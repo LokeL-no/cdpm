@@ -288,6 +288,44 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
+        <div class="asset-stats" style="margin-bottom: 20px;">
+            <h2 style="color: #3b82f6; margin-bottom: 10px;">📊 W/D/L per Asset</h2>
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;" id="asset-wdl-stats">
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-btc">BTC</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-eth">ETH</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-sol">SOL</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-xrp">XRP</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
         <h2 style="color: #3b82f6; margin-bottom: 15px;">📊 Active Markets</h2>
         <div class="markets-grid" id="active-markets">
             <div style="color: #888; text-align: center; padding: 40px; grid-column: span 2;">
@@ -396,6 +434,34 @@ HTML_TEMPLATE = """
             pnlEl.className = 'value ' + (totalPnl >= 0 ? 'profit' : 'loss');
             
             document.getElementById('markets-resolved').textContent = data.history.length;
+            
+            // Update W/D/L per asset
+            if (data.asset_wdl) {
+                const wdlContainer = document.getElementById('asset-wdl-stats');
+                let wdlHtml = '';
+                const assets = ['btc', 'eth', 'sol', 'xrp'];
+                for (const asset of assets) {
+                    const stats = data.asset_wdl[asset] || { wins: 0, draws: 0, losses: 0, total: 0 };
+                    const winPct = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(0) : '--';
+                    const drawPct = stats.total > 0 ? ((stats.draws / stats.total) * 100).toFixed(0) : '--';
+                    const lossPct = stats.total > 0 ? ((stats.losses / stats.total) * 100).toFixed(0) : '--';
+                    
+                    wdlHtml += `
+                        <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                            <span class="asset-badge asset-${asset}">${asset.toUpperCase()}</span>
+                            <div style="margin-top: 8px; font-size: 12px;">
+                                <span class="profit">W: ${winPct}%</span> | 
+                                <span style="color: #888;">D: ${drawPct}%</span> | 
+                                <span class="loss">L: ${lossPct}%</span>
+                            </div>
+                            <div style="font-size: 10px; color: #666; margin-top: 4px;">
+                                (${stats.wins}/${stats.draws}/${stats.losses}) n=${stats.total}
+                            </div>
+                        </div>
+                    `;
+                }
+                wdlContainer.innerHTML = wdlHtml;
+            }
             
             // Update active markets
             const marketsGrid = document.getElementById('active-markets');
@@ -590,8 +656,10 @@ class PaperTrader:
         self.last_trade_time = 0
         self.first_trade_time = 0
         
-        # Timing
+        # Timing - be more patient before accepting bad hedges
         self.emergency_after_seconds = 300
+        self.patience_before_breakeven = 420  # Wait 7 minutes before accepting break-even
+        self.patience_before_small_loss = 540  # Wait 9 minutes before accepting small loss
         self.max_qty_ratio = 1.02         # Keep positions very balanced
         self.target_qty_ratio = 1.0
         self.rebalance_trigger = 1.015
@@ -603,6 +671,12 @@ class PaperTrader:
         self.imbalanced_cheap_buy_fraction = 0.4
         self.imbalanced_expensive_hedge_threshold = 0.82
         self.gradual_hedge_increment = 0.25
+        
+        # SAFETY: Max unhedged exposure to prevent large losses
+        self.max_unhedged_cost = 15.0      # Max $ spent on one side without hedge
+        self.forced_hedge_threshold = 0.70 # Force hedge even at this price if unhedged too long
+        self.forced_hedge_time = 480       # Force hedge after 8 minutes unhedged
+        self.max_loss_per_market = 5.0     # Stop trading if expected loss > this
         
     @property
     def cash(self):
@@ -690,16 +764,20 @@ class PaperTrader:
             if estimated_pair_cost >= self.absolute_max_pair_cost:
                 return False, 0, f"Estimated pair ${estimated_pair_cost:.3f} too risky"
             
-            # Imbalanced market: smaller position
+            # SAFETY: Limit first trade size to max_unhedged_cost
+            # This prevents large losses if we never find a good hedge
+            max_first_trade = min(self.max_unhedged_cost, self.cash * 0.015)
+            
+            # Imbalanced market: even smaller position
             if is_imbalanced_market:
-                max_spend = min(self.cash * 0.012 * self.imbalanced_cheap_buy_fraction, self.max_single_trade * 0.5)
+                max_spend = min(max_first_trade * self.imbalanced_cheap_buy_fraction, self.max_single_trade * 0.4)
             else:
-                max_spend = min(self.cash * 0.02, self.max_single_trade)
+                max_spend = min(max_first_trade, self.max_single_trade)
             
             qty = max_spend / price
             self.first_trade_time = now
             expected_profit = (1.0 - estimated_pair_cost) * qty
-            return True, qty, f"First trade @ ${price:.2f} (est. profit: ${expected_profit:.2f})"
+            return True, qty, f"First trade @ ${price:.2f} (max exposure: ${max_spend:.2f})"
         
         # Must balance before adding more
         if other_qty == 0 and my_qty > 0:
@@ -711,6 +789,7 @@ class PaperTrader:
         if my_qty == 0 and other_qty > 0:
             # Calculate what pair cost would be if we hedge now
             other_avg = self.avg_up if side == 'DOWN' else self.avg_down
+            other_cost = self.cost_up if side == 'DOWN' else self.cost_down
             simulated_pair_cost = other_avg + price
             
             profit_per_pair = 1.0 - simulated_pair_cost
@@ -724,31 +803,65 @@ class PaperTrader:
                 total_profit = profit_per_pair * min(qty, other_qty)
                 return True, qty, f"✅ PROFIT hedge: ${total_profit:.2f} (pair: ${simulated_pair_cost:.3f})"
             
-            # BREAK-EVEN SCENARIO: Accept minimal loss/gain to secure position
-            if simulated_pair_cost <= 1.01:  # Within 1% of break-even
-                # Check urgency
-                urgency = False
-                if time_to_close is not None and time_to_close < 180:
-                    urgency = True
-                if time_unhedged > 180:  # Unhedged for 3+ minutes
-                    urgency = True
+            # SAFETY CHECK: If we've spent too much unhedged, force a hedge
+            # to limit maximum possible loss
+            expected_loss_if_no_hedge = other_cost  # We'd lose everything if market closes
+            time_pressure = time_to_close is not None and time_to_close < 300  # 5 min left
+            waited_too_long = time_unhedged > self.forced_hedge_time
+            
+            # FORCED HEDGE: Accept loss to prevent total loss
+            if (waited_too_long or time_pressure) and other_cost > self.max_unhedged_cost * 0.5:
+                # Calculate max acceptable loss
+                max_acceptable_pair_cost = 1.0 + (self.max_loss_per_market / other_qty)
                 
-                if urgency or simulated_pair_cost <= 1.005:
+                if simulated_pair_cost <= max_acceptable_pair_cost:
+                    target_qty = other_qty
+                    max_spend = min(target_qty * price, self.cash * 0.35)
+                    qty = max_spend / price
+                    expected_loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
+                    reason = f"{time_to_close:.0f}s left" if time_pressure else f"waited {time_unhedged:.0f}s"
+                    return True, qty, f"🛡️ FORCED hedge to limit loss: -${expected_loss:.2f} ({reason})"
+            
+            # BREAK-EVEN SCENARIO: Accept minimal loss/gain to secure position
+            # But be patient - try to find a better opportunity first!
+            if simulated_pair_cost <= 1.01:  # Within 1% of break-even
+                # Check urgency - but be more patient
+                urgency = False
+                urgency_reason = ""
+                
+                # Time-based urgency: market closing soon
+                if time_to_close is not None and time_to_close < 120:  # Less than 2 minutes
+                    urgency = True
+                    urgency_reason = f"{time_to_close:.0f}s left"
+                
+                # Position-based urgency: been unhedged too long
+                # Only accept break-even after waiting long enough
+                if time_unhedged > self.patience_before_breakeven:  # 7+ minutes unhedged
+                    if simulated_pair_cost <= 1.005:  # Only if almost break-even
+                        urgency = True
+                        urgency_reason = f"waited {time_unhedged:.0f}s"
+                
+                if urgency:
                     target_qty = other_qty
                     max_spend = min(target_qty * price, self.cash * 0.25)
                     qty = max_spend / price
-                    return True, qty, f"⚖️ Break-even hedge (pair: ${simulated_pair_cost:.3f})"
+                    return True, qty, f"⚖️ Break-even hedge (pair: ${simulated_pair_cost:.3f}, {urgency_reason})"
             
-            # EMERGENCY SCENARIO: Accept larger loss to avoid total loss
-            if time_to_close is not None and time_to_close < 90:
-                if simulated_pair_cost <= 1.03:  # Max 3% loss
+            # EMERGENCY SCENARIO: Market closing very soon
+            if time_to_close is not None and time_to_close < 60:  # Less than 1 minute
+                # Accept any hedge that limits our loss
+                max_loss_pair_cost = 1.0 + (self.max_loss_per_market / other_qty)
+                if simulated_pair_cost <= max_loss_pair_cost:
                     target_qty = other_qty
                     max_spend = min(target_qty * price, self.cash * 0.4)
                     qty = max_spend / price
-                    loss = simulated_pair_cost - 1.0
-                    return True, qty, f"⚠️ EMERGENCY: ${loss:.3f}/pair loss ({time_to_close:.0f}s left)"
+                    loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
+                    return True, qty, f"⚠️ EMERGENCY: -${loss:.2f} loss ({time_to_close:.0f}s left!)"
             
-            return False, 0, f"Waiting: pair ${simulated_pair_cost:.3f} > $1.00 (need cheaper)"
+            # Not urgent yet - keep waiting for better prices
+            wait_msg = f"waited {time_unhedged:.0f}s" if time_unhedged > 0 else ""
+            potential_loss = other_cost if simulated_pair_cost > 1.0 else 0
+            return False, 0, f"Waiting: pair ${simulated_pair_cost:.3f} ({wait_msg}) [risk: ${potential_loss:.2f}]"
         
         # ═══════════════════════════════════════════════════════════════════
         # BOTH SIDES HAVE POSITIONS: Add more only if profitable
@@ -1400,6 +1513,21 @@ class MultiMarketBot:
                     # True balance = cash + value of locked positions
                     true_balance = self.cash_ref['balance'] + total_position_value
                     
+                    # Calculate W/D/L per asset
+                    asset_wdl = {}
+                    for asset in SUPPORTED_ASSETS:
+                        asset_history = [h for h in self.history if h['asset'] == asset]
+                        wins = sum(1 for h in asset_history if h['pnl'] > 0)
+                        draws = sum(1 for h in asset_history if h['pnl'] == 0)
+                        losses = sum(1 for h in asset_history if h['pnl'] < 0)
+                        total = len(asset_history)
+                        asset_wdl[asset] = {
+                            'wins': wins,
+                            'draws': draws,
+                            'losses': losses,
+                            'total': total
+                        }
+                    
                     data = {
                         'starting_balance': self.starting_balance,
                         'current_balance': self.cash_ref['balance'],
@@ -1408,7 +1536,8 @@ class MultiMarketBot:
                         'active_markets': active_data,
                         'history': self.history,
                         'trade_log': self.trade_log,
-                        'paused': self.paused
+                        'paused': self.paused,
+                        'asset_wdl': asset_wdl
                     }
                     
                     await self.broadcast(data)
