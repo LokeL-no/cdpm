@@ -573,8 +573,8 @@ class PolymarketBot:
 
 
 async def main():
-    # Event slug fra URL: https://polymarket.com/event/btc-updown-15m-1769755500
-    event_slug = "btc-updown-15m-1769755500"
+    # Event slug fra URL: https://polymarket.com/event/btc-updown-15m-1769769000
+    event_slug = "btc-updown-15m-1769769000"
     
     bot = PolymarketBot(event_slug)
     await bot.run()
