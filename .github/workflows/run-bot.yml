@@ -1,4 +1,4 @@
-name: 🤖 Polymarket Bot (3 timer)
+name: 🤖 Polymarket Bot (13 timer)
 
 on:
   workflow_dispatch:  # Manuell trigger
@@ -6,7 +6,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 3 timer maks
+    timeout-minutes: 780  # 13 timer maks
 
     steps:
       - name: 📥 Checkout repo
@@ -51,14 +51,16 @@ jobs:
           echo "=============================================="
           echo ""
           
-          # Hold workflow kjørende i 3 timer
-          echo "⏰ Bot kjører i 3 timer (eller til du stopper den)"
+          # Hold workflow kjørende i 13 timer
+          echo "⏰ Bot kjører i 13 timer (eller til du stopper den)"
           echo "🛑 Stopp: Gå til Actions → klikk på workflow → Cancel"
           
-          # Vis status hvert 5. minutt
-          for i in $(seq 1 36); do
+          # Vis status hvert 5. minutt (156 iterasjoner = 13 timer)
+          for i in $(seq 1 156); do
             sleep 300
-            echo "⏰ $(date '+%H:%M') - Bot har kjørt i $((i*5)) minutter"
+            HOURS=$((i*5/60))
+            MINS=$((i*5%60))
+            echo "⏰ $(date '+%H:%M') - Bot har kjørt i ${HOURS}t ${MINS}m"
           done
           
           # Cleanup
