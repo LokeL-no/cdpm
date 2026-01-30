@@ -678,6 +678,12 @@ class PaperTrader:
         self.forced_hedge_time = 480       # Force hedge after 8 minutes unhedged
         self.max_loss_per_market = 5.0     # Stop trading if expected loss > this
         
+        # SMART HEDGE: Over-hedge to guarantee profit on hedge side
+        self.enable_smart_hedge = True     # Enable over-hedging strategy
+        self.smart_hedge_max_price = 0.75  # Max price to use smart hedge (avoid extreme prices)
+        self.smart_hedge_min_profit = 1.0  # Min $ profit to trigger smart hedge
+        self.smart_hedge_max_spend = 50.0  # Max $ to spend on smart hedge
+        
     @property
     def cash(self):
         return self.cash_ref['balance']
@@ -722,6 +728,100 @@ class PaperTrader:
         if new_avg_up == 0 or new_avg_down == 0:
             return (new_avg_up if side == 'UP' else new_avg_down, 0.0)
         return (new_avg_up if side == 'UP' else new_avg_down, new_avg_up + new_avg_down)
+    
+    def calculate_smart_hedge(self, hedge_price: float) -> dict:
+        """
+        Beregner smart hedge når pair_cost > 1.0
+        
+        Strategi: Kjøp FLERE shares på hedge-siden slik at:
+        - Hvis hedge-siden vinner: Vi går i PLUSS
+        - Hvis original-siden vinner: Vi går i MINUS (men begrenset)
+        
+        Formel for break-even på hedge-siden:
+        qty_hedge = existing_cost / (1 - hedge_price)
+        
+        For å gå i PLUSS, kjøper vi litt mer enn break-even.
+        """
+        # Determine which side we're hedging
+        if self.qty_up > 0 and self.qty_down == 0:
+            existing_qty = self.qty_up
+            existing_cost = self.cost_up
+            existing_avg = self.avg_up
+            hedge_side = 'DOWN'
+        elif self.qty_down > 0 and self.qty_up == 0:
+            existing_qty = self.qty_down
+            existing_cost = self.cost_down
+            existing_avg = self.avg_down
+            hedge_side = 'UP'
+        else:
+            return {'viable': False, 'reason': 'Need unhedged position'}
+        
+        # Can't smart hedge if price >= 1.0
+        if hedge_price >= 1.0:
+            return {'viable': False, 'reason': 'Hedge price too high'}
+        
+        # Calculate break-even hedge quantity
+        # If hedge wins: qty_hedge - existing_cost - (qty_hedge * hedge_price) = 0
+        # qty_hedge * (1 - hedge_price) = existing_cost
+        # qty_hedge = existing_cost / (1 - hedge_price)
+        breakeven_qty = existing_cost / (1 - hedge_price)
+        breakeven_cost = breakeven_qty * hedge_price
+        
+        # Add buffer for profit (10% more shares)
+        profit_buffer = 1.10
+        smart_qty = breakeven_qty * profit_buffer
+        smart_cost = smart_qty * hedge_price
+        
+        # Calculate outcomes
+        total_cost = existing_cost + smart_cost
+        
+        # If hedge side wins:
+        pnl_if_hedge_wins = smart_qty - total_cost
+        
+        # If original side wins:
+        pnl_if_original_wins = existing_qty - total_cost
+        
+        # Check viability
+        result = {
+            'viable': False,
+            'hedge_side': hedge_side,
+            'existing_qty': existing_qty,
+            'existing_cost': existing_cost,
+            'hedge_price': hedge_price,
+            'breakeven_qty': breakeven_qty,
+            'smart_qty': smart_qty,
+            'smart_cost': smart_cost,
+            'total_cost': total_cost,
+            'pnl_if_hedge_wins': pnl_if_hedge_wins,
+            'pnl_if_original_wins': pnl_if_original_wins,
+            'reason': ''
+        }
+        
+        # Check constraints
+        if hedge_price > self.smart_hedge_max_price:
+            result['reason'] = f'Price ${hedge_price:.2f} > max ${self.smart_hedge_max_price}'
+            return result
+        
+        if smart_cost > self.smart_hedge_max_spend:
+            result['reason'] = f'Cost ${smart_cost:.2f} > max ${self.smart_hedge_max_spend}'
+            return result
+        
+        if smart_cost > self.cash * 0.5:  # Don't spend more than 50% of cash
+            result['reason'] = f'Cost ${smart_cost:.2f} > 50% of cash'
+            return result
+        
+        if pnl_if_hedge_wins < self.smart_hedge_min_profit:
+            result['reason'] = f'Profit ${pnl_if_hedge_wins:.2f} < min ${self.smart_hedge_min_profit}'
+            return result
+        
+        # Check worst case loss is acceptable
+        if abs(pnl_if_original_wins) > self.max_loss_per_market * 3:  # Allow 3x max loss for smart hedge
+            result['reason'] = f'Worst loss ${pnl_if_original_wins:.2f} too high'
+            return result
+        
+        result['viable'] = True
+        result['reason'] = 'Smart hedge viable!'
+        return result
     
     def should_buy(self, side: str, price: float, other_price: float, is_rebalance: bool = False, is_emergency: bool = False, time_to_close: float = None) -> tuple:
         if self.market_status != 'open':
@@ -802,6 +902,21 @@ class PaperTrader:
                 qty = max_spend / price
                 total_profit = profit_per_pair * min(qty, other_qty)
                 return True, qty, f"✅ PROFIT hedge: ${total_profit:.2f} (pair: ${simulated_pair_cost:.3f})"
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # SMART HEDGE: Over-hedge to guarantee profit on hedge side
+            # Use when pair_cost > 1.0 but price is reasonable
+            # ═══════════════════════════════════════════════════════════════════
+            if self.enable_smart_hedge and simulated_pair_cost > 1.0:
+                smart = self.calculate_smart_hedge(price)
+                
+                if smart['viable']:
+                    # Use smart hedge - buy more than 1:1 to guarantee profit if this side wins
+                    qty = smart['smart_qty']
+                    if qty * price <= self.cash:
+                        win_profit = smart['pnl_if_hedge_wins']
+                        lose_loss = smart['pnl_if_original_wins']
+                        return True, qty, f"🎯 SMART hedge: +${win_profit:.2f} if {side} wins, ${lose_loss:.2f} if not"
             
             # SAFETY CHECK: If we've spent too much unhedged, force a hedge
             # to limit maximum possible loss
