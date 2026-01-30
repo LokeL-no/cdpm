@@ -1,0 +1,65 @@
+name: 🤖 Polymarket Bot (3 timer)
+
+on:
+  workflow_dispatch:  # Manuell trigger
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 timer maks
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 Installer avhengigheter
+        run: pip install -r requirements.txt
+
+      - name: 🌐 Installer cloudflared (tunnel)
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: 🚀 Start bot og tunnel
+        run: |
+          # Start botten i bakgrunnen
+          python3 web_bot_multi.py &
+          BOT_PID=$!
+          
+          # Vent litt så botten starter
+          sleep 5
+          
+          # Start Cloudflare tunnel (gratis, ingen konto nødvendig)
+          ./cloudflared tunnel --url http://localhost:8080 2>&1 | tee tunnel.log &
+          TUNNEL_PID=$!
+          
+          # Vent på at tunnel-URL vises
+          sleep 10
+          
+          # Finn og vis URL
+          echo ""
+          echo "=============================================="
+          echo "🎉 BOT KJØRER!"
+          echo "=============================================="
+          TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          echo "📱 Åpne på telefonen: $TUNNEL_URL"
+          echo "=============================================="
+          echo ""
+          
+          # Hold workflow kjørende i 3 timer
+          echo "⏰ Bot kjører i 3 timer (eller til du stopper den)"
+          echo "🛑 Stopp: Gå til Actions → klikk på workflow → Cancel"
+          
+          # Vis status hvert 5. minutt
+          for i in $(seq 1 36); do
+            sleep 300
+            echo "⏰ $(date '+%H:%M') - Bot har kjørt i $((i*5)) minutter"
+          done
+          
+          # Cleanup
+          kill $BOT_PID $TUNNEL_PID 2>/dev/null || true

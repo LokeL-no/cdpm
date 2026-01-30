@@ -1,0 +1,19 @@
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-bot
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Europe/Oslo
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
