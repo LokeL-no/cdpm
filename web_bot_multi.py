@@ -441,10 +441,12 @@ HTML_TEMPLATE = """
                 let wdlHtml = '';
                 const assets = ['btc', 'eth', 'sol', 'xrp'];
                 for (const asset of assets) {
-                    const stats = data.asset_wdl[asset] || { wins: 0, draws: 0, losses: 0, total: 0 };
+                    const stats = data.asset_wdl[asset] || { wins: 0, draws: 0, losses: 0, total: 0, total_pnl: 0 };
                     const winPct = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(0) : '--';
                     const drawPct = stats.total > 0 ? ((stats.draws / stats.total) * 100).toFixed(0) : '--';
                     const lossPct = stats.total > 0 ? ((stats.losses / stats.total) * 100).toFixed(0) : '--';
+                    const pnlClass = stats.total_pnl >= 0 ? 'profit' : 'loss';
+                    const pnlSign = stats.total_pnl >= 0 ? '+' : '';
                     
                     wdlHtml += `
                         <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
@@ -456,6 +458,9 @@ HTML_TEMPLATE = """
                             </div>
                             <div style="font-size: 10px; color: #666; margin-top: 4px;">
                                 (${stats.wins}/${stats.draws}/${stats.losses}) n=${stats.total}
+                            </div>
+                            <div style="margin-top: 6px; font-size: 14px; font-weight: bold;" class="${pnlClass}">
+                                ${pnlSign}$${stats.total_pnl.toFixed(2)}
                             </div>
                         </div>
                     `;
@@ -1636,11 +1641,13 @@ class MultiMarketBot:
                         draws = sum(1 for h in asset_history if h['pnl'] == 0)
                         losses = sum(1 for h in asset_history if h['pnl'] < 0)
                         total = len(asset_history)
+                        total_pnl = sum(h['pnl'] for h in asset_history)
                         asset_wdl[asset] = {
                             'wins': wins,
                             'draws': draws,
                             'losses': losses,
-                            'total': total
+                            'total': total,
+                            'total_pnl': total_pnl
                         }
                     
                     data = {
