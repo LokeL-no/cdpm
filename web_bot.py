@@ -9,12 +9,15 @@ import aiohttp
 import json
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 from aiohttp import web
 import os
 
-# Event slug - endre denne for å spore et annet market
-EVENT_SLUG = "btc-updown-15m-1769777100"
+# Asset to track (btc, eth, sol, xrp)
+ASSET = "btc"
+
+# Market interval in minutes
+MARKET_INTERVAL_MINUTES = 15
 
 # HTML Template
 HTML_TEMPLATE = """
@@ -524,6 +527,74 @@ HTML_TEMPLATE = """
         .pnl-display .value.loss {
             color: #ef4444;
         }
+        
+        /* Control Buttons */
+        .control-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        
+        .control-btn {
+            flex: 1;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .control-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+        
+        .control-btn:active {
+            transform: translateY(0);
+        }
+        
+        .control-btn.pause {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: #000;
+        }
+        
+        .control-btn.pause.paused {
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+            color: #000;
+        }
+        
+        .control-btn.reset {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: #fff;
+        }
+        
+        .control-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .bot-status-badge {
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        
+        .bot-status-badge.active {
+            background: #22c55e;
+            color: #000;
+        }
+        
+        .bot-status-badge.paused {
+            background: #f59e0b;
+            color: #000;
+            animation: pulse 1.5s infinite;
+        }
     </style>
 </head>
 <body>
@@ -624,8 +695,17 @@ HTML_TEMPLATE = """
         
         <div class="trading-section">
             <div class="trading-header">
-                <h2>📈 Paper Trading Bot</h2>
+                <h2>📈 Paper Trading Bot <span id="bot-status-badge" class="bot-status-badge active">ACTIVE</span></h2>
                 <span id="market-status" class="market-status open">OPEN</span>
+            </div>
+            
+            <div class="control-buttons">
+                <button id="pause-btn" class="control-btn pause" onclick="togglePause()">
+                    ⏸️ Pause Trading
+                </button>
+                <button id="reset-btn" class="control-btn reset" onclick="resetBot()">
+                    🔄 Reset Bot
+                </button>
             </div>
             
             <div class="trading-stats">
@@ -730,6 +810,42 @@ HTML_TEMPLATE = """
                     <div class="label">🏆 FINAL REALIZED P&L 🏆</div>
                     <div id="final-pnl" class="value profit">$0.00</div>
                     <div id="resolution-outcome" style="margin-top: 10px; color: #9ca3af;"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="section-title">📊 PNL HISTORY 📊</div>
+        
+        <div class="trading-section" style="border-color: #22d3ee;">
+            <div class="trading-header" style="border-color: #22d3ee;">
+                <h2 style="color: #22d3ee;">💰 Session PNL Summary</h2>
+                <span id="markets-traded" style="color: #9ca3af;">Markets: 0</span>
+            </div>
+            
+            <div class="trading-stats">
+                <div class="stat-box">
+                    <div class="label">Total Realized PNL</div>
+                    <div class="value" id="total-realized-pnl">$0.00</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Wins / Losses</div>
+                    <div class="value neutral" id="win-loss-record">0 / 0</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Avg PNL per Market</div>
+                    <div class="value" id="avg-pnl">$0.00</div>
+                </div>
+            </div>
+            
+            <div style="color: #9ca3af; font-size: 0.8rem; margin-bottom: 10px;">📜 Market History</div>
+            <div class="trade-log" id="pnl-history" style="max-height: 200px;">
+                <div class="trade-entry" style="color: #6b7280;">No markets resolved yet...</div>
+            </div>
+            
+            <div style="margin-top: 15px; padding: 10px; background: rgba(34, 211, 238, 0.1); border-radius: 6px; border: 1px solid #22d3ee;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="color: #22d3ee;">🔄 Auto Market Discovery</span>
+                    <span id="next-market-info" style="color: #9ca3af; font-size: 0.85rem;">Watching for next market...</span>
                 </div>
             </div>
         </div>
@@ -952,6 +1068,75 @@ HTML_TEMPLATE = """
                 finalPnlEl.className = 'value ' + (pt.final_pnl >= 0 ? 'profit' : 'loss');
                 document.getElementById('resolution-outcome').textContent = 
                     'Market resolved: ' + pt.resolution_outcome + ' | Payout: $' + pt.payout.toFixed(2);
+            }
+            
+            // Update PNL history
+            updatePnlHistory(data);
+        }
+        
+        function updatePnlHistory(data) {
+            const pnlHistory = data.pnl_history || [];
+            const totalPnl = data.total_realized_pnl || 0;
+            const nextMarketInfo = data.next_market_info || 'Watching for next market...';
+            
+            // Update summary stats
+            const totalEl = document.getElementById('total-realized-pnl');
+            totalEl.textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
+            totalEl.className = 'value ' + (totalPnl >= 0 ? 'profit' : 'loss');
+            
+            const wins = pnlHistory.filter(h => h.pnl > 0).length;
+            const losses = pnlHistory.filter(h => h.pnl <= 0).length;
+            document.getElementById('win-loss-record').textContent = wins + ' / ' + losses;
+            
+            const avgPnl = pnlHistory.length > 0 ? totalPnl / pnlHistory.length : 0;
+            const avgEl = document.getElementById('avg-pnl');
+            avgEl.textContent = (avgPnl >= 0 ? '+' : '') + '$' + avgPnl.toFixed(2);
+            avgEl.className = 'value ' + (avgPnl >= 0 ? 'profit' : 'loss');
+            
+            document.getElementById('markets-traded').textContent = 'Markets: ' + pnlHistory.length;
+            document.getElementById('next-market-info').textContent = nextMarketInfo;
+            
+            // Update history log
+            if (pnlHistory.length > 0) {
+                const historyEl = document.getElementById('pnl-history');
+                historyEl.innerHTML = pnlHistory.slice().reverse().map(h => {
+                    const pnlClass = h.pnl >= 0 ? 'buy-up' : 'buy-down';
+                    const pnlSign = h.pnl >= 0 ? '+' : '';
+                    return `<div class="trade-entry ${pnlClass}">
+                        <span class="time">[${h.time}]</span>
+                        ${h.slug} | Outcome: ${h.outcome} | PNL: ${pnlSign}$${h.pnl.toFixed(2)}
+                    </div>`;
+                }).join('');
+            }
+            
+            // Update bot paused status
+            updateBotStatus(data.bot_paused || false);
+        }
+        
+        function updateBotStatus(isPaused) {
+            const pauseBtn = document.getElementById('pause-btn');
+            const statusBadge = document.getElementById('bot-status-badge');
+            
+            if (isPaused) {
+                pauseBtn.innerHTML = '▶️ Resume Trading';
+                pauseBtn.classList.add('paused');
+                statusBadge.textContent = 'PAUSED';
+                statusBadge.className = 'bot-status-badge paused';
+            } else {
+                pauseBtn.innerHTML = '⏸️ Pause Trading';
+                pauseBtn.classList.remove('paused');
+                statusBadge.textContent = 'ACTIVE';
+                statusBadge.className = 'bot-status-badge active';
+            }
+        }
+        
+        function togglePause() {
+            ws.send(JSON.stringify({ command: 'toggle_pause' }));
+        }
+        
+        function resetBot() {
+            if (confirm('Are you sure you want to reset the bot? This will clear all PNL history and current positions.')) {
+                ws.send(JSON.stringify({ command: 'reset_bot' }));
             }
         }
         
@@ -1354,9 +1539,11 @@ class PolymarketWebBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, event_slug: str):
-        self.event_slug = event_slug
-        self.market_title = "Bitcoin Up or Down"
+    def __init__(self, asset: str = "btc", interval_minutes: int = 15):
+        self.asset = asset.lower()
+        self.interval_minutes = interval_minutes
+        self.event_slug = None
+        self.market_title = f"{asset.upper()} Up or Down"
         self.up_token_id = None
         self.down_token_id = None
         self.update_count = 0
@@ -1367,6 +1554,199 @@ class PolymarketWebBot:
         self.paper_trader = PaperTrader(starting_balance=1000.0)
         self.market_closed = False
         self.market_resolved = False
+        
+        # PNL History tracking
+        self.pnl_history: List[Dict] = []
+        self.total_realized_pnl = 0.0
+        self.next_market_info = "Initializing..."
+        
+        # Track current market start epoch
+        self.current_market_epoch = None
+        
+        # Bot control state
+        self.bot_paused = False
+    
+    def toggle_pause(self):
+        """Toggle the bot's paused state"""
+        self.bot_paused = not self.bot_paused
+        status = "PAUSED" if self.bot_paused else "RESUMED"
+        print(f"🎮 Bot {status}")
+        return self.bot_paused
+    
+    def reset_bot(self):
+        """Reset all bot state including PNL history"""
+        self.pnl_history = []
+        self.total_realized_pnl = 0.0
+        self.paper_trader = PaperTrader(starting_balance=1000.0)
+        self.bot_paused = False
+        print("🔄 Bot RESET - All PNL history and positions cleared")
+    
+    def calculate_current_market_epoch(self) -> int:
+        """Calculate the epoch for the current/next market window.
+        
+        The epoch in the slug is the START time of the market.
+        Markets run every 15 minutes at :00, :15, :30, :45
+        """
+        now = datetime.now(timezone.utc)
+        interval_seconds = self.interval_minutes * 60
+        
+        # Get current timestamp
+        current_ts = int(now.timestamp())
+        
+        # Find the current window's start time (floor to interval)
+        current_window_start = (current_ts // interval_seconds) * interval_seconds
+        current_window_end = current_window_start + interval_seconds
+        
+        # If we're past the end of current window, get next window
+        # Or if market is resolved, also get next window
+        if current_ts >= current_window_end or self.market_resolved:
+            return current_window_start + interval_seconds
+        
+        return current_window_start
+    
+    def calculate_next_market_epoch(self) -> int:
+        """Calculate epoch for the next upcoming market after current one"""
+        current = self.calculate_current_market_epoch()
+        return current + (self.interval_minutes * 60)
+    
+    def generate_event_slug(self, epoch: int) -> str:
+        """Generate the event slug for a given epoch timestamp"""
+        return f"{self.asset}-updown-{self.interval_minutes}m-{epoch}"
+    
+    async def discover_and_switch_market(self, session: aiohttp.ClientSession) -> bool:
+        """Auto-discover the current market and switch to it if different"""
+        target_epoch = self.calculate_current_market_epoch()
+        target_slug = self.generate_event_slug(target_epoch)
+        
+        # Check if current market should be closed and PNL saved
+        if self.event_slug and self.event_slug != target_slug:
+            # Current market window has ended, save PNL before switching
+            if self.paper_trader.market_status != 'resolved':
+                # Force close and calculate PNL based on positions
+                await self.close_and_save_current_market(session)
+        
+        if target_slug == self.event_slug and not self.market_resolved:
+            return False  # Already on correct market
+        
+        # Try to fetch the target market
+        success = await self.fetch_market_by_slug(session, target_slug)
+        
+        if success:
+            # Switch to new market
+            old_slug = self.event_slug
+            self.event_slug = target_slug
+            self.current_market_epoch = target_epoch
+            
+            # Reset for new market
+            self.reset_for_new_market()
+            
+            # Fetch the new market data
+            await self.fetch_event_data(session)
+            
+            print(f"🔄 Switched to new market: {target_slug}")
+            self.next_market_info = f"Active: {target_slug}"
+            return True
+        else:
+            # Market not available yet, calculate when it should be
+            next_start = datetime.fromtimestamp(target_epoch, tz=timezone.utc)
+            self.next_market_info = f"Waiting for market at {next_start.strftime('%H:%M:%S')} UTC"
+            return False
+    
+    async def fetch_market_by_slug(self, session: aiohttp.ClientSession, slug: str) -> bool:
+        """Try to fetch a specific market by slug"""
+        try:
+            url = f"{self.GAMMA_API_URL}/events/slug/{slug}"
+            async with session.get(url) as response:
+                if response.status == 200:
+                    event = await response.json()
+                    if event:
+                        return True
+            return False
+        except Exception as e:
+            return False
+    
+    async def close_and_save_current_market(self, session: aiohttp.ClientSession):
+        """Close current market and save PNL - called when market window ends"""
+        if not self.event_slug:
+            return
+        
+        # Check if we have any positions
+        pt = self.paper_trader
+        if pt.qty_up == 0 and pt.qty_down == 0:
+            print(f"📭 Market {self.event_slug} closed with no positions")
+            return
+        
+        # Try to fetch final resolution from API
+        await self.fetch_event_data(session)
+        
+        # If market is resolved, use that outcome
+        if self.market_resolved and pt.final_pnl is not None:
+            self.save_market_pnl()
+            return
+        
+        # If not resolved yet, estimate PNL based on hedged position
+        # For a hedged position: guaranteed payout = min(qty_up, qty_down)
+        # PNL = guaranteed_payout - total_cost
+        guaranteed_payout = min(pt.qty_up, pt.qty_down)
+        total_cost = pt.cost_up + pt.cost_down
+        estimated_pnl = guaranteed_payout - total_cost
+        
+        # Determine likely outcome based on final prices
+        outcome = 'HEDGED'
+        if pt.qty_up > pt.qty_down:
+            outcome = 'UP (unhedged)'
+        elif pt.qty_down > pt.qty_up:
+            outcome = 'DOWN (unhedged)'
+        
+        pnl_entry = {
+            'slug': self.event_slug,
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'outcome': outcome,
+            'pnl': estimated_pnl,
+            'payout': guaranteed_payout,
+            'cost': total_cost,
+            'qty_up': pt.qty_up,
+            'qty_down': pt.qty_down,
+            'status': 'closed'
+        }
+        
+        self.pnl_history.append(pnl_entry)
+        self.total_realized_pnl += estimated_pnl
+        
+        print(f"💰 Market CLOSED: {self.event_slug}")
+        print(f"   Positions: {pt.qty_up:.1f} UP / {pt.qty_down:.1f} DOWN")
+        print(f"   PNL: ${estimated_pnl:.2f} | Total: ${self.total_realized_pnl:.2f}")
+    
+    def save_market_pnl(self):
+        """Save the PNL from the resolved market to history"""
+        if self.paper_trader.final_pnl is None:
+            return
+        
+        pnl_entry = {
+            'slug': self.event_slug,
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'outcome': self.paper_trader.resolution_outcome or 'Unknown',
+            'pnl': self.paper_trader.final_pnl,
+            'payout': self.paper_trader.payout,
+            'cost': self.paper_trader.cost_up + self.paper_trader.cost_down,
+            'qty_up': self.paper_trader.qty_up,
+            'qty_down': self.paper_trader.qty_down
+        }
+        
+        self.pnl_history.append(pnl_entry)
+        self.total_realized_pnl += self.paper_trader.final_pnl
+        
+        print(f"💰 Saved PNL: {pnl_entry['pnl']:.2f} | Total: {self.total_realized_pnl:.2f}")
+    
+    def reset_for_new_market(self):
+        """Reset state for a new market"""
+        self.up_token_id = None
+        self.down_token_id = None
+        self.window_start = None
+        self.window_end = None
+        self.market_closed = False
+        self.market_resolved = False
+        self.paper_trader = PaperTrader(starting_balance=1000.0)
         
     async def fetch_event_data(self, session: aiohttp.ClientSession):
         """Fetch event data from Gamma API"""
@@ -1511,11 +1891,15 @@ class PolymarketWebBot:
         self.websockets -= dead_sockets
     
     async def data_loop(self):
-        """Main data fetching loop"""
+        """Main data fetching loop with auto market discovery"""
         async with aiohttp.ClientSession() as session:
-            # Fetch initial event data
-            print(f"Fetching event data for: {self.event_slug}")
-            await self.fetch_event_data(session)
+            # Auto-discover initial market
+            print(f"🔍 Auto-discovering {self.asset.upper()} markets...")
+            await self.discover_and_switch_market(session)
+            
+            if self.event_slug:
+                print(f"📊 Found market: {self.event_slug}")
+                await self.fetch_event_data(session)
             
             if not self.up_token_id or not self.down_token_id:
                 print("Could not find token IDs, running in demo mode")
@@ -1524,6 +1908,14 @@ class PolymarketWebBot:
             
             while self.running:
                 try:
+                    # Check for market switch every 5 seconds
+                    if self.update_count % 5 == 0:
+                        switched = await self.discover_and_switch_market(session)
+                        if switched:
+                            await self.fetch_event_data(session)
+                            if self.up_token_id and self.down_token_id:
+                                print(f"Found tokens - UP: {self.up_token_id[:20]}... DOWN: {self.down_token_id[:20]}...")
+                    
                     # Fetch all data
                     if self.up_token_id and self.down_token_id:
                         results = await asyncio.gather(
@@ -1583,8 +1975,8 @@ class PolymarketWebBot:
                         self.paper_trader.close_market()
                         print(f"Market window ended at {self.window_end}")
                     
-                    # Run paper trading logic
-                    if self.paper_trader.market_status == 'open':
+                    # Run paper trading logic (only if not paused)
+                    if self.paper_trader.market_status == 'open' and not self.bot_paused:
                         # Get best ask prices for buying (lowest ask = best price to buy)
                         # Asks are sorted ascending, so first ask is cheapest
                         asks_up = up_book.get('asks', [])
@@ -1635,7 +2027,7 @@ class PolymarketWebBot:
                     
                     data = {
                         'title': self.market_title,
-                        'event_slug': self.event_slug,
+                        'event_slug': self.event_slug or 'Discovering...',
                         'window_time': window_time,
                         'current_time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
                         'update_count': self.update_count,
@@ -1645,7 +2037,13 @@ class PolymarketWebBot:
                         'down_book': down_book,
                         'up_trades': up_trades,
                         'down_trades': down_trades,
-                        'paper_trading': self.paper_trader.get_state()
+                        'paper_trading': self.paper_trader.get_state(),
+                        # PNL History data
+                        'pnl_history': self.pnl_history,
+                        'total_realized_pnl': self.total_realized_pnl,
+                        'next_market_info': self.next_market_info,
+                        # Bot control state
+                        'bot_paused': self.bot_paused
                     }
                     
                     await self.broadcast(data)
@@ -1657,7 +2055,7 @@ class PolymarketWebBot:
 
 
 # Create bot instance
-bot = PolymarketWebBot(EVENT_SLUG)
+bot = PolymarketWebBot(asset=ASSET, interval_minutes=MARKET_INTERVAL_MINUTES)
 
 
 async def index_handler(request):
@@ -1675,7 +2073,18 @@ async def websocket_handler(request):
     
     try:
         async for msg in ws:
-            if msg.type == aiohttp.WSMsgType.ERROR:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    command = data.get('command')
+                    
+                    if command == 'toggle_pause':
+                        bot.toggle_pause()
+                    elif command == 'reset_bot':
+                        bot.reset_bot()
+                except json.JSONDecodeError:
+                    pass
+            elif msg.type == aiohttp.WSMsgType.ERROR:
                 break
     finally:
         bot.websockets.discard(ws)
@@ -1708,7 +2117,8 @@ def main():
     app.on_cleanup.append(cleanup_background_tasks)
     
     print(f"🤖 Polymarket Web Bot starting...")
-    print(f"📊 Event: {EVENT_SLUG}")
+    print(f"📊 Asset: {ASSET.upper()} | Interval: {MARKET_INTERVAL_MINUTES}m")
+    print(f"🔍 Auto-discovery enabled - will find current market automatically")
     print(f"🌐 Open http://localhost:8080 in your browser")
     print(f"Press Ctrl+C to stop")
     print()
