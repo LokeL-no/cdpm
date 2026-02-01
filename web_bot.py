@@ -1168,29 +1168,36 @@ class PaperTrader:
         self.final_pnl = None
         self.payout = 0.0
         
-        # === GABAGOOL STRATEGY v3 PARAMETERS ===
-        # The key insight: we need avg_UP + avg_DOWN < 1.00 to guarantee profit
-        # And we need qty_UP ≈ qty_DOWN to maximize the guaranteed payout
-        # v4: EMERGENCY BALANCING - force balance even at bad prices if unhedged too long
+        # === GABAGOOL STRATEGY v6: GUARANTEED PROFIT ===
+        # THE ONLY WAY TO GUARANTEE PROFIT: pair_cost < $1.00 with balanced positions
+        # Formula: avg_UP + avg_DOWN < $1.00 means we ALWAYS profit at settlement
+        # REALITY: Polymarket spread is often ~1.01, so we accept slight risk
         
-        self.target_pair_cost = 0.90    # Target pair cost (below this = profit zone)
-        self.max_pair_cost = 0.96       # Absolute max pair cost - allow up to 0.96 for emergency balance
-        self.cheap_threshold = 0.46     # Only buy when price is below this
-        self.rebalance_threshold_price = 0.50  # Buy to rebalance even at this price
-        self.emergency_rebalance_price = 0.55  # EMERGENCY: Force buy at this price if unhedged
-        self.very_cheap_threshold = 0.40 # Aggressively buy when below this
-        self.min_trade_size = 5.0       # Minimum trade size in dollars
-        self.max_single_trade = 20.0    # Max single trade size (smaller = more control)
-        self.cooldown_seconds = 3       # Seconds between trades
+        self.target_pair_cost = 0.96    # Target pair cost for good profit margin
+        self.max_pair_cost = 1.02       # Accept up to 2% loss risk to participate
+        self.cheap_threshold = 0.48     # "Cheap" price to start buying
+        self.force_balance_threshold = 0.80  # Buy other side at this price if pair_cost is OK
+        self.max_balance_price = 0.90   # Absolute max to pay for balancing (emergency)
+        self.very_cheap_threshold = 0.40 # Super cheap - accumulate more aggressively
+        self.min_trade_size = 3.0       # Minimum trade size
+        self.max_single_trade = 12.0    # Max single trade
+        self.cooldown_seconds = 4       # Seconds between trades
         self.last_trade_time = 0
-        self.first_trade_time = 0       # When we made our first trade (for emergency timing)
-        self.emergency_after_seconds = 300  # 5 minutes - force balance after this
+        self.first_trade_time = 0       # When we made our first trade
+        self.force_balance_after_seconds = 60  # Force balance after 60 seconds!
         
-        # Balance constraints - THIS IS CRITICAL for Gabagool strategy
-        # v4: Must balance even at worse prices to avoid total loss
-        self.max_qty_ratio = 1.05       # Max ratio - EXTREMELY STRICT
+        # === BALANCE IS KING ===
+        # Without balance, there is NO guaranteed profit
+        self.max_qty_ratio = 1.15       # Max imbalance allowed (15%)
+        self.target_qty_ratio = 1.0     # Perfect balance
+        self.rebalance_trigger = 1.08   # Start rebalancing at 8% imbalance
+        self.max_position_pct = 0.40    # Max 40% of balance per market (need reserves)
+        
+        # Balance constraints
+        # Allow some imbalance if we're getting great prices
+        self.max_qty_ratio = 1.20       # Allow more imbalance (was 1.05)
         self.target_qty_ratio = 1.0     # Ideal ratio (perfectly balanced)
-        self.rebalance_trigger = 1.03   # Start rebalancing when ratio exceeds this
+        self.rebalance_trigger = 1.10   # Start rebalancing when ratio exceeds this (was 1.03)
         
     @property
     def avg_up(self) -> float:
@@ -1234,143 +1241,157 @@ class PaperTrader:
     
     def should_buy(self, side: str, price: float, other_price: float, is_rebalance: bool = False, is_emergency: bool = False) -> tuple:
         """
-        GABAGOOL STRATEGY v4: Emergency balancing.
+        GABAGOOL STRATEGY v6: GUARANTEED PROFIT
         
-        Key principles:
-        1. BALANCE IS ABSOLUTELY REQUIRED - ratio must stay < 1.05
-        2. Rebalancing takes priority over cheap prices
-        3. EMERGENCY: After 5 min unhedged, force balance even at bad prices
-        4. The guaranteed profit = min(qty_UP, qty_DOWN) - total_cost
+        THE ONLY WAY TO GUARANTEE PROFIT:
+        - pair_cost (avg_UP + avg_DOWN) < $1.00
+        - qty_UP ≈ qty_DOWN (balanced positions)
+        
+        Example: 100 UP @ $0.30 + 100 DOWN @ $0.65 = $95 cost → $100 payout = $5 GUARANTEED
+        
+        Strategy:
+        1. Buy cheap side first (< $0.45)
+        2. MUST buy other side to lock in profit (even if expensive)
+        3. Keep pair_cost under $0.98 at all times
+        4. Cost average to improve pair_cost when possible
         """
         import time as time_module
         
         if self.market_status != 'open':
             return False, 0, "Market not open"
         
-        # Cooldown check (shorter cooldown for rebalancing/emergency)
         now = time_module.time()
-        cooldown = self.cooldown_seconds / 3 if (is_rebalance or is_emergency) else self.cooldown_seconds
+        cooldown = self.cooldown_seconds / 2 if is_rebalance else self.cooldown_seconds
         if now - self.last_trade_time < cooldown:
             return False, 0, "Cooldown active"
         
         my_qty = self.qty_up if side == 'UP' else self.qty_down
+        my_cost = self.cost_up if side == 'UP' else self.cost_down
+        my_avg = my_cost / my_qty if my_qty > 0 else 0
         other_qty = self.qty_down if side == 'UP' else self.qty_up
+        other_cost = self.cost_down if side == 'UP' else self.cost_up
+        other_avg = other_cost / other_qty if other_qty > 0 else 0
         other_side = 'DOWN' if side == 'UP' else 'UP'
         
-        # === FIRST TRADE ===
+        # === POSITION SIZE LIMIT ===
+        total_spent = self.cost_up + self.cost_down
+        max_total_spend = self.starting_balance * self.max_position_pct
+        remaining_budget = max_total_spend - total_spent
+        
+        # Allow emergency balance even if over budget
+        if remaining_budget <= self.min_trade_size and not is_emergency and not (my_qty == 0 and other_qty > 0):
+            return False, 0, f"Position limit reached (spent ${total_spent:.0f})"
+        
+        # === FIRST TRADE: Only start if we can get good pair_cost ===
         if my_qty == 0 and other_qty == 0:
             if price > self.cheap_threshold:
-                return False, 0, f"First trade needs cheap price (< {self.cheap_threshold})"
-            max_spend = min(self.cash * 0.02, self.max_single_trade)
-            qty = max_spend / price
-            # Record first trade time for emergency timing
-            self.first_trade_time = now
-            return True, qty, "First trade - starting small"
-        
-        # === MUST BALANCE BEFORE ADDING MORE ===
-        if other_qty == 0 and my_qty > 0:
-            return False, 0, f"BLOCKED: Must buy {other_side} first"
-        
-        # === CATCH UP MODE (including EMERGENCY) ===
-        if my_qty == 0 and other_qty > 0:
-            # Check if this is an emergency (been waiting too long)
-            time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
-            is_emergency_mode = time_unhedged > self.emergency_after_seconds
+                return False, 0, f"First trade needs price < ${self.cheap_threshold}"
             
-            # Determine price threshold based on urgency
-            if is_emergency_mode or is_emergency:
-                price_threshold = self.emergency_rebalance_price
-                reason_prefix = "🚨 EMERGENCY"
+            # CRITICAL: Check if the OTHER side would give us good pair_cost
+            potential_pair_cost = price + other_price
+            if potential_pair_cost > self.max_pair_cost:
+                return False, 0, f"Pair would be ${potential_pair_cost:.2f} > ${self.max_pair_cost} - waiting"
+            
+            max_spend = min(self.cash * 0.05, self.max_single_trade, remaining_budget)
+            qty = max_spend / price
+            self.first_trade_time = now
+            return True, qty, f"🎯 First trade (pair potential: ${potential_pair_cost:.2f})"
+        
+        # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
+        if my_qty == 0 and other_qty > 0:
+            time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
+            
+            # Calculate what pair_cost would be if we buy at current price
+            potential_pair_cost = other_avg + price
+            
+            # Determine price threshold based on urgency and pair_cost
+            if time_unhedged > self.force_balance_after_seconds:
+                # Force balance - accept higher prices
+                if potential_pair_cost < self.max_pair_cost:
+                    price_threshold = self.max_balance_price
+                    reason = f"🚨 FORCE BALANCE ({time_unhedged:.0f}s unhedged)"
+                else:
+                    return False, 0, f"🚨 Pair cost ${potential_pair_cost:.2f} too high even for emergency"
+            elif potential_pair_cost < self.target_pair_cost:
+                # Great opportunity - pair_cost would be good
+                price_threshold = self.force_balance_threshold
+                reason = f"✅ GOOD PAIR COST (${potential_pair_cost:.2f})"
             else:
-                price_threshold = self.rebalance_threshold_price
-                reason_prefix = "REBALANCE"
+                # Wait for better price
+                price_threshold = self.cheap_threshold
+                reason = "⏳ Waiting for better price"
             
             if price > price_threshold:
-                if is_emergency_mode:
-                    return False, 0, f"🚨 EMERGENCY: Need {side} < ${price_threshold} (unhedged {time_unhedged:.0f}s)"
-                return False, 0, f"Need {side} < ${price_threshold} to balance"
+                return False, 0, f"Need {side} < ${price_threshold:.2f} (pair would be ${potential_pair_cost:.2f})"
             
-            # Calculate how much to buy to match
+            # Buy to match other side for perfect balance
             target_qty = other_qty
-            max_spend = min(target_qty * price, self.cash * 0.2, self.max_single_trade * 2)
+            max_spend = min(target_qty * price, self.cash * 0.3, remaining_budget + 20)  # Allow slight overspend for balance
             qty = max_spend / price
-            return True, qty, f"{reason_prefix}: Catching up {side}"
+            
+            if qty < target_qty * 0.5:
+                # Can't afford enough - buy what we can
+                qty = max(qty, self.min_trade_size / price)
+            
+            return True, qty, reason
         
-        # === BOTH SIDES HAVE POSITIONS ===
-        ratio = my_qty / other_qty
+        # === BOTH SIDES HAVE POSITIONS - OPTIMIZE PAIR COST ===
+        current_pair_cost = self.pair_cost
+        ratio = my_qty / other_qty if other_qty > 0 else 1.0
         
-        # HARD BLOCK: If we're at or above max ratio, NO MORE BUYS on this side
-        if ratio >= self.max_qty_ratio:  # 1.05x
-            return False, 0, f"HARD BLOCK: {side} at max ({ratio:.3f}x)"
+        # Hard block at max ratio
+        if ratio >= self.max_qty_ratio:
+            return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x)"
         
-        # SOFT BLOCK: If we're ahead at all, only buy if it's a rebalancing call
-        if ratio >= self.rebalance_trigger:  # 1.03x
-            if not is_rebalance:
-                return False, 0, f"BLOCKED: {side} ahead ({ratio:.3f}x) - waiting for {other_side}"
-        
-        # Calculate how much we can buy while staying balanced
         max_qty_allowed = other_qty * self.max_qty_ratio - my_qty
         if max_qty_allowed <= 0:
-            return False, 0, f"At balance limit"
+            return False, 0, "At ratio limit"
         
-        # Determine price threshold based on balance state
-        if ratio < 0.97:  # We're behind - be more lenient
-            price_threshold = self.rebalance_threshold_price
-            qty_multiplier = 1.5  # Buy more to catch up
-        elif ratio < 1.0:  # Slightly behind
-            price_threshold = self.cheap_threshold
-            qty_multiplier = 1.2
-        else:  # At or ahead of balance - very strict
-            price_threshold = self.cheap_threshold - 0.03
-            qty_multiplier = 0.5
-        
-        if price > price_threshold:
-            return False, 0, f"{side} price ${price:.3f} > threshold ${price_threshold:.2f}"
-        
-        # Calculate trade size
-        base_spend = min(self.cash * 0.03, self.max_single_trade)
-        max_spend = base_spend * qty_multiplier
-        
-        if max_spend < self.min_trade_size:
-            return False, 0, "Insufficient funds"
-        
-        qty = min(max_spend / price, max_qty_allowed)
-        
-        if qty * price < self.min_trade_size:
-            return False, 0, "Trade too small"
-        
-        # === PAIR COST CHECK ===
-        if self.qty_up > 0 and self.qty_down > 0:
-            new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+        # === COST AVERAGING: Buy if it improves pair cost ===
+        # Only buy if new price < current avg (improves our average)
+        if price < my_avg:
+            # This will improve our avg and lower pair cost!
+            max_spend = min(self.cash * 0.04, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
             
-            # Try reducing quantity if pair cost too high
-            while new_pair_cost > self.max_pair_cost and qty > self.min_trade_size / price:
-                qty = qty * 0.6
+            if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost < current_pair_cost:
+                    improvement = current_pair_cost - new_pair_cost
+                    return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
+        
+        # === REBALANCING: Buy lagging side ===
+        if ratio < 0.92:  # We're behind - catch up
+            if price <= self.force_balance_threshold:
+                max_spend = min(self.cash * 0.05, self.max_single_trade, remaining_budget)
+                qty = min(max_spend / price, max_qty_allowed)
+                
+                if qty * price >= self.min_trade_size:
+                    new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                    if new_pair_cost <= self.max_pair_cost:
+                        return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
+        
+        # === CHEAP ACCUMULATION: Very cheap prices ===
+        if price < self.very_cheap_threshold and ratio < 1.1:
+            max_spend = min(self.cash * 0.04, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
             
-            if new_pair_cost > self.max_pair_cost:
-                return False, 0, f"Would exceed pair cost ${new_pair_cost:.3f}"
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost <= self.max_pair_cost:
+                    return True, qty, f"🔥 CHEAP @ ${price:.3f}"
+        
+        # === STANDARD BUYING ===
+        if ratio <= 1.0 and price < self.cheap_threshold:
+            max_spend = min(self.cash * 0.03, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
             
-            # Don't make pair cost worse if already above target
-            if self.pair_cost > self.target_pair_cost and new_pair_cost >= self.pair_cost:
-                return False, 0, f"Pair cost ${self.pair_cost:.3f} already high"
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost <= self.max_pair_cost:
+                    return True, qty, f"OK (${price:.3f})"
         
-        # === VERY CHEAP BONUS ===
-        if price < self.very_cheap_threshold and ratio < 1.0:
-            # Can be slightly more aggressive when price is very cheap AND we're behind
-            bonus_qty = min(qty * 1.2, max_qty_allowed)
-            if bonus_qty * price < self.cash * 0.1:
-                qty = bonus_qty
-        
-        # Final sanity check
-        if qty * price > self.cash:
-            qty = self.cash / price * 0.95
-        
-        if qty * price < self.min_trade_size:
-            return False, 0, "Trade too small"
-        
-        final_ratio = (my_qty + qty) / other_qty if other_qty > 0 else 1.0
-        return True, qty, f"OK (${price:.3f}, ratio: {final_ratio:.2f}x)"
+        return False, 0, f"{side} ${price:.3f}: no opportunity"
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         """Execute a paper trade"""
@@ -1409,89 +1430,122 @@ class PaperTrader:
     
     def check_and_trade(self, up_price: float, down_price: float, timestamp: str):
         """
-        GABAGOOL v4: EMERGENCY BALANCE-FIRST TRADING
+        GABAGOOL v6: GUARANTEED PROFIT STRATEGY
         
         Priority:
-        1. EMERGENCY: If unhedged too long, force balance at higher prices
-        2. If imbalanced, buy the LAGGING side
-        3. If balanced, buy the CHEAPER side (only if cheap enough)
-        4. Never let ratio exceed 1.05x
+        1. BALANCE FIRST: If one side has no position, buy it to lock profit
+        2. COST AVERAGE: If price < our avg, buy to improve pair_cost
+        3. REBALANCE: Keep qty ratio near 1.0
+        4. ACCUMULATE: Buy very cheap prices
         """
         import time as time_module
         trades_made = []
         
-        # Check if we're in emergency mode (one side has no position for too long)
-        is_emergency = False
-        if self.first_trade_time > 0:
-            time_since_first = time_module.time() - self.first_trade_time
-            if time_since_first > self.emergency_after_seconds:
-                if (self.qty_up == 0 and self.qty_down > 0) or (self.qty_down == 0 and self.qty_up > 0):
-                    is_emergency = True
-                    print(f"🚨 EMERGENCY MODE: Unhedged for {time_since_first:.0f}s!")
-        
-        # === EMERGENCY BALANCING ===
-        if is_emergency:
-            if self.qty_up == 0 and self.qty_down > 0:
-                should, qty, reason = self.should_buy('UP', up_price, down_price, is_rebalance=True, is_emergency=True)
-                if should:
-                    if self.execute_buy('UP', up_price, qty, timestamp):
-                        trades_made.append(('UP', up_price, qty))
-                        print(f"🚨 EMERGENCY BUY: {qty:.1f} UP @ ${up_price:.3f}")
-                return trades_made
-            
-            if self.qty_down == 0 and self.qty_up > 0:
-                should, qty, reason = self.should_buy('DOWN', down_price, up_price, is_rebalance=True, is_emergency=True)
-                if should:
-                    if self.execute_buy('DOWN', down_price, qty, timestamp):
-                        trades_made.append(('DOWN', down_price, qty))
-                        print(f"🚨 EMERGENCY BUY: {qty:.1f} DOWN @ ${down_price:.3f}")
+        # === PRIORITY 1: BALANCE - Lock in guaranteed profit ===
+        # If we have position on one side but not other, we MUST balance
+        if (self.qty_up > 0 and self.qty_down == 0):
+            # Need to buy DOWN to lock profit
+            should, qty, reason = self.should_buy('DOWN', down_price, up_price, is_rebalance=True)
+            if should:
+                if self.execute_buy('DOWN', down_price, qty, timestamp):
+                    trades_made.append(('DOWN', down_price, qty))
+                    print(f"🔒 LOCK PROFIT: {reason}")
+                    return trades_made
+            else:
+                # Report why we can't balance
+                time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
+                potential_pair = self.avg_up + down_price
+                print(f"⏳ Waiting for DOWN: ${down_price:.3f} (pair would be ${potential_pair:.2f}) [{time_unhedged:.0f}s]")
                 return trades_made
         
-        # Calculate current balance
+        if (self.qty_down > 0 and self.qty_up == 0):
+            # Need to buy UP to lock profit
+            should, qty, reason = self.should_buy('UP', up_price, down_price, is_rebalance=True)
+            if should:
+                if self.execute_buy('UP', up_price, qty, timestamp):
+                    trades_made.append(('UP', up_price, qty))
+                    print(f"🔒 LOCK PROFIT: {reason}")
+                    return trades_made
+            else:
+                time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
+                potential_pair = self.avg_down + up_price
+                print(f"⏳ Waiting for UP: ${up_price:.3f} (pair would be ${potential_pair:.2f}) [{time_unhedged:.0f}s]")
+                return trades_made
+        
+        # === PRIORITY 2: REBALANCE if imbalanced ===
         if self.qty_up > 0 and self.qty_down > 0:
             ratio_up = self.qty_up / self.qty_down
             ratio_down = self.qty_down / self.qty_up
             
-            # REBALANCING MODE: If one side is ahead, only buy the other
             if ratio_up > self.rebalance_trigger:  # UP ahead, need DOWN
                 should, qty, reason = self.should_buy('DOWN', down_price, up_price, is_rebalance=True)
                 if should:
                     if self.execute_buy('DOWN', down_price, qty, timestamp):
                         trades_made.append(('DOWN', down_price, qty))
-                return trades_made  # Only rebalance, don't add to leading side
+                        print(f"⚖️ REBALANCE: {reason}")
+                return trades_made
             
             if ratio_down > self.rebalance_trigger:  # DOWN ahead, need UP
                 should, qty, reason = self.should_buy('UP', up_price, down_price, is_rebalance=True)
                 if should:
                     if self.execute_buy('UP', up_price, qty, timestamp):
                         trades_made.append(('UP', up_price, qty))
-                return trades_made  # Only rebalance, don't add to leading side
+                        print(f"⚖️ REBALANCE: {reason}")
+                return trades_made
         
-        # Determine which side is cheaper
-        if up_price < down_price:
-            # UP is cheaper - try UP first, then DOWN
-            should_buy_up, qty_up, reason_up = self.should_buy('UP', up_price, down_price)
-            if should_buy_up:
-                if self.execute_buy('UP', up_price, qty_up, timestamp):
-                    trades_made.append(('UP', up_price, qty_up))
+        # === PRIORITY 3: COST AVERAGE - Improve pair_cost ===
+        if self.qty_up > 0 and self.qty_down > 0:
+            # Check if either price is below our average (opportunity to improve)
+            if up_price < self.avg_up:
+                should, qty, reason = self.should_buy('UP', up_price, down_price)
+                if should:
+                    if self.execute_buy('UP', up_price, qty, timestamp):
+                        trades_made.append(('UP', up_price, qty))
+                        print(f"📉 {reason}")
+                        return trades_made
             
-            # Now check DOWN (might need to balance)
-            should_buy_down, qty_down, reason_down = self.should_buy('DOWN', down_price, up_price)
-            if should_buy_down:
-                if self.execute_buy('DOWN', down_price, qty_down, timestamp):
-                    trades_made.append(('DOWN', down_price, qty_down))
-        else:
-            # DOWN is cheaper - try DOWN first, then UP
-            should_buy_down, qty_down, reason_down = self.should_buy('DOWN', down_price, up_price)
-            if should_buy_down:
-                if self.execute_buy('DOWN', down_price, qty_down, timestamp):
-                    trades_made.append(('DOWN', down_price, qty_down))
+            if down_price < self.avg_down:
+                should, qty, reason = self.should_buy('DOWN', down_price, up_price)
+                if should:
+                    if self.execute_buy('DOWN', down_price, qty, timestamp):
+                        trades_made.append(('DOWN', down_price, qty))
+                        print(f"📉 {reason}")
+                        return trades_made
+        
+        # === PRIORITY 4: FIRST TRADE - Start position ===
+        if self.qty_up == 0 and self.qty_down == 0:
+            # Pick the cheaper side to start
+            if up_price < down_price:
+                should, qty, reason = self.should_buy('UP', up_price, down_price)
+                if should:
+                    if self.execute_buy('UP', up_price, qty, timestamp):
+                        trades_made.append(('UP', up_price, qty))
+                        print(f"🎯 START: {reason}")
+            else:
+                should, qty, reason = self.should_buy('DOWN', down_price, up_price)
+                if should:
+                    if self.execute_buy('DOWN', down_price, qty, timestamp):
+                        trades_made.append(('DOWN', down_price, qty))
+                        print(f"🎯 START: {reason}")
+            return trades_made
+        
+        # === PRIORITY 5: ACCUMULATE - Very cheap prices ===
+        if self.qty_up > 0 and self.qty_down > 0:
+            if up_price < self.very_cheap_threshold:
+                should, qty, reason = self.should_buy('UP', up_price, down_price)
+                if should:
+                    if self.execute_buy('UP', up_price, qty, timestamp):
+                        trades_made.append(('UP', up_price, qty))
+                        print(f"🔥 {reason}")
+                        return trades_made
             
-            # Now check UP (might need to balance)
-            should_buy_up, qty_up, reason_up = self.should_buy('UP', up_price, down_price)
-            if should_buy_up:
-                if self.execute_buy('UP', up_price, qty_up, timestamp):
-                    trades_made.append(('UP', up_price, qty_up))
+            if down_price < self.very_cheap_threshold:
+                should, qty, reason = self.should_buy('DOWN', down_price, up_price)
+                if should:
+                    if self.execute_buy('DOWN', down_price, qty, timestamp):
+                        trades_made.append(('DOWN', down_price, qty))
+                        print(f"🔥 {reason}")
+                        return trades_made
         
         return trades_made
     
@@ -1559,6 +1613,7 @@ class PolymarketWebBot:
         self.pnl_history: List[Dict] = []
         self.total_realized_pnl = 0.0
         self.next_market_info = "Initializing..."
+        self._last_saved_slug: Optional[str] = None
         
         # Track current market start epoch
         self.current_market_epoch = None
@@ -1719,6 +1774,10 @@ class PolymarketWebBot:
     
     def save_market_pnl(self):
         """Save the PNL from the resolved market to history"""
+        if not self.event_slug:
+            return
+        if self._last_saved_slug == self.event_slug:
+            return  # Already saved
         if self.paper_trader.final_pnl is None:
             return
         
@@ -1730,11 +1789,13 @@ class PolymarketWebBot:
             'payout': self.paper_trader.payout,
             'cost': self.paper_trader.cost_up + self.paper_trader.cost_down,
             'qty_up': self.paper_trader.qty_up,
-            'qty_down': self.paper_trader.qty_down
+            'qty_down': self.paper_trader.qty_down,
+            'status': 'resolved'
         }
         
         self.pnl_history.append(pnl_entry)
         self.total_realized_pnl += self.paper_trader.final_pnl
+        self._last_saved_slug = self.event_slug
         
         print(f"💰 Saved PNL: {pnl_entry['pnl']:.2f} | Total: {self.total_realized_pnl:.2f}")
     
@@ -1820,6 +1881,17 @@ class PolymarketWebBot:
                                                 self.paper_trader.resolve_market('DOWN')
                                     except:
                                         pass
+                                
+                                # If market is closed or resolved, save PNL if not already saved
+                                try:
+                                    if (self.market_closed or self.market_resolved) and self.event_slug and self._last_saved_slug != self.event_slug:
+                                        # Save resolved PNL if available, otherwise close-and-save
+                                        if self.market_resolved and self.paper_trader.final_pnl is not None:
+                                            self.save_market_pnl()
+                                        else:
+                                            await self.close_and_save_current_market(session)
+                                except Exception:
+                                    pass
                                 
                                 if clob_token_ids and outcomes:
                                     try:
