@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Polymarket Web Bot - Bitcoin Up or Down Price Tracker
+Polymarket Web Bot - Multi-Asset Up or Down Price Tracker
 Web-based interface with real-time updates via WebSocket.
+Supports multiple assets (BTC, ETH) simultaneously.
 """
 
 import asyncio
@@ -13,8 +14,8 @@ from typing import Optional, List, Dict
 from aiohttp import web
 import os
 
-# Asset to track (btc, eth, sol, xrp)
-ASSET = "btc"
+# Assets to track (can be multiple)
+ASSETS = os.getenv("ASSETS", "btc,eth").split(",")
 
 # Market interval in minutes
 MARKET_INTERVAL_MINUTES = 15
@@ -55,6 +56,31 @@ HTML_TEMPLATE = """
             border-bottom: 1px solid #3b82f6;
             padding-bottom: 15px;
             margin-bottom: 20px;
+        }
+        
+        /* Asset selector buttons */
+        .asset-btn {
+            background: #1f2937;
+            color: #9ca3af;
+            border: 2px solid #374151;
+            padding: 8px 20px;
+            margin: 0 5px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 1rem;
+            transition: all 0.2s;
+        }
+        
+        .asset-btn:hover {
+            background: #374151;
+            color: #fff;
+        }
+        
+        .asset-btn.active {
+            background: #3b82f6;
+            color: #fff;
+            border-color: #60a5fa;
         }
         
         .header h1 {
@@ -327,6 +353,11 @@ HTML_TEMPLATE = """
             color: #000;
         }
         
+        .market-status.sold {
+            background: #8b5cf6;
+            color: #fff;
+        }
+        
         .trading-stats {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
@@ -595,11 +626,47 @@ HTML_TEMPLATE = """
             color: #000;
             animation: pulse 1.5s infinite;
         }
+
+        .sell-mode-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+
+        .sell-mode-badge.on {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .sell-mode-badge.off {
+            background: #374151;
+            color: #e5e7eb;
+        }
+
+        .sell-mode-alert {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            font-weight: bold;
+            text-align: center;
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid #ef4444;
+            color: #fecaca;
+            display: none;
+        }
+
+        .sell-mode-alert.active {
+            display: block;
+            animation: pulse 1.5s infinite;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
+            <div id="asset-buttons" style="margin-bottom: 10px;"></div>
             <h1>🤖 POLYMARKET BOT - <span id="market-title">Bitcoin Up or Down</span></h1>
             <div class="market">Market: <span id="event-slug">Loading...</span></div>
             <div class="info">
@@ -696,8 +763,13 @@ HTML_TEMPLATE = """
         <div class="trading-section">
             <div class="trading-header">
                 <h2>📈 Paper Trading Bot <span id="bot-status-badge" class="bot-status-badge active">ACTIVE</span></h2>
-                <span id="market-status" class="market-status open">OPEN</span>
+                <div>
+                    <span id="market-status" class="market-status open">OPEN</span>
+                    <span id="sell-mode-badge" class="sell-mode-badge off">SELL MODE: OFF</span>
+                </div>
             </div>
+
+            <div id="sell-mode-alert" class="sell-mode-alert">🚨 SELL MODE ACTIVE — no locked profit after 5m</div>
             
             <div class="control-buttons">
                 <button id="pause-btn" class="control-btn pause" onclick="togglePause()">
@@ -795,7 +867,43 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             
-            <div style="color: #9ca3af; font-size: 0.8rem; margin-bottom: 10px;">📜 Trade Log</div>
+            <!-- Position Value Tracking -->
+            <div class="pair-cost-bar" style="border: 1px solid #22c55e; margin-top: 15px;">
+                <div class="pair-cost-header">
+                    <span class="pair-cost-label">📊 Position Value vs Cost</span>
+                    <span id="value-vs-cost" class="pair-cost-value profit">$0.00</span>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px;">
+                    <div style="text-align: center;">
+                        <div style="color: #9ca3af; font-size: 0.75rem;">UP Value</div>
+                        <div id="up-position-value" style="color: #22c55e; font-weight: bold;">$0.00</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #9ca3af; font-size: 0.75rem;">DOWN Value</div>
+                        <div id="down-position-value" style="color: #ef4444; font-weight: bold;">$0.00</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #9ca3af; font-size: 0.75rem;">Total Value</div>
+                        <div id="total-position-value" style="color: #fbbf24; font-weight: bold;">$0.00</div>
+                    </div>
+                </div>
+                <div style="margin-top: 10px; padding: 8px; background: rgba(0,0,0,0.3); border-radius: 4px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+                        <span style="color: #9ca3af;">Total Cost:</span>
+                        <span id="total-cost-display" style="color: #ef4444;">$0.00</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-top: 4px;">
+                        <span style="color: #9ca3af;">Current Value:</span>
+                        <span id="current-value-display" style="color: #22c55e;">$0.00</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-top: 6px; padding-top: 6px; border-top: 1px solid #374151;">
+                        <span style="color: #fbbf24; font-weight: bold;">Value Profit:</span>
+                        <span id="value-profit-display" style="font-weight: bold;">$0.00</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div style="color: #9ca3af; font-size: 0.8rem; margin-bottom: 10px; margin-top: 15px;">📜 Trade Log</div>
             <div class="trade-log" id="trade-log">
                 <div class="trade-entry" style="color: #6b7280;">Waiting for trading signals...</div>
             </div>
@@ -874,11 +982,55 @@ HTML_TEMPLATE = """
             document.getElementById('status').className = 'disconnected';
         };
         
+        // Multi-asset state management
+        let assetData = {};  // Store data for each asset
+        let currentAsset = 'btc';  // Currently displayed asset
+        
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
-            updateDisplay(data);
-            updatePaperTrading(data);
+            const asset = data.asset || 'unknown';
+            
+            // Store data for this asset
+            assetData[asset] = data;
+            
+            // Update asset indicator if we have both
+            updateAssetIndicators();
+            
+            // Only update display if this is the currently selected asset
+            if (asset === currentAsset) {
+                updateDisplay(data);
+                updatePaperTrading(data);
+            }
         };
+        
+        function switchAsset(asset) {
+            currentAsset = asset;
+            // Update buttons
+            document.querySelectorAll('.asset-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.getElementById('asset-' + asset).classList.add('active');
+            
+            // Update display with stored data
+            if (assetData[asset]) {
+                updateDisplay(assetData[asset]);
+                updatePaperTrading(assetData[asset]);
+            }
+        }
+        
+        function updateAssetIndicators() {
+            const assets = Object.keys(assetData);
+            const container = document.getElementById('asset-buttons');
+            if (!container || container.dataset.initialized) return;
+            
+            let html = '';
+            assets.forEach(asset => {
+                const isActive = asset === currentAsset ? 'active' : '';
+                html += `<button id="asset-${asset}" class="asset-btn ${isActive}" onclick="switchAsset('${asset}')">${asset.toUpperCase()}</button>`;
+            });
+            container.innerHTML = html;
+            container.dataset.initialized = 'true';
+        }
         
         function formatSize(size) {
             if (size >= 1000000) return (size / 1000000).toFixed(1) + 'M';
@@ -996,6 +1148,19 @@ HTML_TEMPLATE = """
             const statusEl = document.getElementById('market-status');
             statusEl.textContent = pt.market_status.toUpperCase();
             statusEl.className = 'market-status ' + pt.market_status;
+
+            // Update sell mode badge
+            const sellOn = !!pt.sell_mode;
+            const sellModeEl = document.getElementById('sell-mode-badge');
+            if (sellModeEl) {
+                sellModeEl.textContent = sellOn ? 'SELL MODE: ON' : 'SELL MODE: OFF';
+                sellModeEl.className = 'sell-mode-badge ' + (sellOn ? 'on' : 'off');
+            }
+
+            const sellAlertEl = document.getElementById('sell-mode-alert');
+            if (sellAlertEl) {
+                sellAlertEl.className = sellOn ? 'sell-mode-alert active' : 'sell-mode-alert';
+            }
             
             // Update stats
             document.getElementById('cash-remaining').textContent = '$' + pt.cash.toFixed(2);
@@ -1060,14 +1225,35 @@ HTML_TEMPLATE = """
             unrealizedEl.textContent = (unrealizedPnl >= 0 ? '+' : '') + '$' + unrealizedPnl.toFixed(2);
             unrealizedEl.className = 'value ' + (unrealizedPnl >= 0 ? 'profit' : 'loss');
             
-            // Show final PnL if market is resolved
-            if (pt.market_status === 'resolved' && pt.final_pnl !== undefined) {
+            // Update position value tracking
+            const upPosValue = pt.current_up_value || 0;
+            const downPosValue = pt.current_down_value || 0;
+            const totalPosValue = pt.current_total_value || 0;
+            const valueVsCost = pt.value_vs_cost || 0;
+            
+            document.getElementById('up-position-value').textContent = '$' + upPosValue.toFixed(2);
+            document.getElementById('down-position-value').textContent = '$' + downPosValue.toFixed(2);
+            document.getElementById('total-position-value').textContent = '$' + totalPosValue.toFixed(2);
+            document.getElementById('total-cost-display').textContent = '$' + totalCost.toFixed(2);
+            document.getElementById('current-value-display').textContent = '$' + totalPosValue.toFixed(2);
+            
+            const valueProfitEl = document.getElementById('value-profit-display');
+            valueProfitEl.textContent = (valueVsCost >= 0 ? '+' : '') + '$' + valueVsCost.toFixed(2);
+            valueProfitEl.style.color = valueVsCost >= 0 ? '#22c55e' : '#ef4444';
+            
+            const valueVsCostEl = document.getElementById('value-vs-cost');
+            valueVsCostEl.textContent = (valueVsCost >= 0 ? '+' : '') + '$' + valueVsCost.toFixed(2);
+            valueVsCostEl.className = 'pair-cost-value ' + (valueVsCost >= 0 ? 'profit' : 'loss');
+            
+            // Show final PnL if market is resolved OR sold
+            if ((pt.market_status === 'resolved' || pt.market_status === 'sold') && pt.final_pnl !== undefined && pt.final_pnl !== null) {
                 document.getElementById('final-pnl-section').style.display = 'block';
                 const finalPnlEl = document.getElementById('final-pnl');
                 finalPnlEl.textContent = (pt.final_pnl >= 0 ? '+' : '') + '$' + pt.final_pnl.toFixed(2);
                 finalPnlEl.className = 'value ' + (pt.final_pnl >= 0 ? 'profit' : 'loss');
+                const statusText = pt.market_status === 'sold' ? 'Positions sold' : 'Market resolved';
                 document.getElementById('resolution-outcome').textContent = 
-                    'Market resolved: ' + pt.resolution_outcome + ' | Payout: $' + pt.payout.toFixed(2);
+                    statusText + ': ' + pt.resolution_outcome + ' | Payout: $' + pt.payout.toFixed(2);
             }
             
             // Update PNL history
@@ -1174,10 +1360,10 @@ class PaperTrader:
         # REALITY: Polymarket spread is often ~1.01, so we accept slight risk
         
         self.target_pair_cost = 0.96    # Target pair cost for good profit margin
-        self.max_pair_cost = 1.02       # Accept up to 2% loss risk to participate
+        self.max_pair_cost = 0.995      # NEVER exceed $1.00 - this is the profit threshold!
         self.cheap_threshold = 0.48     # "Cheap" price to start buying
         self.force_balance_threshold = 0.80  # Buy other side at this price if pair_cost is OK
-        self.max_balance_price = 0.90   # Absolute max to pay for balancing (emergency)
+        self.max_balance_price = 0.88   # Absolute max to pay for balancing (emergency) - tighter limit
         self.very_cheap_threshold = 0.40 # Super cheap - accumulate more aggressively
         self.min_trade_size = 3.0       # Minimum trade size
         self.max_single_trade = 12.0    # Max single trade
@@ -1185,19 +1371,32 @@ class PaperTrader:
         self.last_trade_time = 0
         self.first_trade_time = 0       # When we made our first trade
         self.force_balance_after_seconds = 60  # Force balance after 60 seconds!
+        self.initial_trade_usd = 35.0   # Initial trade size ($30-40)
+        self.max_loss_per_market = 50.0 # Max loss per market
+        self.sell_mode = False
+        self.sell_mode_trigger_seconds = 300  # 5 minutes
+        self.sell_mode_min_profit = 1.0
+        self.market_start_time = None
+        
+        # === VALUE-BASED PROFIT TAKING ===
+        # Sell when position value exceeds total cost by this amount
+        self.value_profit_threshold = 2.00  # Sell when value > cost + $2.00 (absolute)
+        self.min_profit_pct = 0.03  # Or when profit > 3% of cost AND > $1.00 minimum
+        
+        # Track current position values (updated each tick)
+        self.current_up_value = 0.0
+        self.current_down_value = 0.0
+        self.current_total_value = 0.0
         
         # === BALANCE IS KING ===
         # Without balance, there is NO guaranteed profit
-        self.max_qty_ratio = 1.15       # Max imbalance allowed (15%)
+        # BUT we allow temporary imbalance to achieve pair_cost < $1.00
+        self.max_qty_ratio = 1.35       # Normal max imbalance (35%)
+        self.emergency_ratio = 2.0      # Allow HIGH imbalance when fixing pair_cost > $1.00
+        self.recovery_ratio = 2.5       # Max ratio when actively recovering (EXTREME)
         self.target_qty_ratio = 1.0     # Perfect balance
-        self.rebalance_trigger = 1.08   # Start rebalancing at 8% imbalance
-        self.max_position_pct = 0.40    # Max 40% of balance per market (need reserves)
-        
-        # Balance constraints
-        # Allow some imbalance if we're getting great prices
-        self.max_qty_ratio = 1.20       # Allow more imbalance (was 1.05)
-        self.target_qty_ratio = 1.0     # Ideal ratio (perfectly balanced)
-        self.rebalance_trigger = 1.10   # Start rebalancing when ratio exceeds this (was 1.03)
+        self.rebalance_trigger = 1.15   # Start rebalancing when ratio exceeds this
+        self.max_position_pct = 0.50    # Max 50% of balance per market (more aggressive)
         
     @property
     def avg_up(self) -> float:
@@ -1218,6 +1417,182 @@ class PaperTrader:
         min_qty = min(self.qty_up, self.qty_down)
         total_cost = self.cost_up + self.cost_down
         return min_qty - total_cost
+
+    def set_market_start_time(self, start_time: Optional[datetime]):
+        if start_time:
+            self.market_start_time = start_time.timestamp()
+        else:
+            self.market_start_time = None
+
+    def update_sell_mode(self, now_ts: float, market_elapsed: Optional[float] = None):
+        if self.sell_mode:
+            return
+        elapsed = market_elapsed
+        if elapsed is None and self.market_start_time:
+            elapsed = now_ts - self.market_start_time
+        if elapsed is None:
+            return
+        # Only trigger sell mode if we have positions but no locked profit
+        has_positions = self.qty_up > 0 or self.qty_down > 0
+        if has_positions and elapsed >= self.sell_mode_trigger_seconds and self.locked_profit <= 0:
+            self.sell_mode = True
+            print("🚨 SELL MODE ACTIVE (no locked profit after 5m)")
+
+    def unrealized_pnl(self, up_price: float, down_price: float) -> float:
+        total_cost = self.cost_up + self.cost_down
+        current_value = (self.qty_up * up_price) + (self.qty_down * down_price)
+        return current_value - total_cost
+    
+    def update_position_values(self, up_bid: float, down_bid: float):
+        """Update current position values based on bid prices (what we could sell for)"""
+        self.current_up_value = self.qty_up * up_bid if up_bid > 0 else 0.0
+        self.current_down_value = self.qty_down * down_bid if down_bid > 0 else 0.0
+        self.current_total_value = self.current_up_value + self.current_down_value
+    
+    def should_take_profit(self) -> tuple:
+        """Check if we should sell positions to lock in profit based on current value.
+        
+        Returns (should_sell, reason)
+        """
+        if self.qty_up == 0 and self.qty_down == 0:
+            return False, "No positions"
+        
+        total_cost = self.cost_up + self.cost_down
+        if total_cost == 0:
+            return False, "No cost"
+        
+        profit = self.current_total_value - total_cost
+        profit_pct = profit / total_cost if total_cost > 0 else 0
+        
+        # Check absolute profit threshold ($1.50 or more)
+        if profit >= self.value_profit_threshold:
+            return True, f"Value profit: ${profit:.2f} (${self.current_total_value:.2f} > ${total_cost:.2f})"
+        
+        # Check percentage profit threshold (3% or more AND at least $1.00)
+        if profit_pct >= self.min_profit_pct and profit >= 1.00:
+            return True, f"Pct profit: {profit_pct*100:.1f}% (${profit:.2f})"
+        
+        return False, f"Profit ${profit:.2f} below threshold (need ${self.value_profit_threshold:.2f} or {self.min_profit_pct*100:.0f}%)"
+
+    def improves_pair_cost(self, side: str, price: float, qty: float) -> bool:
+        if self.qty_up == 0 or self.qty_down == 0:
+            return True
+        _, new_pair_cost = self.simulate_buy(side, price, qty)
+        return new_pair_cost < self.pair_cost
+
+    def improves_locked_profit(self, side: str, price: float, qty: float) -> bool:
+        return self.locked_profit_after_buy(side, price, qty) > self.locked_profit
+
+    def locked_profit_after_buy(self, side: str, price: float, qty: float) -> float:
+        cost = price * qty
+        new_qty_up = self.qty_up + qty if side == 'UP' else self.qty_up
+        new_qty_down = self.qty_down + qty if side == 'DOWN' else self.qty_down
+        new_cost_up = self.cost_up + cost if side == 'UP' else self.cost_up
+        new_cost_down = self.cost_down + cost if side == 'DOWN' else self.cost_down
+        if new_qty_up == 0 or new_qty_down == 0:
+            return 0.0
+        total_cost = new_cost_up + new_cost_down
+        return min(new_qty_up, new_qty_down) - total_cost
+
+    def sell_mode_allows_buy(self, side: str, price: float, qty: float) -> tuple:
+        """Check if a buy is allowed in sell mode.
+        
+        In sell mode, we still allow trades that:
+        1. Lock in positive profit (locked_profit > 0 after trade)
+        2. Improve the pair cost (even if profit not yet locked)
+        3. Improve locked profit compared to current locked profit
+        
+        This allows the bot to keep improving positions during price swings.
+        """
+        if not self.sell_mode:
+            return True, ""
+        
+        locked_after = self.locked_profit_after_buy(side, price, qty)
+        
+        # If this trade results in positive locked profit, always allow
+        if locked_after > 0:
+            return True, f"Sell mode: locks ${locked_after:.2f} profit"
+        
+        # If we already have locked profit and this improves it, allow
+        if self.locked_profit > 0 and locked_after > self.locked_profit:
+            return True, f"Sell mode: improves locked profit ${self.locked_profit:.2f}→${locked_after:.2f}"
+        
+        # If this improves pair cost AND we have balanced positions, allow
+        # (this can help swing towards profit during price movements)
+        if self.qty_up > 0 and self.qty_down > 0 and self.improves_pair_cost(side, price, qty):
+            _, new_pair_cost = self.simulate_buy(side, price, qty)
+            if new_pair_cost < self.pair_cost - 0.005:  # At least 0.5 cent improvement
+                return True, f"Sell mode: improves pair ${self.pair_cost:.3f}→${new_pair_cost:.3f}"
+        
+        return False, "Sell mode: trade doesn't improve position"
+
+    def execute_sell_all(self, up_price: float, down_price: float, timestamp: str, reason: str) -> bool:
+        """Sell all positions and calculate final PnL.
+        
+        This also records the final PnL so it can be saved to history
+        even when selling before market resolution.
+        """
+        import time as time_module
+        proceeds = 0.0
+        sold_any = False
+        
+        # Store original quantities and costs for PnL calculation
+        original_qty_up = self.qty_up
+        original_qty_down = self.qty_down
+        original_cost_up = self.cost_up
+        original_cost_down = self.cost_down
+        total_cost = original_cost_up + original_cost_down
+
+        if self.qty_up > 0 and up_price > 0:
+            proceeds += self.qty_up * up_price
+            self.trade_log.append({
+                'time': timestamp,
+                'side': 'SELL',
+                'token': 'UP',
+                'price': up_price,
+                'qty': self.qty_up,
+                'cost': -(self.qty_up * up_price),
+                'note': reason
+            })
+            self.qty_up = 0.0
+            self.cost_up = 0.0
+            sold_any = True
+
+        if self.qty_down > 0 and down_price > 0:
+            proceeds += self.qty_down * down_price
+            self.trade_log.append({
+                'time': timestamp,
+                'side': 'SELL',
+                'token': 'DOWN',
+                'price': down_price,
+                'qty': self.qty_down,
+                'cost': -(self.qty_down * down_price),
+                'note': reason
+            })
+            self.qty_down = 0.0
+            self.cost_down = 0.0
+            sold_any = True
+
+        if not sold_any:
+            return False
+
+        self.cash += proceeds
+        self.trade_count += 1
+        self.last_trade_time = time_module.time()
+        
+        # Calculate and store final PnL from the sale
+        self.final_pnl = proceeds - total_cost
+        self.payout = proceeds
+        self.resolution_outcome = f"{reason} (sold)"
+        # Note: Keep qty values for history, restore them temporarily for the pnl entry
+        self._sold_qty_up = original_qty_up
+        self._sold_qty_down = original_qty_down
+        self._sold_cost = total_cost
+
+        if len(self.trade_log) > 20:
+            self.trade_log = self.trade_log[-20:]
+
+        return True
     
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         """Simulate what happens if we buy, returns (new_avg, new_pair_cost)"""
@@ -1272,6 +1647,9 @@ class PaperTrader:
         other_cost = self.cost_down if side == 'UP' else self.cost_up
         other_avg = other_cost / other_qty if other_qty > 0 else 0
         other_side = 'DOWN' if side == 'UP' else 'UP'
+
+        if self.sell_mode and my_qty == 0 and other_qty == 0:
+            return False, 0, "Sell mode: waiting for lockable profit"
         
         # === POSITION SIZE LIMIT ===
         total_spent = self.cost_up + self.cost_down
@@ -1292,9 +1670,12 @@ class PaperTrader:
             if potential_pair_cost > self.max_pair_cost:
                 return False, 0, f"Pair would be ${potential_pair_cost:.2f} > ${self.max_pair_cost} - waiting"
             
-            max_spend = min(self.cash * 0.05, self.max_single_trade, remaining_budget)
+            max_spend = min(self.initial_trade_usd, self.max_single_trade, remaining_budget, self.cash)
             qty = max_spend / price
             self.first_trade_time = now
+            allowed, reason = self.sell_mode_allows_buy(side, price, qty)
+            if not allowed:
+                return False, 0, reason
             return True, qty, f"🎯 First trade (pair potential: ${potential_pair_cost:.2f})"
         
         # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
@@ -1332,63 +1713,143 @@ class PaperTrader:
             if qty < target_qty * 0.5:
                 # Can't afford enough - buy what we can
                 qty = max(qty, self.min_trade_size / price)
-            
+            allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+            if not allowed:
+                return False, 0, reason_block
             return True, qty, reason
         
         # === BOTH SIDES HAVE POSITIONS - OPTIMIZE PAIR COST ===
         current_pair_cost = self.pair_cost
         ratio = my_qty / other_qty if other_qty > 0 else 1.0
         
-        # Hard block at max ratio
-        if ratio >= self.max_qty_ratio:
-            return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x)"
+        # === RECOVERY MODE: When pair_cost > $1.00, be VERY aggressive ===
+        # The ONLY thing that matters is getting pair_cost under $1.00
+        # We don't care about temporary locked_profit loss!
+        recovery_mode = current_pair_cost >= 1.0
         
-        max_qty_allowed = other_qty * self.max_qty_ratio - my_qty
+        # Dynamic ratio limit based on how critical the situation is
+        if recovery_mode:
+            # The worse the pair_cost, the more imbalance we allow
+            if current_pair_cost >= 1.05:
+                effective_max_ratio = self.recovery_ratio  # 2.5x - extreme
+            elif current_pair_cost >= 1.02:
+                effective_max_ratio = self.emergency_ratio  # 2.0x - high
+            else:
+                effective_max_ratio = 1.80  # Getting better but still aggressive
+        else:
+            effective_max_ratio = self.max_qty_ratio  # 1.35x - normal
+        
+        # Hard block at effective max ratio
+        if ratio >= effective_max_ratio:
+            return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x, limit {effective_max_ratio:.2f}x)"
+        
+        max_qty_allowed = other_qty * effective_max_ratio - my_qty
         if max_qty_allowed <= 0:
             return False, 0, "At ratio limit"
         
-        # === COST AVERAGING: Buy if it improves pair cost ===
-        # Only buy if new price < current avg (improves our average)
-        if price < my_avg:
-            # This will improve our avg and lower pair cost!
-            max_spend = min(self.cash * 0.04, self.max_single_trade, remaining_budget)
+        # === RECOVERY MODE: AGGRESSIVE COST AVERAGING ===
+        # When pair_cost > $1.00, we need to get it under $1.00 FAST
+        # Accept any trade that improves pair_cost, even at the expense of balance
+        if recovery_mode and price < my_avg:
+            # In recovery, allow MUCH larger trades to fix the situation faster
+            spend_pct = 0.15 if current_pair_cost >= 1.02 else 0.10
+            max_spend = min(self.cash * spend_pct, self.max_single_trade * 2, remaining_budget + 50)  # Allow overspend
             qty = min(max_spend / price, max_qty_allowed)
             
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
                 if new_pair_cost < current_pair_cost:
                     improvement = current_pair_cost - new_pair_cost
-                    return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
+                    
+                    if new_pair_cost < 1.0:
+                        # SUCCESS! This gets us under $1.00
+                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                        if not allowed:
+                            return False, 0, reason_block
+                        return True, qty, f"🎯 RECOVERY SUCCESS: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (UNDER $1.00!)"
+                    
+                    if improvement >= 0.002:  # Even tiny improvements count in recovery
+                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                        if not allowed:
+                            return False, 0, reason_block
+                        return True, qty, f"🚨 RECOVERY: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
-        # === REBALANCING: Buy lagging side ===
-        if ratio < 0.92:  # We're behind - catch up
-            if price <= self.force_balance_threshold:
-                max_spend = min(self.cash * 0.05, self.max_single_trade, remaining_budget)
-                qty = min(max_spend / price, max_qty_allowed)
-                
-                if qty * price >= self.min_trade_size:
-                    new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                    if new_pair_cost <= self.max_pair_cost:
-                        return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
-        
-        # === CHEAP ACCUMULATION: Very cheap prices ===
-        if price < self.very_cheap_threshold and ratio < 1.1:
-            max_spend = min(self.cash * 0.04, self.max_single_trade, remaining_budget)
+        # === NORMAL MODE: COST AVERAGING ===
+        # Only buy if new price < current avg (improves our average)
+        if not recovery_mode and price < my_avg:
+            # Standard conservative trading
+            spend_pct = 0.04
+            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
             qty = min(max_spend / price, max_qty_allowed)
             
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost <= self.max_pair_cost:
-                    return True, qty, f"🔥 CHEAP @ ${price:.3f}"
+                if new_pair_cost < current_pair_cost:
+                    improvement = current_pair_cost - new_pair_cost
+                    
+                    # Normal case: require both pair cost and locked profit improvement
+                    if self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty):
+                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                        if not allowed:
+                            return False, 0, reason_block
+                        return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
+        
+        # === REBALANCING: Buy lagging side ===
+        if ratio < 0.92:  # We're behind - catch up
+            price_threshold = self.max_balance_price if recovery_mode else self.force_balance_threshold
+            if price <= price_threshold:
+                spend_pct = 0.10 if recovery_mode else 0.05
+                max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+                qty = min(max_spend / price, max_qty_allowed)
+                
+                if qty * price >= self.min_trade_size:
+                    new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                    pair_cost_ok = new_pair_cost <= self.max_pair_cost
+                    pair_cost_improving = new_pair_cost < current_pair_cost
+                    
+                    # In recovery mode, just check if it improves pair_cost
+                    # In normal mode, require both pair_cost AND locked_profit improvement
+                    should_trade = (recovery_mode and pair_cost_improving) or \
+                                   (pair_cost_ok and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty))
+                    
+                    if should_trade:
+                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                        if not allowed:
+                            return False, 0, reason_block
+                        prefix = "🚨" if recovery_mode else "⚖️"
+                        return True, qty, f"{prefix} REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
+        
+        # === CHEAP ACCUMULATION: Very cheap prices ===
+        if price < self.very_cheap_threshold and ratio < 1.1:
+            spend_pct = 0.08 if recovery_mode else 0.04
+            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
+            
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                pair_cost_improving = new_pair_cost < current_pair_cost
+                
+                should_trade = (recovery_mode and pair_cost_improving) or \
+                               (new_pair_cost <= self.max_pair_cost and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty))
+                
+                if should_trade:
+                    allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                    if not allowed:
+                        return False, 0, reason_block
+                    prefix = "🚨" if recovery_mode else "🔥"
+                    return True, qty, f"{prefix} CHEAP @ ${price:.3f}"
         
         # === STANDARD BUYING ===
-        if ratio <= 1.0 and price < self.cheap_threshold:
+        if ratio <= 1.0 and price < self.cheap_threshold and not recovery_mode:
             max_spend = min(self.cash * 0.03, self.max_single_trade, remaining_budget)
             qty = min(max_spend / price, max_qty_allowed)
             
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost <= self.max_pair_cost:
+                if new_pair_cost <= self.max_pair_cost and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty):
+                    allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
+                    if not allowed:
+                        return False, 0, reason_block
                     return True, qty, f"OK (${price:.3f})"
         
         return False, 0, f"{side} ${price:.3f}: no opportunity"
@@ -1428,11 +1889,12 @@ class PaperTrader:
         
         return True
     
-    def check_and_trade(self, up_price: float, down_price: float, timestamp: str):
+    def check_and_trade(self, up_price: float, down_price: float, timestamp: str, up_bid: Optional[float] = None, down_bid: Optional[float] = None, market_elapsed: Optional[float] = None):
         """
         GABAGOOL v6: GUARANTEED PROFIT STRATEGY
         
         Priority:
+        0. VALUE-BASED PROFIT TAKING: Sell if position value > total cost
         1. BALANCE FIRST: If one side has no position, buy it to lock profit
         2. COST AVERAGE: If price < our avg, buy to improve pair_cost
         3. REBALANCE: Keep qty ratio near 1.0
@@ -1440,6 +1902,38 @@ class PaperTrader:
         """
         import time as time_module
         trades_made = []
+        now_ts = time_module.time()
+        self.update_sell_mode(now_ts, market_elapsed)
+        sell_up_price = up_bid if up_bid and up_bid > 0 else up_price
+        sell_down_price = down_bid if down_bid and down_bid > 0 else down_price
+        
+        # Update position values for tracking
+        self.update_position_values(sell_up_price, sell_down_price)
+        
+        unrealized = self.unrealized_pnl(sell_up_price, sell_down_price)
+
+        # === PRIORITY 0: MAX LOSS PROTECTION ===
+        if unrealized <= -self.max_loss_per_market and (self.qty_up > 0 or self.qty_down > 0):
+            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Max loss"):
+                self.market_status = 'sold'
+            return trades_made
+        
+        # === PRIORITY 0.5: VALUE-BASED PROFIT TAKING ===
+        # If current position value exceeds total cost, sell to lock profit!
+        should_sell, sell_reason = self.should_take_profit()
+        if should_sell:
+            print(f"💰 PROFIT TAKING: {sell_reason}")
+            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, sell_reason):
+                self.market_status = 'sold'
+            return trades_made
+
+        if self.sell_mode:
+            # In sell mode with positive unrealized profit, sell to lock it in
+            if unrealized >= self.sell_mode_min_profit:
+                if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Sell mode profit"):
+                    self.market_status = 'sold'
+                return trades_made
+            # NOTE: Don't return here! Continue to check for opportunities to improve position
         
         # === PRIORITY 1: BALANCE - Lock in guaranteed profit ===
         # If we have position on one side but not other, we MUST balance
@@ -1570,10 +2064,16 @@ class PaperTrader:
     
     def get_state(self) -> dict:
         """Return current state for broadcasting"""
+        # Use stored sold quantities if available for display consistency
+        qty_up = getattr(self, '_sold_qty_up', self.qty_up) if self.market_status == 'sold' else self.qty_up
+        qty_down = getattr(self, '_sold_qty_down', self.qty_down) if self.market_status == 'sold' else self.qty_down
+        
+        total_cost = self.cost_up + self.cost_down
+        
         return {
             'cash': self.cash,
-            'qty_up': self.qty_up,
-            'qty_down': self.qty_down,
+            'qty_up': qty_up,
+            'qty_down': qty_down,
             'cost_up': self.cost_up,
             'cost_down': self.cost_down,
             'avg_up': self.avg_up,
@@ -1585,7 +2085,14 @@ class PaperTrader:
             'market_status': self.market_status,
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
-            'payout': self.payout
+            'payout': self.payout,
+            'sell_mode': self.sell_mode,
+            # Position value tracking
+            'current_up_value': self.current_up_value,
+            'current_down_value': self.current_down_value,
+            'current_total_value': self.current_total_value,
+            'total_cost': total_cost,
+            'value_vs_cost': self.current_total_value - total_cost if total_cost > 0 else 0.0
         }
 
 
@@ -1727,8 +2234,18 @@ class PolymarketWebBot:
         
         # Check if we have any positions
         pt = self.paper_trader
+        
+        # Check if positions were already sold (market_status == 'sold')
+        if pt.market_status == 'sold' and pt.final_pnl is not None:
+            self.save_market_pnl()
+            return
+        
         if pt.qty_up == 0 and pt.qty_down == 0:
-            print(f"📭 Market {self.event_slug} closed with no positions")
+            # Check if we have stored sold quantities (from execute_sell_all)
+            if hasattr(pt, '_sold_qty_up') and (pt._sold_qty_up > 0 or getattr(pt, '_sold_qty_down', 0) > 0):
+                self.save_market_pnl()
+            else:
+                print(f"📭 Market {self.event_slug} closed with no positions")
             return
         
         # Try to fetch final resolution from API
@@ -1739,12 +2256,24 @@ class PolymarketWebBot:
             self.save_market_pnl()
             return
         
-        # If not resolved yet, estimate PNL based on hedged position
-        # For a hedged position: guaranteed payout = min(qty_up, qty_down)
-        # PNL = guaranteed_payout - total_cost
-        guaranteed_payout = min(pt.qty_up, pt.qty_down)
+        # If not resolved yet, estimate PNL by liquidating at best bids
+        up_bid = 0.0
+        down_bid = 0.0
+        if self.up_token_id:
+            up_book = await self.fetch_orderbook(session, self.up_token_id)
+            if up_book and up_book.get('bids'):
+                up_bid = max(float(b.get('price', 0.0)) for b in up_book.get('bids', []) if b.get('price'))
+
+        if self.down_token_id:
+            down_book = await self.fetch_orderbook(session, self.down_token_id)
+            if down_book and down_book.get('bids'):
+                down_bid = max(float(b.get('price', 0.0)) for b in down_book.get('bids', []) if b.get('price'))
+
+        liquidation_value = (pt.qty_up * up_bid) + (pt.qty_down * down_bid)
+        if liquidation_value == 0 and (pt.qty_up > 0 or pt.qty_down > 0):
+            liquidation_value = min(pt.qty_up, pt.qty_down)
         total_cost = pt.cost_up + pt.cost_down
-        estimated_pnl = guaranteed_payout - total_cost
+        estimated_pnl = liquidation_value - total_cost
         
         # Determine likely outcome based on final prices
         outcome = 'HEDGED'
@@ -1758,7 +2287,7 @@ class PolymarketWebBot:
             'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
             'outcome': outcome,
             'pnl': estimated_pnl,
-            'payout': guaranteed_payout,
+            'payout': liquidation_value,
             'cost': total_cost,
             'qty_up': pt.qty_up,
             'qty_down': pt.qty_down,
@@ -1773,7 +2302,7 @@ class PolymarketWebBot:
         print(f"   PNL: ${estimated_pnl:.2f} | Total: ${self.total_realized_pnl:.2f}")
     
     def save_market_pnl(self):
-        """Save the PNL from the resolved market to history"""
+        """Save the PNL from the resolved or sold market to history"""
         if not self.event_slug:
             return
         if self._last_saved_slug == self.event_slug:
@@ -1781,20 +2310,27 @@ class PolymarketWebBot:
         if self.paper_trader.final_pnl is None:
             return
         
+        pt = self.paper_trader
+        
+        # Use stored sold quantities if available (from execute_sell_all)
+        qty_up = getattr(pt, '_sold_qty_up', pt.qty_up)
+        qty_down = getattr(pt, '_sold_qty_down', pt.qty_down)
+        cost = getattr(pt, '_sold_cost', pt.cost_up + pt.cost_down)
+        
         pnl_entry = {
             'slug': self.event_slug,
             'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
-            'outcome': self.paper_trader.resolution_outcome or 'Unknown',
-            'pnl': self.paper_trader.final_pnl,
-            'payout': self.paper_trader.payout,
-            'cost': self.paper_trader.cost_up + self.paper_trader.cost_down,
-            'qty_up': self.paper_trader.qty_up,
-            'qty_down': self.paper_trader.qty_down,
-            'status': 'resolved'
+            'outcome': pt.resolution_outcome or 'Unknown',
+            'pnl': pt.final_pnl,
+            'payout': pt.payout,
+            'cost': cost,
+            'qty_up': qty_up,
+            'qty_down': qty_down,
+            'status': 'sold' if 'sold' in str(pt.resolution_outcome) else 'resolved'
         }
         
         self.pnl_history.append(pnl_entry)
-        self.total_realized_pnl += self.paper_trader.final_pnl
+        self.total_realized_pnl += pt.final_pnl
         self._last_saved_slug = self.event_slug
         
         print(f"💰 Saved PNL: {pnl_entry['pnl']:.2f} | Total: {self.total_realized_pnl:.2f}")
@@ -1808,6 +2344,7 @@ class PolymarketWebBot:
         self.market_closed = False
         self.market_resolved = False
         self.paper_trader = PaperTrader(starting_balance=1000.0)
+        self.paper_trader.set_market_start_time(None)
         
     async def fetch_event_data(self, session: aiohttp.ClientSession):
         """Fetch event data from Gamma API"""
@@ -1852,6 +2389,8 @@ class PolymarketWebBot:
                                         self.window_end = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                                 except:
                                     pass
+
+                        self.paper_trader.set_market_start_time(self.window_start)
                         
                         # Get markets from event
                         markets = event.get('markets', [])
@@ -1882,13 +2421,13 @@ class PolymarketWebBot:
                                     except:
                                         pass
                                 
-                                # If market is closed or resolved, save PNL if not already saved
+                                # If market is closed, resolved, or sold, save PNL if not already saved
                                 try:
-                                    if (self.market_closed or self.market_resolved) and self.event_slug and self._last_saved_slug != self.event_slug:
-                                        # Save resolved PNL if available, otherwise close-and-save
-                                        if self.market_resolved and self.paper_trader.final_pnl is not None:
+                                    if (self.market_closed or self.market_resolved or self.paper_trader.market_status == 'sold') and self.event_slug and self._last_saved_slug != self.event_slug:
+                                        # Save PNL if available (resolved or sold)
+                                        if self.paper_trader.final_pnl is not None:
                                             self.save_market_pnl()
-                                        else:
+                                        elif self.market_resolved or self.market_closed:
                                             await self.close_and_save_current_market(session)
                                 except Exception:
                                     pass
@@ -2053,6 +2592,8 @@ class PolymarketWebBot:
                         # Asks are sorted ascending, so first ask is cheapest
                         asks_up = up_book.get('asks', [])
                         asks_down = down_book.get('asks', [])
+                        bids_up = up_book.get('bids', [])
+                        bids_down = down_book.get('bids', [])
                         
                         # Find lowest ask price
                         if asks_up:
@@ -2064,6 +2605,16 @@ class PolymarketWebBot:
                             down_ask = min(float(a.get('price', 1.0)) for a in asks_down if a.get('price'))
                         else:
                             down_ask = down_mid if down_mid > 0 else 0.5
+
+                        if bids_up:
+                            up_bid = max(float(b.get('price', 0.0)) for b in bids_up if b.get('price'))
+                        else:
+                            up_bid = up_mid if up_mid > 0 else up_ask
+
+                        if bids_down:
+                            down_bid = max(float(b.get('price', 0.0)) for b in bids_down if b.get('price'))
+                        else:
+                            down_bid = down_mid if down_mid > 0 else down_ask
                         
                         # Debug: print status every 10 updates
                         if self.update_count % 10 == 0:
@@ -2081,23 +2632,27 @@ class PolymarketWebBot:
                             
                             status = "✅ HEDGED" if (pt.qty_up > 0 and pt.qty_down > 0) else f"⚠️ UNHEDGED {unhedged_time:.0f}s"
                             
-                            print(f"📊 UP: ${up_ask:.3f} | DOWN: ${down_ask:.3f} | {status}")
-                            print(f"   Qty: {pt.qty_up:.1f}U / {pt.qty_down:.1f}D | Ratio: {ratio:.3f}x")
-                            print(f"   Pair Cost: ${pt.pair_cost:.3f} | Locked PnL: ${locked_pnl:.2f}")
-                            print(f"   Cash: ${pt.cash:.2f} | Trades: {pt.trade_count}")
+                            print(f"📊 [{self.asset.upper()}] UP: ${up_ask:.3f} | DOWN: ${down_ask:.3f} | {status}")
+                            print(f"   [{self.asset.upper()}] Qty: {pt.qty_up:.1f}U / {pt.qty_down:.1f}D | Ratio: {ratio:.3f}x")
+                            print(f"   [{self.asset.upper()}] Pair Cost: ${pt.pair_cost:.3f} | Locked PnL: ${locked_pnl:.2f}")
+                            print(f"   [{self.asset.upper()}] Cash: ${pt.cash:.2f} | Trades: {pt.trade_count}")
                         
                         timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-                        trades = self.paper_trader.check_and_trade(up_ask, down_ask, timestamp)
+                        market_elapsed = None
+                        if self.window_start:
+                            market_elapsed = (datetime.now(timezone.utc) - self.window_start).total_seconds()
+                        trades = self.paper_trader.check_and_trade(up_ask, down_ask, timestamp, up_bid=up_bid, down_bid=down_bid, market_elapsed=market_elapsed)
                         
                         if trades:
                             for side, price, qty in trades:
                                 pt = self.paper_trader
-                                print(f"📈 BUY {qty:.1f} {side} @ ${price:.3f} | Pair Cost: ${pt.pair_cost:.4f} | Balance: {pt.qty_up:.0f}U/{pt.qty_down:.0f}D")
+                                print(f"📈 [{self.asset.upper()}] BUY {qty:.1f} {side} @ ${price:.3f} | Pair Cost: ${pt.pair_cost:.4f} | Balance: {pt.qty_up:.0f}U/{pt.qty_down:.0f}D")
                     
                     # Prepare data for broadcast
                     window_time = f"{self.window_start.strftime('%H:%M') if self.window_start else '--:--'} - {self.window_end.strftime('%H:%M') if self.window_end else '--:--'}"
                     
                     data = {
+                        'asset': self.asset,  # Identify which asset this data is for
                         'title': self.market_title,
                         'event_slug': self.event_slug or 'Discovering...',
                         'window_time': window_time,
@@ -2126,8 +2681,16 @@ class PolymarketWebBot:
                 await asyncio.sleep(1)
 
 
-# Create bot instance
-bot = PolymarketWebBot(asset=ASSET, interval_minutes=MARKET_INTERVAL_MINUTES)
+# Create bot instances - one per asset
+bots: Dict[str, 'PolymarketWebBot'] = {}
+for asset in ASSETS:
+    asset = asset.strip().lower()
+    if asset:
+        bots[asset] = PolymarketWebBot(asset=asset, interval_minutes=MARKET_INTERVAL_MINUTES)
+        print(f"📊 Created bot for {asset.upper()}")
+
+# For backward compatibility
+bot = list(bots.values())[0] if bots else None
 
 
 async def index_handler(request):
@@ -2140,8 +2703,10 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
-    bot.websockets.add(ws)
-    print(f"WebSocket client connected. Total clients: {len(bot.websockets)}")
+    # Add to all bots
+    for b in bots.values():
+        b.websockets.add(ws)
+    print(f"WebSocket client connected. Total clients: {len(list(bots.values())[0].websockets) if bots else 0}")
     
     try:
         async for msg in ws:
@@ -2149,35 +2714,52 @@ async def websocket_handler(request):
                 try:
                     data = json.loads(msg.data)
                     command = data.get('command')
+                    asset = data.get('asset', '').lower()
+                    
+                    # Handle commands for specific asset or all
+                    target_bots = [bots[asset]] if asset and asset in bots else list(bots.values())
                     
                     if command == 'toggle_pause':
-                        bot.toggle_pause()
+                        for b in target_bots:
+                            b.toggle_pause()
                     elif command == 'reset_bot':
-                        bot.reset_bot()
+                        for b in target_bots:
+                            b.reset_bot()
+                    elif command == 'toggle_sell_mode':
+                        for b in target_bots:
+                            b.paper_trader.sell_mode = not b.paper_trader.sell_mode
+                            print(f"🎯 {b.asset.upper()} Sell Mode: {'ON' if b.paper_trader.sell_mode else 'OFF'}")
                 except json.JSONDecodeError:
                     pass
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 break
     finally:
-        bot.websockets.discard(ws)
-        print(f"WebSocket client disconnected. Total clients: {len(bot.websockets)}")
+        for b in bots.values():
+            b.websockets.discard(ws)
+        print(f"WebSocket client disconnected. Total clients: {len(list(bots.values())[0].websockets) if bots else 0}")
     
     return ws
 
 
 async def start_background_tasks(app):
-    """Start the data fetching loop"""
-    app['data_task'] = asyncio.create_task(bot.data_loop())
+    """Start the data fetching loop for all bots"""
+    app['data_tasks'] = []
+    for asset, b in bots.items():
+        task = asyncio.create_task(b.data_loop())
+        app['data_tasks'].append(task)
+        print(f"🚀 Started data loop for {asset.upper()}")
 
 
 async def cleanup_background_tasks(app):
-    """Stop the data fetching loop"""
-    bot.running = False
-    app['data_task'].cancel()
-    try:
-        await app['data_task']
-    except asyncio.CancelledError:
-        pass
+    """Stop the data fetching loops"""
+    for b in bots.values():
+        b.running = False
+    for task in app.get('data_tasks', []):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def main():
@@ -2189,8 +2771,8 @@ def main():
     app.on_cleanup.append(cleanup_background_tasks)
     
     print(f"🤖 Polymarket Web Bot starting...")
-    print(f"📊 Asset: {ASSET.upper()} | Interval: {MARKET_INTERVAL_MINUTES}m")
-    print(f"🔍 Auto-discovery enabled - will find current market automatically")
+    print(f"📊 Assets: {', '.join([a.upper() for a in ASSETS])} | Interval: {MARKET_INTERVAL_MINUTES}m")
+    print(f"🔍 Auto-discovery enabled - will find current markets automatically")
     print(f"🌐 Open http://localhost:8080 in your browser")
     print(f"Press Ctrl+C to stop")
     print()

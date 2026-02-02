@@ -15,7 +15,7 @@ from aiohttp import web
 import os
 
 # Supported assets
-SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
+SUPPORTED_ASSETS = ['btc', 'eth']
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
@@ -139,6 +139,16 @@ HTML_TEMPLATE = """
             padding: 2px 8px;
             border-radius: 4px;
         }
+
+        .sell-mode-badge {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 6px;
+        }
+
+        .sell-mode-on { background: #ef4444; color: #fff; }
+        .sell-mode-off { background: #374151; color: #e5e7eb; }
         
         .status-open { background: #22c55e; color: #000; }
         .status-closed { background: #f59e0b; color: #000; }
@@ -290,7 +300,7 @@ HTML_TEMPLATE = """
         
         <div class="asset-stats" style="margin-bottom: 20px;">
             <h2 style="color: #3b82f6; margin-bottom: 10px;">📊 W/D/L per Asset</h2>
-            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;" id="asset-wdl-stats">
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;" id="asset-wdl-stats">
                 <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
                     <span class="asset-badge asset-btc">BTC</span>
                     <div style="margin-top: 8px; font-size: 12px;">
@@ -301,22 +311,6 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
                     <span class="asset-badge asset-eth">ETH</span>
-                    <div style="margin-top: 8px; font-size: 12px;">
-                        <span class="profit">W: --</span> | 
-                        <span style="color: #888;">D: --</span> | 
-                        <span class="loss">L: --</span>
-                    </div>
-                </div>
-                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
-                    <span class="asset-badge asset-sol">SOL</span>
-                    <div style="margin-top: 8px; font-size: 12px;">
-                        <span class="profit">W: --</span> | 
-                        <span style="color: #888;">D: --</span> | 
-                        <span class="loss">L: --</span>
-                    </div>
-                </div>
-                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
-                    <span class="asset-badge asset-xrp">XRP</span>
                     <div style="margin-top: 8px; font-size: 12px;">
                         <span class="profit">W: --</span> | 
                         <span style="color: #888;">D: --</span> | 
@@ -439,7 +433,7 @@ HTML_TEMPLATE = """
             if (data.asset_wdl) {
                 const wdlContainer = document.getElementById('asset-wdl-stats');
                 let wdlHtml = '';
-                const assets = ['btc', 'eth', 'sol', 'xrp'];
+                const assets = ['btc', 'eth'];
                 for (const asset of assets) {
                     const stats = data.asset_wdl[asset] || { wins: 0, draws: 0, losses: 0, total: 0, total_pnl: 0 };
                     const winPct = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(0) : '--';
@@ -479,6 +473,8 @@ HTML_TEMPLATE = """
                     const asset = market.asset.toUpperCase();
                     const statusClass = pt.market_status === 'open' ? 'status-open' : 
                                        pt.market_status === 'resolved' ? 'status-resolved' : 'status-closed';
+                    const sellModeClass = pt.sell_mode ? 'sell-mode-on' : 'sell-mode-off';
+                    const sellModeLabel = pt.sell_mode ? 'SELL MODE' : 'SELL MODE: OFF';
                     
                     const lockedPnl = Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
                     
@@ -486,11 +482,15 @@ HTML_TEMPLATE = """
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
                             <div class="market-header">
                                 <span class="asset-badge asset-${market.asset}">${asset}</span>
-                                <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
+                                <div>
+                                    <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
+                                    <span class="sell-mode-badge ${sellModeClass}">${sellModeLabel}</span>
+                                </div>
                             </div>
-                            <div style="font-size: 11px; color: #888; margin-bottom: 10px;">
+                            <div style="font-size: 11px; color: #888; margin-bottom: 6px;">
                                 ${market.window_time || slug}
                             </div>
+                            ${pt.sell_mode ? '<div style="margin-bottom: 8px; padding: 6px 8px; border: 1px solid #ef4444; border-radius: 6px; color: #fecaca; font-weight: bold; background: rgba(239, 68, 68, 0.2);">🚨 SELL MODE ACTIVE</div>' : ''}
                             <div class="prices-row">
                                 <div class="price-box price-up">
                                     <div class="price-label">UP</div>
@@ -655,11 +655,16 @@ class PaperTrader:
         self.emergency_rebalance_price = 0.60
         
         # Position sizing
-        self.min_trade_size = 5.0
+        self.min_trade_size = 3.0
         self.max_single_trade = 12.0      # Smaller trades for safety
         self.cooldown_seconds = 5         # Longer cooldown for better prices
         self.last_trade_time = 0
         self.first_trade_time = 0
+        self.initial_trade_usd = 35.0
+        self.max_loss_per_market = 50.0     # Stop trading if expected loss > this
+        self.sell_mode = False
+        self.sell_mode_trigger_seconds = 300
+        self.sell_mode_min_profit = 1.0
         
         # Timing - be more patient before accepting bad hedges
         self.emergency_after_seconds = 300
@@ -681,7 +686,7 @@ class PaperTrader:
         self.max_unhedged_cost = 15.0      # Max $ spent on one side without hedge
         self.forced_hedge_threshold = 0.70 # Force hedge even at this price if unhedged too long
         self.forced_hedge_time = 480       # Force hedge after 8 minutes unhedged
-        self.max_loss_per_market = 5.0     # Stop trading if expected loss > this
+        
         
         # SMART HEDGE: Over-hedge to guarantee profit on hedge side
         self.enable_smart_hedge = True     # Enable over-hedging strategy
@@ -716,6 +721,95 @@ class PaperTrader:
         min_qty = min(self.qty_up, self.qty_down)
         total_cost = self.cost_up + self.cost_down
         return min_qty - total_cost
+
+    def update_sell_mode(self, market_elapsed: Optional[float] = None):
+        if self.sell_mode:
+            return
+        if market_elapsed is None:
+            return
+        # Only trigger sell mode if we have positions but no locked profit
+        has_positions = self.qty_up > 0 or self.qty_down > 0
+        if has_positions and market_elapsed >= self.sell_mode_trigger_seconds and self.locked_profit <= 0:
+            self.sell_mode = True
+            print(f"🚨 SELL MODE ACTIVE [{self.market_slug}] (no locked profit after 5m)")
+
+    def unrealized_pnl(self, up_price: float, down_price: float) -> float:
+        total_cost = self.cost_up + self.cost_down
+        current_value = (self.qty_up * up_price) + (self.qty_down * down_price)
+        return current_value - total_cost
+
+    def improves_pair_cost(self, side: str, price: float, qty: float) -> bool:
+        if self.qty_up == 0 or self.qty_down == 0:
+            return True
+        _, new_pair_cost = self.simulate_buy(side, price, qty)
+        return new_pair_cost < self.pair_cost
+
+    def improves_locked_profit(self, side: str, price: float, qty: float) -> bool:
+        return self.locked_profit_after_buy(side, price, qty) > self.locked_profit
+
+    def locked_profit_after_buy(self, side: str, price: float, qty: float) -> float:
+        cost = price * qty
+        new_qty_up = self.qty_up + qty if side == 'UP' else self.qty_up
+        new_qty_down = self.qty_down + qty if side == 'DOWN' else self.qty_down
+        new_cost_up = self.cost_up + cost if side == 'UP' else self.cost_up
+        new_cost_down = self.cost_down + cost if side == 'DOWN' else self.cost_down
+        if new_qty_up == 0 or new_qty_down == 0:
+            return 0.0
+        total_cost = new_cost_up + new_cost_down
+        return min(new_qty_up, new_qty_down) - total_cost
+
+    def sell_mode_allows_buy(self, side: str, price: float, qty: float) -> tuple:
+        if not self.sell_mode:
+            return True, ""
+        if self.locked_profit_after_buy(side, price, qty) > 0:
+            return True, ""
+        return False, "Sell mode: profit not lockable"
+
+    def execute_sell_all(self, up_price: float, down_price: float, timestamp: str, reason: str) -> bool:
+        proceeds = 0.0
+        sold_any = False
+
+        if self.qty_up > 0 and up_price > 0:
+            proceeds += self.qty_up * up_price
+            self.trade_log.append({
+                'time': timestamp,
+                'side': 'SELL',
+                'token': 'UP',
+                'price': up_price,
+                'qty': self.qty_up,
+                'cost': -(self.qty_up * up_price),
+                'note': reason
+            })
+            self.qty_up = 0.0
+            self.cost_up = 0.0
+            sold_any = True
+
+        if self.qty_down > 0 and down_price > 0:
+            proceeds += self.qty_down * down_price
+            self.trade_log.append({
+                'time': timestamp,
+                'side': 'SELL',
+                'token': 'DOWN',
+                'price': down_price,
+                'qty': self.qty_down,
+                'cost': -(self.qty_down * down_price),
+                'note': reason
+            })
+            self.qty_down = 0.0
+            self.cost_down = 0.0
+            sold_any = True
+
+        if not sold_any:
+            return False
+
+        self.cash += proceeds
+        self.trade_count += 1
+        self.last_trade_time = time.time()
+
+        if len(self.trade_log) > 20:
+            self.trade_log = self.trade_log[-20:]
+
+        return True
     
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         cost = price * qty
@@ -840,6 +934,23 @@ class PaperTrader:
         my_qty = self.qty_up if side == 'UP' else self.qty_down
         other_qty = self.qty_down if side == 'UP' else self.qty_up
         other_side = 'DOWN' if side == 'UP' else 'UP'
+
+        def approve_buy(qty: float, reason: str) -> tuple:
+            if qty <= 0:
+                return False, 0, "Invalid qty"
+            # For scaling (both sides have positions), require pair_cost AND locked_profit improvement
+            # For first trade or hedge (one side is 0), allow freely
+            is_scaling = self.qty_up > 0 and self.qty_down > 0
+            if is_scaling:
+                if not self.improves_pair_cost(side, price, qty) or not self.improves_locked_profit(side, price, qty):
+                    return False, 0, "Scaling blocked: must improve pair cost AND locked profit"
+            allowed, block_reason = self.sell_mode_allows_buy(side, price, qty)
+            if not allowed:
+                return False, 0, block_reason
+            return True, qty, reason
+
+        if self.sell_mode and my_qty == 0 and other_qty == 0:
+            return False, 0, "Sell mode: waiting for lockable profit"
         
         # ═══════════════════════════════════════════════════════════════════
         # MARKET ANALYSIS
@@ -871,7 +982,7 @@ class PaperTrader:
             
             # SAFETY: Limit first trade size to max_unhedged_cost
             # This prevents large losses if we never find a good hedge
-            max_first_trade = min(self.max_unhedged_cost, self.cash * 0.015)
+            max_first_trade = min(self.max_unhedged_cost, self.initial_trade_usd, self.cash)
             
             # Imbalanced market: even smaller position
             if is_imbalanced_market:
@@ -882,7 +993,7 @@ class PaperTrader:
             qty = max_spend / price
             self.first_trade_time = now
             expected_profit = (1.0 - estimated_pair_cost) * qty
-            return True, qty, f"First trade @ ${price:.2f} (max exposure: ${max_spend:.2f})"
+            return approve_buy(qty, f"First trade @ ${price:.2f} (max exposure: ${max_spend:.2f})")
         
         # Must balance before adding more
         if other_qty == 0 and my_qty > 0:
@@ -906,7 +1017,7 @@ class PaperTrader:
                 max_spend = min(target_qty * price, self.cash * 0.3, self.max_single_trade * 2)
                 qty = max_spend / price
                 total_profit = profit_per_pair * min(qty, other_qty)
-                return True, qty, f"✅ PROFIT hedge: ${total_profit:.2f} (pair: ${simulated_pair_cost:.3f})"
+                return approve_buy(qty, f"✅ PROFIT hedge: ${total_profit:.2f} (pair: ${simulated_pair_cost:.3f})")
             
             # ═══════════════════════════════════════════════════════════════════
             # SMART HEDGE: Over-hedge to guarantee profit on hedge side
@@ -921,7 +1032,7 @@ class PaperTrader:
                     if qty * price <= self.cash:
                         win_profit = smart['pnl_if_hedge_wins']
                         lose_loss = smart['pnl_if_original_wins']
-                        return True, qty, f"🎯 SMART hedge: +${win_profit:.2f} if {side} wins, ${lose_loss:.2f} if not"
+                        return approve_buy(qty, f"🎯 SMART hedge: +${win_profit:.2f} if {side} wins, ${lose_loss:.2f} if not")
             
             # SAFETY CHECK: If we've spent too much unhedged, force a hedge
             # to limit maximum possible loss
@@ -940,7 +1051,7 @@ class PaperTrader:
                     qty = max_spend / price
                     expected_loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
                     reason = f"{time_to_close:.0f}s left" if time_pressure else f"waited {time_unhedged:.0f}s"
-                    return True, qty, f"🛡️ FORCED hedge to limit loss: -${expected_loss:.2f} ({reason})"
+                    return approve_buy(qty, f"🛡️ FORCED hedge to limit loss: -${expected_loss:.2f} ({reason})")
             
             # BREAK-EVEN SCENARIO: Accept minimal loss/gain to secure position
             # But be patient - try to find a better opportunity first!
@@ -965,7 +1076,7 @@ class PaperTrader:
                     target_qty = other_qty
                     max_spend = min(target_qty * price, self.cash * 0.25)
                     qty = max_spend / price
-                    return True, qty, f"⚖️ Break-even hedge (pair: ${simulated_pair_cost:.3f}, {urgency_reason})"
+                    return approve_buy(qty, f"⚖️ Break-even hedge (pair: ${simulated_pair_cost:.3f}, {urgency_reason})")
             
             # EMERGENCY SCENARIO: Market closing very soon
             if time_to_close is not None and time_to_close < 60:  # Less than 1 minute
@@ -976,7 +1087,7 @@ class PaperTrader:
                     max_spend = min(target_qty * price, self.cash * 0.4)
                     qty = max_spend / price
                     loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
-                    return True, qty, f"⚠️ EMERGENCY: -${loss:.2f} loss ({time_to_close:.0f}s left!)"
+                    return approve_buy(qty, f"⚠️ EMERGENCY: -${loss:.2f} loss ({time_to_close:.0f}s left!)")
             
             # Not urgent yet - keep waiting for better prices
             wait_msg = f"waited {time_unhedged:.0f}s" if time_unhedged > 0 else ""
@@ -1060,7 +1171,7 @@ class PaperTrader:
         min_hedged = min(my_qty + qty, other_qty)
         total_profit = profit_per_pair * min_hedged
         
-        return True, qty, f"Add {side} (profit: ${total_profit:.2f}, pair: ${final_pair_cost:.3f})"
+        return approve_buy(qty, f"Add {side} (profit: ${total_profit:.2f}, pair: ${final_pair_cost:.3f})")
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         cost = price * qty
@@ -1092,8 +1203,26 @@ class PaperTrader:
         
         return True
     
-    def check_and_trade(self, up_price: float, down_price: float, timestamp: str, time_to_close: float = None):
+    def check_and_trade(self, up_price: float, down_price: float, timestamp: str, time_to_close: float = None, up_bid: Optional[float] = None, down_bid: Optional[float] = None):
         trades_made = []
+        market_elapsed = None
+        if time_to_close is not None:
+            market_elapsed = max(0.0, 900.0 - time_to_close)
+        self.update_sell_mode(market_elapsed)
+        sell_up_price = up_bid if up_bid and up_bid > 0 else up_price
+        sell_down_price = down_bid if down_bid and down_bid > 0 else down_price
+        unrealized = self.unrealized_pnl(sell_up_price, sell_down_price)
+
+        if unrealized <= -self.max_loss_per_market and (self.qty_up > 0 or self.qty_down > 0):
+            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Max loss"):
+                self.market_status = 'closed'
+            return trades_made
+
+        if self.sell_mode:
+            if unrealized >= self.sell_mode_min_profit:
+                if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Sell mode profit"):
+                    self.market_status = 'closed'
+                return trades_made
         
         if self.qty_up > 0 and self.qty_down > 0:
             ratio_up = self.qty_up / self.qty_down
@@ -1170,7 +1299,8 @@ class PaperTrader:
             'market_status': self.market_status,
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
-            'payout': self.payout
+            'payout': self.payout,
+            'sell_mode': self.sell_mode
         }
 
 
@@ -1186,6 +1316,8 @@ class MarketTracker:
         self.window_end = None
         self.up_price = None
         self.down_price = None
+        self.last_up_bid = 0.0
+        self.last_down_bid = 0.0
         self.paper_trader = PaperTrader(cash_ref, slug)
         self.initialized = False
         self.last_update = 0
@@ -1414,21 +1546,22 @@ class MultiMarketBot:
             if tracker.paper_trader.market_status == 'open':
                 # Market closed - liquidate positions and move to history
                 pt = tracker.paper_trader
-                min_qty = min(pt.qty_up, pt.qty_down)
-                payout = min_qty  # Guaranteed payout from locked pairs
+                liquidation_value = (pt.qty_up * tracker.last_up_bid) + (pt.qty_down * tracker.last_down_bid)
+                if liquidation_value == 0 and (pt.qty_up > 0 or pt.qty_down > 0):
+                    liquidation_value = min(pt.qty_up, pt.qty_down)
                 total_cost = pt.cost_up + pt.cost_down
-                pnl = payout - total_cost
+                pnl = liquidation_value - total_cost
                 
                 # Add payout back to cash
-                self.cash_ref['balance'] += payout
+                self.cash_ref['balance'] += liquidation_value
                 
                 # Mark as resolved with "CLOSED" outcome
                 pt.market_status = 'resolved'
                 pt.resolution_outcome = 'CLOSED'
-                pt.payout = payout
+                pt.payout = liquidation_value
                 pt.final_pnl = pnl
                 
-                print(f"🔒 Market closed: {tracker.slug} | Liquidated: ${payout:.2f} | PnL: ${pnl:+.2f}")
+                print(f"🔒 Market closed: {tracker.slug} | Liquidated: ${liquidation_value:.2f} | PnL: ${pnl:+.2f}")
                 
                 # Add to history
                 self.history.append({
@@ -1439,7 +1572,7 @@ class MultiMarketBot:
                     'qty_up': pt.qty_up,
                     'qty_down': pt.qty_down,
                     'pair_cost': pt.pair_cost,
-                    'payout': payout,
+                    'payout': liquidation_value,
                     'pnl': pnl
                 })
             return
@@ -1464,12 +1597,28 @@ class MultiMarketBot:
             # Extract prices
             asks_up = up_book.get('asks', [])
             asks_down = down_book.get('asks', [])
+            bids_up = up_book.get('bids', [])
+            bids_down = down_book.get('bids', [])
             
             if asks_up:
                 tracker.up_price = min(float(a.get('price', 1.0)) for a in asks_up if a.get('price'))
             
             if asks_down:
                 tracker.down_price = min(float(a.get('price', 1.0)) for a in asks_down if a.get('price'))
+
+            bids_up = up_book.get('bids', [])
+            bids_down = down_book.get('bids', [])
+            if bids_up:
+                tracker.last_up_bid = max(float(b.get('price', 0.0)) for b in bids_up if b.get('price'))
+            if bids_down:
+                tracker.last_down_bid = max(float(b.get('price', 0.0)) for b in bids_down if b.get('price'))
+
+            up_bid = None
+            down_bid = None
+            if bids_up:
+                up_bid = max(float(b.get('price', 0.0)) for b in bids_up if b.get('price'))
+            if bids_down:
+                down_bid = max(float(b.get('price', 0.0)) for b in bids_down if b.get('price'))
             
             # Paper trading - calculate time to close for urgency
             if tracker.up_price and tracker.down_price and tracker.paper_trader.market_status == 'open':
@@ -1488,7 +1637,9 @@ class MultiMarketBot:
                     tracker.up_price, 
                     tracker.down_price, 
                     timestamp,
-                    time_to_close=time_to_close
+                    time_to_close=time_to_close,
+                    up_bid=up_bid,
+                    down_bid=down_bid
                 )
                 
                 if trades:
