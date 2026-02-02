@@ -645,13 +645,13 @@ class PaperTrader:
         self.target_pair_cost = 0.95     # Ideal pair cost target
         self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
-        # Position sizing (10x increased)
-        self.min_trade_size = 3.0        # Was 0.3
-        self.max_single_trade = 15.0     # Was 1.5
+        # Position sizing (scaled down 10x for $100 bankroll)
+        self.min_trade_size = 0.3
+        self.max_single_trade = 1.5
         self.cooldown_seconds = 4
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 35.0    # Was 3.5
+        self.initial_trade_usd = 3.5
         self.max_position_pct = 0.50     # Max 50% of balance per market
         self.force_balance_after_seconds = 120
         
@@ -1182,15 +1182,15 @@ class PaperTrader:
                         new_fees = fee_up + fee_down
 
                         new_total_spent = new_cost_up + new_cost_down
-                        new_sum_qty = new_qty_up + new_qty_down
+                        new_min_qty = min(new_qty_up, new_qty_down)
 
-                        # STRICT: sum(qty) must exceed total_spent + fees AND pair_cost < $1.00
-                        if new_pair_cost < pair_cost and new_pair_cost < 1.00 and new_sum_qty > (new_total_spent + new_fees):
+                        # STRICT: each side qty must exceed total_spent + fees AND pair_cost < $1.00
+                        if new_pair_cost < pair_cost and new_pair_cost < 1.00 and new_min_qty > (new_total_spent + new_fees):
                             if self.execute_buy(cheaper_side, cheaper_price, test_qty, timestamp):
                                 trades_made.append((cheaper_side, cheaper_price, test_qty))
                                 print(
                                     f"📉 [AGGRESSIVE REDUCE] Bought {test_qty:.1f} {cheaper_side} @ ${cheaper_price:.3f} | "
-                                    f"pair ${pair_cost:.3f}→${new_pair_cost:.3f} | sum_qty ${new_sum_qty:.1f} > spent ${new_total_spent + new_fees:.2f}"
+                                    f"pair ${pair_cost:.3f}→${new_pair_cost:.3f} | min_qty ${new_min_qty:.1f} > spent ${new_total_spent + new_fees:.2f}"
                                 )
                             return trades_made
             
