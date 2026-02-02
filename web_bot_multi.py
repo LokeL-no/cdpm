@@ -638,7 +638,7 @@ class PaperTrader:
         self.resolution_outcome = None
         self.final_pnl = None
         self.payout = 0.0
-        self.starting_balance = 1000.0
+        self.starting_balance = 100.0
         
         # === GABAGOOL v7 - RECOVERY MODE STRATEGY ===
         # Core principle: Get pair_cost < $1.00 by ANY means necessary
@@ -652,12 +652,12 @@ class PaperTrader:
         self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
         # Position sizing
-        self.min_trade_size = 3.0
-        self.max_single_trade = 15.0
+        self.min_trade_size = 0.3
+        self.max_single_trade = 1.5
         self.cooldown_seconds = 4
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 35.0
+        self.initial_trade_usd = 3.5
         self.max_position_pct = 0.50     # Max 50% of balance per market
         self.force_balance_after_seconds = 120
         
@@ -668,6 +668,19 @@ class PaperTrader:
         self.recovery_ratio = 2.5       # Max ratio when actively recovering (EXTREME)
         self.target_qty_ratio = 1.0     # Perfect balance
         self.rebalance_trigger = 1.15   # Start rebalancing when ratio exceeds this
+        
+        # === FEE AWARENESS ===
+        # Polymarket charges 3.1% fees - profit must exceed this to be real
+        self.fee_rate = 0.031             # 3.1% fee
+        self.max_entry_pair_potential = 1.05  # Allow entry even if pair > $1.00 - we'll improve via cost averaging
+        
+        # === SELL MODE (DISABLED) ===
+        # Sell mode was designed to exit positions when stuck without profit
+        # Currently DISABLED - recovery mode should fix pair_cost instead
+        self.sell_mode = False
+        self.sell_mode_trigger_seconds = 300  # 5 minutes (but won't trigger since disabled)
+        self.sell_mode_min_profit = 0.05      # Min profit to sell in sell mode
+        self.max_loss_per_market = 5.0        # Max loss before forced exit
         
     @property
     def cash(self):
@@ -698,15 +711,8 @@ class PaperTrader:
         return min_qty - total_cost
 
     def update_sell_mode(self, market_elapsed: Optional[float] = None):
-        if self.sell_mode:
-            return
-        if market_elapsed is None:
-            return
-        # Only trigger sell mode if we have positions but no locked profit
-        has_positions = self.qty_up > 0 or self.qty_down > 0
-        if has_positions and market_elapsed >= self.sell_mode_trigger_seconds and self.locked_profit <= 0:
-            self.sell_mode = True
-            print(f"🚨 SELL MODE ACTIVE [{self.market_slug}] (no locked profit after 5m)")
+        # SELL MODE DISABLED - Recovery mode should fix pair_cost instead
+        return
 
     def unrealized_pnl(self, up_price: float, down_price: float) -> float:
         total_cost = self.cost_up + self.cost_down
@@ -932,66 +938,78 @@ class PaperTrader:
         if remaining_budget <= self.min_trade_size and not is_emergency and not (my_qty == 0 and other_qty > 0):
             return False, 0, f"Position limit reached (spent ${total_spent:.0f})"
         
-        # === FIRST TRADE: Only start if we can get good pair_cost ===
+        # === FIRST TRADE: Buy cheap side, will hedge later ===
         if my_qty == 0 and other_qty == 0:
             if price > self.cheap_threshold:
                 return False, 0, f"First trade needs price < ${self.cheap_threshold}"
             
+            # Don't start if market is about to close (need time to hedge)
+            if time_to_close is not None and time_to_close < 120:
+                return False, 0, f"Only {time_to_close:.0f}s left - too late to start"
+            
+            # Check if this trade could realistically be profitable after fees
+            # For profit after 3.1% fees, we need pair_cost < ~0.969
+            # Only enter if potential pair cost would allow profit after fees
             potential_pair_cost = price + other_price
-            if potential_pair_cost > self.max_pair_cost:
-                return False, 0, f"Pair would be ${potential_pair_cost:.2f} > ${self.max_pair_cost} - waiting"
+            if potential_pair_cost > self.max_entry_pair_potential:
+                return False, 0, f"Pair potential ${potential_pair_cost:.3f} > ${self.max_entry_pair_potential} - can't cover fees"
             
             max_spend = min(self.initial_trade_usd, self.max_single_trade, remaining_budget, self.cash)
             qty = max_spend / price
             self.first_trade_time = now
-            return True, qty, f"🎯 First trade (pair potential: ${potential_pair_cost:.2f})"
+            return True, qty, f"🎯 First trade @ ${price:.3f} (potential pair: ${potential_pair_cost:.3f})"
         
         # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
         if my_qty == 0 and other_qty > 0:
             time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
             potential_pair_cost = other_avg + price
             
-            if time_unhedged > self.force_balance_after_seconds:
-                if potential_pair_cost < self.max_pair_cost:
-                    price_threshold = self.max_balance_price
-                    reason = f"🚨 FORCE BALANCE ({time_unhedged:.0f}s unhedged)"
-                else:
-                    return False, 0, f"🚨 Pair cost ${potential_pair_cost:.2f} too high even for emergency"
+            # Determine urgency and reason
+            if time_unhedged > 30:
+                reason = f"🔒 HEDGE (waited {time_unhedged:.0f}s)"
             elif potential_pair_cost < self.target_pair_cost:
-                price_threshold = self.force_balance_threshold
                 reason = f"✅ GOOD PAIR COST (${potential_pair_cost:.2f})"
             else:
-                price_threshold = self.cheap_threshold
-                reason = "⏳ Waiting for better price"
+                reason = f"🔒 HEDGE (pair: ${potential_pair_cost:.2f})"
             
-            if price > price_threshold:
-                return False, 0, f"Need {side} < ${price_threshold:.2f} (pair would be ${potential_pair_cost:.2f})"
-            
+            # Hedge to match qty - use available cash
             target_qty = other_qty
-            max_spend = min(target_qty * price, self.cash * 0.3, remaining_budget + 20)
+            cost_needed = target_qty * price
+            max_spend = min(cost_needed, self.cash)  # Use what we have, up to what we need
             qty = max_spend / price
             
-            if qty < target_qty * 0.5:
-                qty = max(qty, self.min_trade_size / price)
+            if qty < self.min_trade_size / price:
+                return False, 0, f"Not enough cash to hedge (need ${cost_needed:.2f}, have ${self.cash:.2f})"
             return True, qty, reason
         
-        # === BOTH SIDES HAVE POSITIONS - OPTIMIZE PAIR COST ===
+        # === BOTH SIDES HAVE POSITIONS ===
         current_pair_cost = self.pair_cost
         ratio = my_qty / other_qty if other_qty > 0 else 1.0
+        total_spent = self.cost_up + self.cost_down
+        min_hedged_qty = min(self.qty_up, self.qty_down)
+        current_locked_profit = min_hedged_qty * (1.0 - current_pair_cost)
         
-        # === RECOVERY MODE: When pair_cost > $1.00, be VERY aggressive ===
-        recovery_mode = current_pair_cost >= 1.0
+        # === CHECK IF PROFIT COVERS FEES ===
+        min_profit_needed = total_spent * self.fee_rate
+        profit_after_fees = current_locked_profit - min_profit_needed
+        
+        # Profit is truly locked only if it covers fees
+        if current_pair_cost < 1.0 and profit_after_fees > 0:
+            return False, 0, f"✅ Profit locked: ${current_locked_profit:.2f} (after {self.fee_rate*100:.1f}% fees: ${profit_after_fees:.2f})"
+        
+        # === NEED MORE PROFIT: Either pair_cost >= 1.0 OR profit doesn't cover fees ===
+        if current_pair_cost < 1.0:
+            reason = f"⚠️ Profit ${current_locked_profit:.2f} < fees ${min_profit_needed:.2f} - need to improve"
+        else:
+            reason = f"🚨 Recovery: pair=${current_pair_cost:.3f}"
         
         # Dynamic ratio limit based on how critical the situation is
-        if recovery_mode:
-            if current_pair_cost >= 1.05:
-                effective_max_ratio = self.recovery_ratio  # 2.5x - extreme
-            elif current_pair_cost >= 1.02:
-                effective_max_ratio = self.emergency_ratio  # 2.0x - high
-            else:
-                effective_max_ratio = 1.80
+        if current_pair_cost >= 1.05:
+            effective_max_ratio = self.recovery_ratio  # 2.5x - extreme
+        elif current_pair_cost >= 1.02:
+            effective_max_ratio = self.emergency_ratio  # 2.0x - high
         else:
-            effective_max_ratio = self.max_qty_ratio  # 1.35x - normal
+            effective_max_ratio = 1.80
         
         if ratio >= effective_max_ratio:
             return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x, limit {effective_max_ratio:.2f}x)"
@@ -1000,78 +1018,51 @@ class PaperTrader:
         if max_qty_allowed <= 0:
             return False, 0, "At ratio limit"
         
-        # === RECOVERY MODE: AGGRESSIVE COST AVERAGING ===
-        if recovery_mode and price < my_avg:
-            spend_pct = 0.15 if current_pair_cost >= 1.02 else 0.10
-            max_spend = min(self.cash * spend_pct, self.max_single_trade * 2, remaining_budget + 50)
-            qty = min(max_spend / price, max_qty_allowed)
-            
-            if qty * price >= self.min_trade_size:
-                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost < current_pair_cost:
-                    improvement = current_pair_cost - new_pair_cost
-                    
-                    if new_pair_cost < 1.0:
-                        return True, qty, f"🎯 RECOVERY SUCCESS: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (UNDER $1.00!)"
-                    
-                    if improvement >= 0.002:
-                        return True, qty, f"🚨 RECOVERY: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
+        # Helper to check if trade results in profit after fees
+        def would_cover_fees(new_pair_cost: float, additional_cost: float) -> tuple:
+            new_total_spent = total_spent + additional_cost
+            new_min_qty = min(self.qty_up + (qty if side == 'UP' else 0), 
+                             self.qty_down + (qty if side == 'DOWN' else 0))
+            new_locked_profit = new_min_qty * (1.0 - new_pair_cost)
+            new_min_profit_needed = new_total_spent * self.fee_rate
+            covers = new_locked_profit > new_min_profit_needed
+            return covers, new_locked_profit, new_min_profit_needed
         
-        # === NORMAL MODE: COST AVERAGING ===
-        if not recovery_mode and price < my_avg:
-            spend_pct = 0.04
-            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+        # === IMPROVEMENT MODE: Cost average to increase profit ===
+        if price < my_avg:
+            max_spend = min(self.cash * 0.5, max_qty_allowed * price)
             qty = min(max_spend / price, max_qty_allowed)
             
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
                 if new_pair_cost < current_pair_cost:
+                    covers, new_profit, min_needed = would_cover_fees(new_pair_cost, qty * price)
+                    
+                    if covers:
+                        return True, qty, f"🎯 SUCCESS: profit ${new_profit:.2f} > fees ${min_needed:.2f}!"
+                    
                     improvement = current_pair_cost - new_pair_cost
-                    if improvement >= 0.003:
-                        return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
+                    if improvement >= 0.001:
+                        return True, qty, f"📈 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (profit ${new_profit:.2f})"
         
         # === REBALANCING: Buy lagging side ===
-        if ratio < 0.92:
-            price_threshold = self.max_balance_price if recovery_mode else self.force_balance_threshold
-            if price <= price_threshold:
-                spend_pct = 0.10 if recovery_mode else 0.05
-                max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
-                qty = min(max_spend / price, max_qty_allowed)
-                
-                if qty * price >= self.min_trade_size:
-                    new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                    pair_cost_improving = new_pair_cost < current_pair_cost
+        if ratio < 0.95:
+            qty_needed = other_qty - my_qty
+            max_spend = min(self.cash * 0.5, qty_needed * price)
+            qty = min(max_spend / price, max_qty_allowed, qty_needed)
+            
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost < current_pair_cost:
+                    covers, new_profit, min_needed = would_cover_fees(new_pair_cost, qty * price)
+                    new_ratio = (my_qty + qty) / other_qty if other_qty > 0 else 1.0
                     
-                    if recovery_mode and pair_cost_improving:
-                        return True, qty, f"🚨 REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
-                    elif new_pair_cost <= self.max_pair_cost:
-                        return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
+                    if covers:
+                        return True, qty, f"🎯 REBALANCE SUCCESS: profit ${new_profit:.2f} > fees!"
+                    
+                    return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{new_ratio:.2f}, profit ${new_profit:.2f}"
         
-        # === CHEAP ACCUMULATION: Very cheap prices ===
-        if price < self.very_cheap_threshold and ratio < 1.1:
-            spend_pct = 0.08 if recovery_mode else 0.04
-            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
-            qty = min(max_spend / price, max_qty_allowed)
-            
-            if qty * price >= self.min_trade_size:
-                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                pair_cost_improving = new_pair_cost < current_pair_cost
-                
-                if (recovery_mode and pair_cost_improving) or (new_pair_cost <= self.max_pair_cost):
-                    prefix = "🚨" if recovery_mode else "🔥"
-                    return True, qty, f"{prefix} CHEAP @ ${price:.3f}"
-        
-        # === STANDARD BUYING ===
-        if ratio <= 1.0 and price < self.cheap_threshold and not recovery_mode:
-            max_spend = min(self.cash * 0.03, self.max_single_trade, remaining_budget)
-            qty = min(max_spend / price, max_qty_allowed)
-            
-            if qty * price >= self.min_trade_size:
-                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost <= self.max_pair_cost:
-                    return True, qty, f"OK (${price:.3f})"
-        
-        return False, 0, f"{side} ${price:.3f}: no opportunity"
+        return False, 0, f"⚠️ Need profit > ${min_profit_needed:.2f} (current: ${current_locked_profit:.2f})"
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         cost = price * qty
@@ -1227,7 +1218,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 1000.0):
+    def __init__(self, starting_balance: float = 100.0):
         self.starting_balance = starting_balance
         self.cash_ref = {'balance': starting_balance}
         self.active_markets: Dict[str, MarketTracker] = {}
@@ -1533,6 +1524,11 @@ class MultiMarketBot:
                 if tracker.window_end:
                     time_to_close = (tracker.window_end - now).total_seconds()
                 
+                # DEBUG: Print prices and why no trade
+                pt = tracker.paper_trader
+                if pt.qty_up == 0 and pt.qty_down == 0:
+                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | pair=${tracker.up_price+tracker.down_price:.3f} | cheap<${pt.cheap_threshold}")
+                
                 trades = tracker.paper_trader.check_and_trade(
                     tracker.up_price, 
                     tracker.down_price, 
@@ -1750,16 +1746,16 @@ class MultiMarketBot:
                         
                         elif action == 'reset':
                             # Reset everything
-                            self.starting_balance = 1000.0
-                            self.cash_ref['balance'] = 1000.0
+                            self.starting_balance = 100.0
+                            self.cash_ref['balance'] = 100.0
                             self.history = []
                             self.trade_log = []
                             self.active_markets = {}
-                            print(f"🔄 Bot RESET - Balance: $1000.00")
+                            print(f"🔄 Bot RESET - Balance: $100.00")
                             await self.broadcast({
                                 'starting_balance': self.starting_balance,
                                 'current_balance': self.cash_ref['balance'],
-                                'true_balance': 1000.0,
+                                'true_balance': 100.0,
                                 'total_locked_profit': 0,
                                 'active_markets': {},
                                 'history': [],
