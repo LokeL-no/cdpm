@@ -1143,26 +1143,55 @@ class PaperTrader:
                                 print(f"🔧 [REBALANCE] Bought {test_qty:.1f} {lagging_side} @ ${lagging_price:.3f} | locked ${locked:.2f}→${new_locked:.2f}")
                             return trades_made
             
-            # CASE 2: Balanced but pair_cost >= $1.00 - need cheaper side to reduce avg
-            if pair_cost >= 0.99 and ratio <= 1.10:
-                # Only buy the CHEAPER side to reduce pair_cost
+            # CASE 2: pair_cost >= $1.00 - aggressively buy cheaper side to push below $1.00
+            if pair_cost >= 1.00:
                 cheaper_side = 'UP' if up_price < down_price else 'DOWN'
                 cheaper_price = min(up_price, down_price)
-                
-                # Must be cheap enough to help
-                current_avg = self.avg_up if cheaper_side == 'UP' else self.avg_down
-                
-                if cheaper_price < current_avg and remaining_budget > 3.0:
-                    test_qty = min(remaining_budget / cheaper_price, self.cash * 0.3 / cheaper_price)
-                    
-                    if test_qty >= 3.0:
-                        new_locked = self.locked_profit_after_buy(cheaper_side, cheaper_price, test_qty)
-                        _, new_pair_cost = self.simulate_buy(cheaper_side, cheaper_price, test_qty)
-                        
-                        if new_locked > locked or new_pair_cost < pair_cost:
+
+                if remaining_budget > 3.0:
+                    max_spend = min(remaining_budget, self.cash * 0.6, self.max_single_trade * 2)
+                    max_qty = max_spend / cheaper_price
+
+                    # Try larger sizes first to aggressively reduce pair_cost
+                    for factor in [1.0, 0.75, 0.5, 0.25]:
+                        test_qty = max_qty * factor
+                        if test_qty * cheaper_price < self.min_trade_size:
+                            continue
+
+                        # Simulate new position
+                        if cheaper_side == 'UP':
+                            new_qty_up = self.qty_up + test_qty
+                            new_qty_down = self.qty_down
+                            new_cost_up = self.cost_up + (test_qty * cheaper_price)
+                            new_cost_down = self.cost_down
+                        else:
+                            new_qty_down = self.qty_down + test_qty
+                            new_qty_up = self.qty_up
+                            new_cost_down = self.cost_down + (test_qty * cheaper_price)
+                            new_cost_up = self.cost_up
+
+                        if new_qty_up == 0 or new_qty_down == 0:
+                            continue
+
+                        new_avg_up = new_cost_up / new_qty_up
+                        new_avg_down = new_cost_down / new_qty_down
+                        new_pair_cost = new_avg_up + new_avg_down
+
+                        fee_up = self.calculate_fee(new_avg_up, new_qty_up)
+                        fee_down = self.calculate_fee(new_avg_down, new_qty_down)
+                        new_fees = fee_up + fee_down
+
+                        new_total_spent = new_cost_up + new_cost_down
+                        new_sum_qty = new_qty_up + new_qty_down
+
+                        # STRICT: sum(qty) must exceed total_spent + fees AND pair_cost < $1.00
+                        if new_pair_cost < pair_cost and new_pair_cost < 1.00 and new_sum_qty > (new_total_spent + new_fees):
                             if self.execute_buy(cheaper_side, cheaper_price, test_qty, timestamp):
                                 trades_made.append((cheaper_side, cheaper_price, test_qty))
-                                print(f"📉 [REDUCE PAIR] Bought {test_qty:.1f} {cheaper_side} @ ${cheaper_price:.3f} | pair ${pair_cost:.3f}→${new_pair_cost:.3f}")
+                                print(
+                                    f"📉 [AGGRESSIVE REDUCE] Bought {test_qty:.1f} {cheaper_side} @ ${cheaper_price:.3f} | "
+                                    f"pair ${pair_cost:.3f}→${new_pair_cost:.3f} | sum_qty ${new_sum_qty:.1f} > spent ${new_total_spent + new_fees:.2f}"
+                                )
                             return trades_made
             
             # CASE 3: Already good ratio, pair_cost OK - just wait
