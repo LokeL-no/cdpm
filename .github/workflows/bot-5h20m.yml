@@ -27,14 +27,52 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Multi-Market Bot
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Run Multi-Market Bot with Cloudflare Tunnel
         env:
           BOT_DURATION: ${{ github.event.inputs.duration || '19200' }}
         run: |
           echo "🚀 Starting Multi-Market Bot for $BOT_DURATION seconds (5h20m)"
           echo "⏰ Started at: $(date)"
           
-          timeout ${BOT_DURATION}s python web_bot_multi.py || true
+          # Start the bot in background
+          python web_bot_multi.py &
+          BOT_PID=$!
+          sleep 3
+          
+          # Start cloudflare tunnel and capture URL
+          ./cloudflared tunnel --url http://localhost:8080 2>&1 | tee cf.log &
+          CF_PID=$!
+          
+          # Wait for tunnel URL
+          sleep 10
+          
+          # Extract and display URL
+          TUNNEL_URL=$(grep -o 'https://[^[:space:]]*\.trycloudflare\.com' cf.log | head -1)
+          
+          echo ""
+          echo "=========================================="
+          echo "📱 OPEN THIS URL ON YOUR PHONE:"
+          echo "🌐 $TUNNEL_URL"
+          echo "=========================================="
+          echo ""
+          
+          # Keep showing status every 5 minutes
+          ELAPSED=0
+          while [ $ELAPSED -lt $BOT_DURATION ]; do
+            sleep 300
+            ELAPSED=$((ELAPSED + 300))
+            MINS=$((ELAPSED / 60))
+            echo "⏱️ Running for $MINS minutes... URL: $TUNNEL_URL"
+          done
+          
+          # Cleanup
+          kill $BOT_PID 2>/dev/null || true
+          kill $CF_PID 2>/dev/null || true
           
           echo "✅ Bot finished at: $(date)"
 
