@@ -1093,6 +1093,48 @@ class PaperTrader:
             if locked > 0:
                 # Do nothing - we have guaranteed profit
                 return trades_made
+            
+            # ⚠️ PROFIT NOT SECURED - TRY TO FIX!
+            # If we have both sides but locked < 0, we need to REBALANCE aggressively
+            ratio = max(self.qty_up, self.qty_down) / min(self.qty_up, self.qty_down)
+            
+            if ratio > 1.15:  # Position is unbalanced
+                # Determine which side needs more
+                if self.qty_up < self.qty_down:
+                    # Need more UP to balance
+                    needed_qty = self.qty_down - self.qty_up
+                    max_price_to_pay = 0.60  # Pay up to $0.60 to rebalance
+                    
+                    if up_price <= max_price_to_pay:
+                        # Calculate how much to buy
+                        cost_for_balance = needed_qty * up_price
+                        max_spend = min(cost_for_balance, self.cash * 0.5)
+                        qty = max_spend / up_price
+                        
+                        if qty >= 5.0:  # Minimum meaningful qty
+                            new_locked = self.locked_profit_after_buy('UP', up_price, qty)
+                            if new_locked > locked:  # Only if it improves
+                                if self.execute_buy('UP', up_price, qty, timestamp):
+                                    trades_made.append(('UP', up_price, qty))
+                                    print(f"🔧 [FIX] Bought {qty:.1f} UP @ ${up_price:.3f} to rebalance (locked ${locked:.2f}→${new_locked:.2f})")
+                                return trades_made
+                else:
+                    # Need more DOWN to balance
+                    needed_qty = self.qty_up - self.qty_down
+                    max_price_to_pay = 0.60
+                    
+                    if down_price <= max_price_to_pay:
+                        cost_for_balance = needed_qty * down_price
+                        max_spend = min(cost_for_balance, self.cash * 0.5)
+                        qty = max_spend / down_price
+                        
+                        if qty >= 5.0:
+                            new_locked = self.locked_profit_after_buy('DOWN', down_price, qty)
+                            if new_locked > locked:
+                                if self.execute_buy('DOWN', down_price, qty, timestamp):
+                                    trades_made.append(('DOWN', down_price, qty))
+                                    print(f"🔧 [FIX] Bought {qty:.1f} DOWN @ ${down_price:.3f} to rebalance (locked ${locked:.2f}→${new_locked:.2f})")
+                                return trades_made
         
         if self.qty_up > 0 and self.qty_down > 0:
             ratio_up = self.qty_up / self.qty_down
