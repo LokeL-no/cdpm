@@ -1,0 +1,65 @@
+name: Bot 4h GABAGOOL v10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 245
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install bore
+        run: |
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
+          chmod +x bore
+
+      - name: Run bot with tunnel
+        run: |
+          echo "🚀 Starting GABAGOOL v10 Bot (4 hours)"
+          echo "⏰ Start: $(date)"
+          echo ""
+          echo "📋 GABAGOOL v10 Features:"
+          echo "   - NEVER accept hedge with pair >= 0.99"
+          echo "   - Max single trade: $25"
+          echo "   - Initial trade: $5"
+          echo "   - Max per market: 50% ($50)"
+          echo ""
+          
+          # Start bot
+          python web_bot_multi.py &
+          BOT_PID=$!
+          sleep 5
+          
+          # Start bore tunnel
+          echo ""
+          echo "🌐 Starting bore tunnel..."
+          ./bore local 8080 --to bore.pub 2>&1 &
+          BORE_PID=$!
+          sleep 3
+          
+          # Get bore port
+          echo ""
+          echo "=========================================="
+          echo "📱 Se bore.pub port i output over!"
+          echo "   URL format: http://bore.pub:XXXXX"
+          echo "=========================================="
+          echo ""
+          
+          # Run for 4 hours = 14400 seconds
+          sleep 14400
+          
+          kill $BOT_PID 2>/dev/null || true
+          kill $BORE_PID 2>/dev/null || true
+          echo ""
+          echo "✅ Done: $(date)"
