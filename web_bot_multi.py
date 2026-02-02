@@ -473,8 +473,6 @@ HTML_TEMPLATE = """
                     const asset = market.asset.toUpperCase();
                     const statusClass = pt.market_status === 'open' ? 'status-open' : 
                                        pt.market_status === 'resolved' ? 'status-resolved' : 'status-closed';
-                    const sellModeClass = pt.sell_mode ? 'sell-mode-on' : 'sell-mode-off';
-                    const sellModeLabel = pt.sell_mode ? 'SELL MODE' : 'SELL MODE: OFF';
                     
                     const lockedPnl = Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
                     
@@ -482,15 +480,11 @@ HTML_TEMPLATE = """
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
                             <div class="market-header">
                                 <span class="asset-badge asset-${market.asset}">${asset}</span>
-                                <div>
-                                    <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
-                                    <span class="sell-mode-badge ${sellModeClass}">${sellModeLabel}</span>
-                                </div>
+                                <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
                             </div>
                             <div style="font-size: 11px; color: #888; margin-bottom: 6px;">
                                 ${market.window_time || slug}
                             </div>
-                            ${pt.sell_mode ? '<div style="margin-bottom: 8px; padding: 6px 8px; border: 1px solid #ef4444; border-radius: 6px; color: #fecaca; font-weight: bold; background: rgba(239, 68, 68, 0.2);">🚨 SELL MODE ACTIVE</div>' : ''}
                             <div class="prices-row">
                                 <div class="price-box price-up">
                                     <div class="price-label">UP</div>
@@ -651,36 +645,81 @@ class PaperTrader:
         self.target_pair_cost = 0.95     # Ideal pair cost target
         self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
-        # Position sizing
-        self.min_trade_size = 0.3
-        self.max_single_trade = 1.5
+        # Position sizing (10x increased)
+        self.min_trade_size = 3.0        # Was 0.3
+        self.max_single_trade = 15.0     # Was 1.5
         self.cooldown_seconds = 4
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 3.5
+        self.initial_trade_usd = 35.0    # Was 3.5
         self.max_position_pct = 0.50     # Max 50% of balance per market
         self.force_balance_after_seconds = 120
         
-        # === RECOVERY MODE PARAMETERS ===
-        # When pair_cost > $1.00, we need to be aggressive to fix it
-        self.max_qty_ratio = 1.35       # Normal max imbalance (35%)
-        self.emergency_ratio = 2.0      # Allow HIGH imbalance when fixing pair_cost > $1.00
-        self.recovery_ratio = 2.5       # Max ratio when actively recovering (EXTREME)
+        # === GUARANTEED PROFIT PARAMETERS ===
+        # NEW STRATEGY: Ensure min(qty_up, qty_down) > total_spent
+        # This guarantees profit regardless of outcome!
+        self.max_qty_ratio = 1.20       # Max 20% imbalance - MUCH STRICTER
+        self.emergency_ratio = 1.35     # Emergency: max 35% imbalance
+        self.recovery_ratio = 1.50      # Recovery: max 50% (only when pair_cost > 1.05)
         self.target_qty_ratio = 1.0     # Perfect balance
-        self.rebalance_trigger = 1.15   # Start rebalancing when ratio exceeds this
+        self.rebalance_trigger = 1.10   # Start rebalancing earlier (was 1.15)
         
         # === FEE AWARENESS ===
-        # Polymarket charges 3.1% fees - profit must exceed this to be real
-        self.fee_rate = 0.031             # 3.1% fee
-        self.max_entry_pair_potential = 1.05  # Allow entry even if pair > $1.00 - we'll improve via cost averaging
+        # Polymarket uses dynamic fees: highest at $0.50 (1.56%), lowest at extremes
+        # Fee formula: fee_rate ≈ price * (1 - price) * 0.0624 (capped at ~1.56%)
+        # CRITICAL: For guaranteed profit, pair_cost MUST be < $1.00
+        # With ~1.5% avg fees, we need pair_cost < ~$0.985 to profit
+        self.max_entry_pair_potential = 0.98  # STRICT: Only enter if pair < $0.98
+    
+    @staticmethod
+    def calculate_fee(price: float, qty: float) -> float:
+        """
+        Calculate Polymarket fee based on price.
+        Fee is highest at $0.50 (~1.56%) and approaches 0 at extremes ($0.01, $0.99)
         
-        # === SELL MODE (DISABLED) ===
-        # Sell mode was designed to exit positions when stuck without profit
-        # Currently DISABLED - recovery mode should fix pair_cost instead
-        self.sell_mode = False
-        self.sell_mode_trigger_seconds = 300  # 5 minutes (but won't trigger since disabled)
-        self.sell_mode_min_profit = 0.05      # Min profit to sell in sell mode
-        self.max_loss_per_market = 5.0        # Max loss before forced exit
+        Fee table (per 100 shares):
+        $0.50 → $0.78 (1.56%)
+        $0.45 → $0.69 (1.53%)  
+        $0.40 → $0.58 (1.44%)
+        $0.30 → $0.33 (1.10%)
+        $0.20 → $0.13 (0.64%)
+        $0.10 → $0.02 (0.20%)
+        $0.05 → $0.003 (0.06%)
+        """
+        # Effective rate lookup table (interpolated)
+        fee_table = {
+            0.01: 0.0000, 0.05: 0.0006, 0.10: 0.0020, 0.15: 0.0041,
+            0.20: 0.0064, 0.25: 0.0088, 0.30: 0.0110, 0.35: 0.0129,
+            0.40: 0.0144, 0.45: 0.0153, 0.50: 0.0156, 0.55: 0.0153,
+            0.60: 0.0144, 0.65: 0.0129, 0.70: 0.0110, 0.75: 0.0088,
+            0.80: 0.0064, 0.85: 0.0041, 0.90: 0.0020, 0.95: 0.0006,
+            0.99: 0.0000
+        }
+        
+        # Find closest prices in table and interpolate
+        prices = sorted(fee_table.keys())
+        
+        if price <= prices[0]:
+            rate = fee_table[prices[0]]
+        elif price >= prices[-1]:
+            rate = fee_table[prices[-1]]
+        else:
+            # Linear interpolation
+            for i in range(len(prices) - 1):
+                if prices[i] <= price <= prices[i + 1]:
+                    p1, p2 = prices[i], prices[i + 1]
+                    r1, r2 = fee_table[p1], fee_table[p2]
+                    rate = r1 + (r2 - r1) * (price - p1) / (p2 - p1)
+                    break
+        
+        trade_value = price * qty
+        return trade_value * rate
+    
+    def calculate_total_fees(self) -> float:
+        """Calculate total fees for current positions"""
+        fee_up = self.calculate_fee(self.avg_up, self.qty_up) if self.qty_up > 0 else 0
+        fee_down = self.calculate_fee(self.avg_down, self.qty_down) if self.qty_down > 0 else 0
+        return fee_up + fee_down
         
     @property
     def cash(self):
@@ -706,13 +745,26 @@ class PaperTrader:
     
     @property
     def locked_profit(self) -> float:
+        """Guaranteed profit regardless of outcome (worst-case), accounting for fees"""
         min_qty = min(self.qty_up, self.qty_down)
         total_cost = self.cost_up + self.cost_down
-        return min_qty - total_cost
-
-    def update_sell_mode(self, market_elapsed: Optional[float] = None):
-        # SELL MODE DISABLED - Recovery mode should fix pair_cost instead
-        return
+        fees = self.calculate_total_fees()
+        return min_qty - total_cost - fees
+    
+    @property
+    def best_case_profit(self) -> float:
+        """Best-case profit if the larger position wins"""
+        max_qty = max(self.qty_up, self.qty_down)
+        total_cost = self.cost_up + self.cost_down
+        fees = self.calculate_total_fees()
+        return max_qty - total_cost - fees
+    
+    @property
+    def qty_ratio(self) -> float:
+        """Ratio of larger qty to smaller qty (1.0 = perfectly balanced)"""
+        if self.qty_up == 0 or self.qty_down == 0:
+            return 0.0
+        return max(self.qty_up, self.qty_down) / min(self.qty_up, self.qty_down)
 
     def unrealized_pnl(self, up_price: float, down_price: float) -> float:
         total_cost = self.cost_up + self.cost_down
@@ -729,6 +781,7 @@ class PaperTrader:
         return self.locked_profit_after_buy(side, price, qty) > self.locked_profit
 
     def locked_profit_after_buy(self, side: str, price: float, qty: float) -> float:
+        """Calculate guaranteed profit after a hypothetical buy, with accurate fees"""
         cost = price * qty
         new_qty_up = self.qty_up + qty if side == 'UP' else self.qty_up
         new_qty_down = self.qty_down + qty if side == 'DOWN' else self.qty_down
@@ -736,62 +789,17 @@ class PaperTrader:
         new_cost_down = self.cost_down + cost if side == 'DOWN' else self.cost_down
         if new_qty_up == 0 or new_qty_down == 0:
             return 0.0
+        
+        # Calculate fees with new averages
+        new_avg_up = new_cost_up / new_qty_up if new_qty_up > 0 else 0
+        new_avg_down = new_cost_down / new_qty_down if new_qty_down > 0 else 0
+        fee_up = self.calculate_fee(new_avg_up, new_qty_up)
+        fee_down = self.calculate_fee(new_avg_down, new_qty_down)
+        total_fees = fee_up + fee_down
+        
         total_cost = new_cost_up + new_cost_down
-        return min(new_qty_up, new_qty_down) - total_cost
+        return min(new_qty_up, new_qty_down) - total_cost - total_fees
 
-    def sell_mode_allows_buy(self, side: str, price: float, qty: float) -> tuple:
-        if not self.sell_mode:
-            return True, ""
-        if self.locked_profit_after_buy(side, price, qty) > 0:
-            return True, ""
-        return False, "Sell mode: profit not lockable"
-
-    def execute_sell_all(self, up_price: float, down_price: float, timestamp: str, reason: str) -> bool:
-        proceeds = 0.0
-        sold_any = False
-
-        if self.qty_up > 0 and up_price > 0:
-            proceeds += self.qty_up * up_price
-            self.trade_log.append({
-                'time': timestamp,
-                'side': 'SELL',
-                'token': 'UP',
-                'price': up_price,
-                'qty': self.qty_up,
-                'cost': -(self.qty_up * up_price),
-                'note': reason
-            })
-            self.qty_up = 0.0
-            self.cost_up = 0.0
-            sold_any = True
-
-        if self.qty_down > 0 and down_price > 0:
-            proceeds += self.qty_down * down_price
-            self.trade_log.append({
-                'time': timestamp,
-                'side': 'SELL',
-                'token': 'DOWN',
-                'price': down_price,
-                'qty': self.qty_down,
-                'cost': -(self.qty_down * down_price),
-                'note': reason
-            })
-            self.qty_down = 0.0
-            self.cost_down = 0.0
-            sold_any = True
-
-        if not sold_any:
-            return False
-
-        self.cash += proceeds
-        self.trade_count += 1
-        self.last_trade_time = time.time()
-
-        if len(self.trade_log) > 20:
-            self.trade_log = self.trade_log[-20:]
-
-        return True
-    
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         cost = price * qty
         if side == 'UP':
@@ -938,131 +946,108 @@ class PaperTrader:
         if remaining_budget <= self.min_trade_size and not is_emergency and not (my_qty == 0 and other_qty > 0):
             return False, 0, f"Position limit reached (spent ${total_spent:.0f})"
         
-        # === FIRST TRADE: Buy cheap side, will hedge later ===
+        # ============================================================
+        # GOAL: min(qty_up, qty_down) > total_spent  AND  pair_cost < $1
+        # This guarantees profit regardless of outcome!
+        # ============================================================
+        
+        # === PHASE 1: ENTRY - Buy cheap side first ===
         if my_qty == 0 and other_qty == 0:
             if price > self.cheap_threshold:
                 return False, 0, f"First trade needs price < ${self.cheap_threshold}"
             
-            # Don't start if market is about to close (need time to hedge)
-            if time_to_close is not None and time_to_close < 120:
+            if time_to_close is not None and time_to_close < 180:
                 return False, 0, f"Only {time_to_close:.0f}s left - too late to start"
-            
-            # Check if this trade could realistically be profitable after fees
-            # For profit after 3.1% fees, we need pair_cost < ~0.969
-            # Only enter if potential pair cost would allow profit after fees
-            potential_pair_cost = price + other_price
-            if potential_pair_cost > self.max_entry_pair_potential:
-                return False, 0, f"Pair potential ${potential_pair_cost:.3f} > ${self.max_entry_pair_potential} - can't cover fees"
             
             max_spend = min(self.initial_trade_usd, self.max_single_trade, remaining_budget, self.cash)
             qty = max_spend / price
             self.first_trade_time = now
-            return True, qty, f"🎯 First trade @ ${price:.3f} (potential pair: ${potential_pair_cost:.3f})"
+            return True, qty, f"🎯 ENTRY @ ${price:.3f}"
         
-        # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
+        # === PHASE 2: HEDGE - Must have both sides ===
         if my_qty == 0 and other_qty > 0:
-            time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
-            potential_pair_cost = other_avg + price
+            potential_pair = other_avg + price
             
-            # Determine urgency and reason
-            if time_unhedged > 30:
-                reason = f"🔒 HEDGE (waited {time_unhedged:.0f}s)"
-            elif potential_pair_cost < self.target_pair_cost:
-                reason = f"✅ GOOD PAIR COST (${potential_pair_cost:.2f})"
-            else:
-                reason = f"🔒 HEDGE (pair: ${potential_pair_cost:.2f})"
+            # After 10 seconds, NEVER accept pair > $1.00!
+            market_elapsed = 900.0 - time_to_close if time_to_close is not None else 0.0
+            if market_elapsed > 10 and potential_pair > 1.0:
+                return False, 0, f"⛔ REFUSE hedge: pair ${potential_pair:.3f} > $1.00 after {market_elapsed:.0f}s"
             
-            # Hedge to match qty - use available cash
+            # Match qty to balance
             target_qty = other_qty
             cost_needed = target_qty * price
-            max_spend = min(cost_needed, self.cash)  # Use what we have, up to what we need
+            max_spend = min(cost_needed, self.cash * 0.8)
             qty = max_spend / price
             
-            if qty < self.min_trade_size / price:
-                return False, 0, f"Not enough cash to hedge (need ${cost_needed:.2f}, have ${self.cash:.2f})"
-            return True, qty, reason
+            if qty < 1.0:
+                return False, 0, f"Not enough cash to hedge"
+            
+            return True, qty, f"🔒 HEDGE @ ${price:.3f} (pair: ${potential_pair:.2f})"
         
-        # === BOTH SIDES HAVE POSITIONS ===
+        # === PHASE 3: OPTIMIZE - Build toward guaranteed profit ===
         current_pair_cost = self.pair_cost
-        ratio = my_qty / other_qty if other_qty > 0 else 1.0
         total_spent = self.cost_up + self.cost_down
-        min_hedged_qty = min(self.qty_up, self.qty_down)
-        current_locked_profit = min_hedged_qty * (1.0 - current_pair_cost)
+        min_qty = min(self.qty_up, self.qty_down)
+        fees = self.calculate_total_fees()
         
-        # === CHECK IF PROFIT COVERS FEES ===
-        min_profit_needed = total_spent * self.fee_rate
-        profit_after_fees = current_locked_profit - min_profit_needed
+        # THE KEY METRIC: guaranteed_profit = min_qty - total_spent - fees
+        guaranteed_profit = min_qty - total_spent - fees
         
-        # Profit is truly locked only if it covers fees
-        if current_pair_cost < 1.0 and profit_after_fees > 0:
-            return False, 0, f"✅ Profit locked: ${current_locked_profit:.2f} (after {self.fee_rate*100:.1f}% fees: ${profit_after_fees:.2f})"
+        # Current ratio (1.0 = perfectly balanced)
+        ratio = my_qty / other_qty if other_qty > 0 else 1.0
         
-        # === NEED MORE PROFIT: Either pair_cost >= 1.0 OR profit doesn't cover fees ===
-        if current_pair_cost < 1.0:
-            reason = f"⚠️ Profit ${current_locked_profit:.2f} < fees ${min_profit_needed:.2f} - need to improve"
-        else:
-            reason = f"🚨 Recovery: pair=${current_pair_cost:.3f}"
+        # TARGET: pair_cost < $0.97 to ensure profit after fees!
+        TARGET_PAIR_COST = 0.97
         
-        # Dynamic ratio limit based on how critical the situation is
-        if current_pair_cost >= 1.05:
-            effective_max_ratio = self.recovery_ratio  # 2.5x - extreme
-        elif current_pair_cost >= 1.02:
-            effective_max_ratio = self.emergency_ratio  # 2.0x - high
-        else:
-            effective_max_ratio = 1.80
+        # === SUCCESS CHECK ===
+        if guaranteed_profit > 0 and current_pair_cost < TARGET_PAIR_COST:
+            return False, 0, f"✅ DONE! profit=${guaranteed_profit:.2f}, pair=${current_pair_cost:.3f}"
         
-        if ratio >= effective_max_ratio:
-            return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x, limit {effective_max_ratio:.2f}x)"
+        # === NEED TO IMPROVE ===
+        # Strategy: Buy whichever side helps reach the goal
         
-        max_qty_allowed = other_qty * effective_max_ratio - my_qty
-        if max_qty_allowed <= 0:
-            return False, 0, "At ratio limit"
+        # RULE 1: Don't exceed ratio of 1.3
+        if ratio > 1.3:
+            return False, 0, f"⛔ Ratio {ratio:.2f}x - need to buy {other_side}"
         
-        # Helper to check if trade results in profit after fees
-        def would_cover_fees(new_pair_cost: float, additional_cost: float) -> tuple:
-            new_total_spent = total_spent + additional_cost
-            new_min_qty = min(self.qty_up + (qty if side == 'UP' else 0), 
-                             self.qty_down + (qty if side == 'DOWN' else 0))
-            new_locked_profit = new_min_qty * (1.0 - new_pair_cost)
-            new_min_profit_needed = new_total_spent * self.fee_rate
-            covers = new_locked_profit > new_min_profit_needed
-            return covers, new_locked_profit, new_min_profit_needed
-        
-        # === IMPROVEMENT MODE: Cost average to increase profit ===
-        if price < my_avg:
-            max_spend = min(self.cash * 0.5, max_qty_allowed * price)
-            qty = min(max_spend / price, max_qty_allowed)
-            
-            if qty * price >= self.min_trade_size:
-                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost < current_pair_cost:
-                    covers, new_profit, min_needed = would_cover_fees(new_pair_cost, qty * price)
-                    
-                    if covers:
-                        return True, qty, f"🎯 SUCCESS: profit ${new_profit:.2f} > fees ${min_needed:.2f}!"
-                    
-                    improvement = current_pair_cost - new_pair_cost
-                    if improvement >= 0.001:
-                        return True, qty, f"📈 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (profit ${new_profit:.2f})"
-        
-        # === REBALANCING: Buy lagging side ===
+        # RULE 2: If we're the lagging side, buy to catch up (increases min_qty!)
         if ratio < 0.95:
-            qty_needed = other_qty - my_qty
-            max_spend = min(self.cash * 0.5, qty_needed * price)
-            qty = min(max_spend / price, max_qty_allowed, qty_needed)
+            qty_to_balance = other_qty - my_qty
+            max_spend = min(self.cash * 0.6, qty_to_balance * price, remaining_budget)
+            qty = max_spend / price
+            
+            if qty * price >= self.min_trade_size:
+                new_locked = self.locked_profit_after_buy(side, price, qty)
+                new_ratio = (my_qty + qty) / other_qty
+                return True, qty, f"⚖️ BALANCE: ratio {ratio:.2f}→{new_ratio:.2f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
+        
+        # RULE 3: If pair_cost >= TARGET ($0.97), only buy if it reduces pair_cost
+        if current_pair_cost >= TARGET_PAIR_COST:
+            new_avg, new_pair_cost = self.simulate_buy(side, price, 10)
+            
+            if new_pair_cost >= current_pair_cost:
+                return False, 0, f"⏳ pair=${current_pair_cost:.3f} (need <${TARGET_PAIR_COST}), price ${price:.3f} won't help"
+            
+            # Good! This trade reduces pair_cost toward target
+            max_spend = min(self.cash * 0.4, self.max_single_trade, remaining_budget)
+            qty = max_spend / price
             
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
-                if new_pair_cost < current_pair_cost:
-                    covers, new_profit, min_needed = would_cover_fees(new_pair_cost, qty * price)
-                    new_ratio = (my_qty + qty) / other_qty if other_qty > 0 else 1.0
-                    
-                    if covers:
-                        return True, qty, f"🎯 REBALANCE SUCCESS: profit ${new_profit:.2f} > fees!"
-                    
-                    return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{new_ratio:.2f}, profit ${new_profit:.2f}"
+                new_locked = self.locked_profit_after_buy(side, price, qty)
+                return True, qty, f"📉 REDUCE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
-        return False, 0, f"⚠️ Need profit > ${min_profit_needed:.2f} (current: ${current_locked_profit:.2f})"
+        # RULE 4: If pair_cost < TARGET, buy cheap to grow position
+        if price <= self.cheap_threshold and ratio <= 1.15:
+            max_spend = min(self.cash * 0.3, self.max_single_trade, remaining_budget)
+            qty = max_spend / price
+            
+            if qty * price >= self.min_trade_size:
+                new_locked = self.locked_profit_after_buy(side, price, qty)
+                if new_locked > guaranteed_profit:
+                    return True, qty, f"💰 CHEAP @ ${price:.3f}: locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
+        
+        return False, 0, f"⏳ pair=${current_pair_cost:.3f} (target <${TARGET_PAIR_COST}), locked=${guaranteed_profit:.2f}, ratio={ratio:.2f}x"
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         cost = price * qty
@@ -1096,23 +1081,17 @@ class PaperTrader:
     
     def check_and_trade(self, up_price: float, down_price: float, timestamp: str, time_to_close: float = None, up_bid: Optional[float] = None, down_bid: Optional[float] = None):
         trades_made = []
-        market_elapsed = None
-        if time_to_close is not None:
-            market_elapsed = max(0.0, 900.0 - time_to_close)
-        self.update_sell_mode(market_elapsed)
-        sell_up_price = up_bid if up_bid and up_bid > 0 else up_price
-        sell_down_price = down_bid if down_bid and down_bid > 0 else down_price
-        unrealized = self.unrealized_pnl(sell_up_price, sell_down_price)
-
-        if unrealized <= -self.max_loss_per_market and (self.qty_up > 0 or self.qty_down > 0):
-            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Max loss"):
-                self.market_status = 'closed'
-            return trades_made
-
-        if self.sell_mode:
-            if unrealized >= self.sell_mode_min_profit:
-                if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Sell mode profit"):
-                    self.market_status = 'closed'
+        
+        # === CHECK IF PROFIT IS SECURED ===
+        if self.qty_up > 0 and self.qty_down > 0:
+            total_spent = self.cost_up + self.cost_down
+            min_qty = min(self.qty_up, self.qty_down)
+            fees = self.calculate_total_fees()
+            locked = min_qty - total_spent - fees
+            
+            # ✅ PROFIT SECURED - STOP ALL TRADING!
+            if locked > 0:
+                # Do nothing - we have guaranteed profit
                 return trades_made
         
         if self.qty_up > 0 and self.qty_down > 0:
@@ -1133,6 +1112,24 @@ class PaperTrader:
                         trades_made.append(('UP', up_price, qty))
                 return trades_made
         
+        # === PRIORITY: HEDGE if we only have one side! ===
+        if self.qty_up > 0 and self.qty_down == 0:
+            # Have UP, need DOWN
+            should, qty, reason = self.should_buy('DOWN', down_price, up_price, time_to_close=time_to_close)
+            if should:
+                if self.execute_buy('DOWN', down_price, qty, timestamp):
+                    trades_made.append(('DOWN', down_price, qty))
+            return trades_made  # Always return after attempting hedge
+        
+        if self.qty_down > 0 and self.qty_up == 0:
+            # Have DOWN, need UP
+            should, qty, reason = self.should_buy('UP', up_price, down_price, time_to_close=time_to_close)
+            if should:
+                if self.execute_buy('UP', up_price, qty, timestamp):
+                    trades_made.append(('UP', up_price, qty))
+            return trades_made  # Always return after attempting hedge
+        
+        # === Normal trading when both sides have positions ===
         if up_price < down_price:
             should_buy_up, qty_up, _ = self.should_buy('UP', up_price, down_price, time_to_close=time_to_close)
             if should_buy_up:
@@ -1186,12 +1183,13 @@ class PaperTrader:
             'avg_down': self.avg_down,
             'pair_cost': self.pair_cost,
             'locked_profit': self.locked_profit,
+            'best_case_profit': self.best_case_profit,
+            'qty_ratio': self.qty_ratio,
             'trade_count': self.trade_count,
             'market_status': self.market_status,
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
-            'payout': self.payout,
-            'sell_mode': self.sell_mode
+            'payout': self.payout
         }
 
 
@@ -1343,12 +1341,13 @@ class MultiMarketBot:
         timestamps_to_check = [current_window, next_window]
         
         for asset in SUPPORTED_ASSETS:
-            # Skip if we already have an active market for this asset
-            has_active = any(
-                t.asset == asset and t.paper_trader.market_status == 'open' 
+            # Skip if we already have an OPEN market for this asset
+            # Resolved markets don't block new ones
+            has_open_market = any(
+                t.asset == asset and t.paper_trader.market_status == 'open'
                 for t in self.active_markets.values()
             )
-            if has_active:
+            if has_open_market:
                 continue
             
             # Find one market for this asset
@@ -1431,41 +1430,54 @@ class MultiMarketBot:
         if not tracker.initialized:
             return
         
+        # Don't update resolved markets
+        if tracker.paper_trader.market_status == 'resolved':
+            return
+        
         # Check if market window has ended
         now = datetime.now(timezone.utc)
-        if tracker.window_end and now > tracker.window_end:
-            if tracker.paper_trader.market_status == 'open':
-                # Market closed - liquidate positions and move to history
-                pt = tracker.paper_trader
-                liquidation_value = (pt.qty_up * tracker.last_up_bid) + (pt.qty_down * tracker.last_down_bid)
-                if liquidation_value == 0 and (pt.qty_up > 0 or pt.qty_down > 0):
-                    liquidation_value = min(pt.qty_up, pt.qty_down)
-                total_cost = pt.cost_up + pt.cost_down
-                pnl = liquidation_value - total_cost
-                
-                # Add payout back to cash
-                self.cash_ref['balance'] += liquidation_value
-                
-                # Mark as resolved with "CLOSED" outcome
-                pt.market_status = 'resolved'
-                pt.resolution_outcome = 'CLOSED'
-                pt.payout = liquidation_value
-                pt.final_pnl = pnl
-                
-                print(f"🔒 Market closed: {tracker.slug} | Liquidated: ${liquidation_value:.2f} | PnL: ${pnl:+.2f}")
-                
-                # Add to history
-                self.history.append({
-                    'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
-                    'slug': tracker.slug,
-                    'asset': tracker.asset,
-                    'outcome': 'CLOSED',
-                    'qty_up': pt.qty_up,
-                    'qty_down': pt.qty_down,
-                    'pair_cost': pt.pair_cost,
-                    'payout': liquidation_value,
-                    'pnl': pnl
-                })
+        market_expired = tracker.window_end and now > tracker.window_end
+        
+        # If market expired, close it immediately and calculate PnL
+        if market_expired and tracker.paper_trader.market_status == 'open':
+            pt = tracker.paper_trader
+            
+            # Determine winner based on last prices (UP wins if UP price > DOWN price)
+            up_price = tracker.up_price or 0.5
+            down_price = tracker.down_price or 0.5
+            if up_price > down_price:
+                outcome = 'UP'
+                payout = pt.qty_up  # $1 per UP share
+            else:
+                outcome = 'DOWN'
+                payout = pt.qty_down  # $1 per DOWN share
+            
+            total_cost = pt.cost_up + pt.cost_down
+            pnl = payout - total_cost
+            
+            # Add payout back to cash
+            self.cash_ref['balance'] += payout
+            
+            # Mark as resolved
+            pt.market_status = 'resolved'
+            pt.resolution_outcome = outcome
+            pt.payout = payout
+            pt.final_pnl = pnl
+            
+            print(f"🏁 [{tracker.asset.upper()}] Market closed: {outcome} won | Payout: ${payout:.2f} | PnL: ${pnl:+.2f}")
+            
+            # Add to history
+            self.history.append({
+                'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                'slug': tracker.slug,
+                'asset': tracker.asset,
+                'outcome': outcome,
+                'qty_up': pt.qty_up,
+                'qty_down': pt.qty_down,
+                'pair_cost': pt.pair_cost,
+                'payout': payout,
+                'pnl': pnl
+            })
             return
         
         try:
@@ -1567,6 +1579,12 @@ class MultiMarketBot:
     
     async def check_resolution(self, session: aiohttp.ClientSession, tracker: MarketTracker):
         """Check if a market has been resolved"""
+        pt = tracker.paper_trader
+        
+        # Already resolved, nothing to do
+        if pt.market_status == 'resolved':
+            return
+            
         try:
             url = f"{self.GAMMA_API_URL}/events?slug={tracker.slug}"
             async with session.get(url) as response:
@@ -1588,23 +1606,58 @@ class MultiMarketBot:
                                 else:
                                     continue
                                 
-                                if tracker.paper_trader.market_status != 'resolved':
-                                    pnl = tracker.paper_trader.resolve_market(resolution)
-                                    print(f"🏁 [{tracker.asset.upper()}] Resolved: {resolution} | PnL: ${pnl:.2f}")
-                                    
-                                    # Add to history
-                                    self.history.append({
-                                        'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
-                                        'slug': tracker.slug,
-                                        'asset': tracker.asset,
-                                        'outcome': resolution,
-                                        'qty_up': tracker.paper_trader.qty_up,
-                                        'qty_down': tracker.paper_trader.qty_down,
-                                        'pair_cost': tracker.paper_trader.pair_cost,
-                                        'payout': tracker.paper_trader.payout,
-                                        'pnl': pnl
-                                    })
-                                break
+                                pnl = pt.resolve_market(resolution)
+                                print(f"🏁 [{tracker.asset.upper()}] Resolved: {resolution} | PnL: ${pnl:.2f}")
+                                
+                                # Add to history
+                                self.history.append({
+                                    'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                                    'slug': tracker.slug,
+                                    'asset': tracker.asset,
+                                    'outcome': resolution,
+                                    'qty_up': pt.qty_up,
+                                    'qty_down': pt.qty_down,
+                                    'pair_cost': pt.pair_cost,
+                                    'payout': pt.payout,
+                                    'pnl': pnl
+                                })
+                                return
+                        
+                        # No winner found yet - check if we've been waiting too long
+                        now = datetime.now(timezone.utc)
+                        if tracker.window_end:
+                            time_since_close = (now - tracker.window_end).total_seconds()
+                            # If we've waited more than 5 minutes without resolution, assume market failed
+                            if time_since_close > 300 and pt.market_status != 'resolved':
+                                # Liquidate at last known prices
+                                liquidation_value = (pt.qty_up * tracker.last_up_bid) + (pt.qty_down * tracker.last_down_bid)
+                                if liquidation_value == 0 and (pt.qty_up > 0 or pt.qty_down > 0):
+                                    liquidation_value = min(pt.qty_up, pt.qty_down)
+                                total_cost = pt.cost_up + pt.cost_down
+                                pnl = liquidation_value - total_cost
+                                
+                                # Add payout back to cash
+                                self.cash_ref['balance'] += liquidation_value
+                                
+                                pt.market_status = 'resolved'
+                                pt.resolution_outcome = 'TIMEOUT'
+                                pt.payout = liquidation_value
+                                pt.final_pnl = pnl
+                                
+                                print(f"⚠️ [{tracker.asset.upper()}] Resolution timeout | Liquidated: ${liquidation_value:.2f} | PnL: ${pnl:+.2f}")
+                                
+                                self.history.append({
+                                    'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                                    'slug': tracker.slug,
+                                    'asset': tracker.asset,
+                                    'outcome': 'TIMEOUT',
+                                    'qty_up': pt.qty_up,
+                                    'qty_down': pt.qty_down,
+                                    'pair_cost': pt.pair_cost,
+                                    'payout': liquidation_value,
+                                    'pnl': pnl
+                                })
+                                
         except Exception as e:
             print(f"Error checking resolution for {tracker.slug}: {e}")
     
@@ -1613,8 +1666,8 @@ class MultiMarketBot:
         to_remove = []
         for slug, tracker in self.active_markets.items():
             if tracker.paper_trader.market_status == 'resolved':
-                # Keep resolved markets for a bit so UI can show them
-                if time.time() - tracker.last_update > 60:
+                # Keep resolved markets for 2 minutes so UI can show them
+                if time.time() - tracker.last_update > 120:
                     to_remove.append(slug)
         
         for slug in to_remove:
@@ -1649,17 +1702,33 @@ class MultiMarketBot:
                     for tracker in list(self.active_markets.values()):
                         await self.update_market(session, tracker)
                         
-                        # Check resolution for closed markets
-                        if tracker.paper_trader.market_status == 'closed':
-                            await self.check_resolution(session, tracker)
+                        # Check resolution for expired markets (window_end has passed)
+                        if tracker.window_end and datetime.now(timezone.utc) > tracker.window_end:
+                            if tracker.paper_trader.market_status != 'resolved':
+                                await self.check_resolution(session, tracker)
                     
                     # Cleanup old markets
                     await self.cleanup_old_markets()
                     
-                    # Prepare broadcast data
+                    # Prepare broadcast data - only send NEWEST market per asset
                     active_data = {}
                     total_locked_profit = 0
                     total_position_value = 0
+                    
+                    # First, find the newest market per asset
+                    newest_per_asset = {}
+                    for slug, tracker in self.active_markets.items():
+                        asset = tracker.asset
+                        # Extract timestamp from slug
+                        import re
+                        match = re.search(r'-(\d+)$', slug)
+                        timestamp = int(match.group(1)) if match else 0
+                        
+                        if asset not in newest_per_asset or timestamp > newest_per_asset[asset][1]:
+                            newest_per_asset[asset] = (slug, timestamp)
+                    
+                    # Now only include newest markets in broadcast
+                    newest_slugs = {slug for slug, _ in newest_per_asset.values()}
                     
                     for slug, tracker in self.active_markets.items():
                         pt = tracker.paper_trader
@@ -1669,13 +1738,15 @@ class MultiMarketBot:
                         total_position_value += position_value
                         total_locked_profit += pt.locked_profit
                         
-                        active_data[slug] = {
-                            'asset': tracker.asset,
-                            'up_price': tracker.up_price,
-                            'down_price': tracker.down_price,
-                            'window_time': f"{tracker.window_end.strftime('%H:%M:%S') if tracker.window_end else '--:--'}",
-                            'paper_trader': tracker.paper_trader.get_state()
-                        }
+                        # Only include newest market per asset in UI data
+                        if slug in newest_slugs:
+                            active_data[slug] = {
+                                'asset': tracker.asset,
+                                'up_price': tracker.up_price,
+                                'down_price': tracker.down_price,
+                                'window_time': f"{tracker.window_end.strftime('%H:%M:%S') if tracker.window_end else '--:--'}",
+                                'paper_trader': tracker.paper_trader.get_state()
+                            }
                     
                     # True balance = cash + value of locked positions
                     true_balance = self.cash_ref['balance'] + total_position_value
@@ -1717,7 +1788,9 @@ class MultiMarketBot:
                         print(f"📊 Cash: ${self.cash_ref['balance']:.2f} | True Balance: ${true_balance:.2f} | PnL: ${total_pnl:+.2f} | Active: {len(self.active_markets)}")
                     
                 except Exception as e:
+                    import traceback
                     print(f"Error in data loop: {e}")
+                    traceback.print_exc()
                 
                 await asyncio.sleep(1)
     
