@@ -40,37 +40,72 @@ jobs:
           echo "⏰ Started at: $(date)"
           
           # Start the bot in background
-          python web_bot_multi.py &
+          python web_bot_multi.py > bot.log 2>&1 &
           BOT_PID=$!
-          sleep 3
+          echo "Bot PID: $BOT_PID"
           
-          # Start cloudflare tunnel and capture URL
-          ./cloudflared tunnel --url http://localhost:8080 2>&1 | tee cf.log &
+          # Wait for bot to start
+          sleep 5
+          
+          # Check if bot is running
+          if ! kill -0 $BOT_PID 2>/dev/null; then
+            echo "❌ Bot failed to start!"
+            cat bot.log
+            exit 1
+          fi
+          
+          echo "✅ Bot started successfully"
+          
+          # Start cloudflare tunnel
+          ./cloudflared tunnel --url http://127.0.0.1:8080 > cf.log 2>&1 &
           CF_PID=$!
+          echo "Cloudflared PID: $CF_PID"
           
-          # Wait for tunnel URL
-          sleep 10
+          # Wait for tunnel URL with retry
+          TUNNEL_URL=""
+          for i in {1..30}; do
+            sleep 2
+            TUNNEL_URL=$(grep -o 'https://[^[:space:]]*\.trycloudflare\.com' cf.log 2>/dev/null | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            echo "Waiting for tunnel... ($i/30)"
+          done
           
-          # Extract and display URL
-          TUNNEL_URL=$(grep -o 'https://[^[:space:]]*\.trycloudflare\.com' cf.log | head -1)
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            cat cf.log
+            exit 1
+          fi
           
           echo ""
           echo "=========================================="
           echo "📱 OPEN THIS URL ON YOUR PHONE:"
+          echo ""
           echo "🌐 $TUNNEL_URL"
+          echo ""
           echo "=========================================="
           echo ""
           
-          # Keep showing status every 5 minutes
+          # Tail bot output while running
+          tail -f bot.log &
+          TAIL_PID=$!
+          
+          # Keep showing URL every 15 minutes
           ELAPSED=0
           while [ $ELAPSED -lt $BOT_DURATION ]; do
-            sleep 300
-            ELAPSED=$((ELAPSED + 300))
+            sleep 900
+            ELAPSED=$((ELAPSED + 900))
             MINS=$((ELAPSED / 60))
-            echo "⏱️ Running for $MINS minutes... URL: $TUNNEL_URL"
+            echo ""
+            echo "=========================================="
+            echo "⏱️ Running for $MINS minutes"
+            echo "🌐 URL: $TUNNEL_URL"
+            echo "=========================================="
           done
           
           # Cleanup
+          kill $TAIL_PID 2>/dev/null || true
           kill $BOT_PID 2>/dev/null || true
           kill $CF_PID 2>/dev/null || true
           
