@@ -1080,118 +1080,157 @@ class PaperTrader:
         return True
     
     def check_and_trade(self, up_price: float, down_price: float, timestamp: str, time_to_close: float = None, up_bid: Optional[float] = None, down_bid: Optional[float] = None):
+        """
+        GABAGOOL v8 - GUARANTEED PROFIT LOGIC
+        
+        GOAL: Ensure min(qty_up, qty_down) > total_spent + fees
+        This means we profit regardless of outcome!
+        
+        CONSTRAINTS:
+        1. pair_cost MUST be < $1.00 (otherwise impossible to profit)
+        2. Budget limit: max 50% of starting balance per market
+        3. Stop trading once profit is secured
+        """
         trades_made = []
         
-        # === CHECK IF PROFIT IS SECURED ===
+        total_spent = self.cost_up + self.cost_down
+        budget_limit = self.starting_balance * self.max_position_pct
+        remaining_budget = max(0, budget_limit - total_spent)
+        
+        # === HAVE BOTH SIDES - CHECK PROFIT STATUS ===
         if self.qty_up > 0 and self.qty_down > 0:
-            total_spent = self.cost_up + self.cost_down
             min_qty = min(self.qty_up, self.qty_down)
             fees = self.calculate_total_fees()
             locked = min_qty - total_spent - fees
             
             # ✅ PROFIT SECURED - STOP ALL TRADING!
             if locked > 0:
-                # Do nothing - we have guaranteed profit
                 return trades_made
             
-            # ⚠️ PROFIT NOT SECURED - TRY TO FIX!
-            # If we have both sides but locked < 0, we need to REBALANCE aggressively
+            # ⚠️ PROFIT NOT SECURED - ANALYZE AND FIX
             ratio = max(self.qty_up, self.qty_down) / min(self.qty_up, self.qty_down)
+            pair_cost = self.pair_cost
             
-            if ratio > 1.15:  # Position is unbalanced
-                # Determine which side needs more
+            # CASE 1: Position is unbalanced - need to buy the lagging side
+            if ratio > 1.10:
                 if self.qty_up < self.qty_down:
-                    # Need more UP to balance
+                    # Need more UP
+                    lagging_side = 'UP'
+                    lagging_price = up_price
                     needed_qty = self.qty_down - self.qty_up
-                    max_price_to_pay = 0.60  # Pay up to $0.60 to rebalance
-                    
-                    if up_price <= max_price_to_pay:
-                        # Calculate how much to buy
-                        cost_for_balance = needed_qty * up_price
-                        max_spend = min(cost_for_balance, self.cash * 0.5)
-                        qty = max_spend / up_price
-                        
-                        if qty >= 5.0:  # Minimum meaningful qty
-                            new_locked = self.locked_profit_after_buy('UP', up_price, qty)
-                            if new_locked > locked:  # Only if it improves
-                                if self.execute_buy('UP', up_price, qty, timestamp):
-                                    trades_made.append(('UP', up_price, qty))
-                                    print(f"🔧 [FIX] Bought {qty:.1f} UP @ ${up_price:.3f} to rebalance (locked ${locked:.2f}→${new_locked:.2f})")
-                                return trades_made
                 else:
-                    # Need more DOWN to balance
+                    # Need more DOWN
+                    lagging_side = 'DOWN'
+                    lagging_price = down_price
                     needed_qty = self.qty_up - self.qty_down
-                    max_price_to_pay = 0.60
+                
+                # Calculate max price we can pay while keeping pair_cost < $1.00
+                # New pair_cost ≈ (cost_up + cost_down + new_cost) / min(new_qty_up, new_qty_down)
+                # We want this < $1.00
+                
+                # Simpler: just ensure the new buy improves locked profit
+                if remaining_budget > 3.0:  # Have budget
+                    # Try buying to improve locked profit
+                    test_qty = min(needed_qty, remaining_budget / lagging_price, self.cash * 0.4 / lagging_price)
                     
-                    if down_price <= max_price_to_pay:
-                        cost_for_balance = needed_qty * down_price
-                        max_spend = min(cost_for_balance, self.cash * 0.5)
-                        qty = max_spend / down_price
+                    if test_qty >= 3.0:
+                        new_locked = self.locked_profit_after_buy(lagging_side, lagging_price, test_qty)
                         
-                        if qty >= 5.0:
-                            new_locked = self.locked_profit_after_buy('DOWN', down_price, qty)
-                            if new_locked > locked:
-                                if self.execute_buy('DOWN', down_price, qty, timestamp):
-                                    trades_made.append(('DOWN', down_price, qty))
-                                    print(f"🔧 [FIX] Bought {qty:.1f} DOWN @ ${down_price:.3f} to rebalance (locked ${locked:.2f}→${new_locked:.2f})")
-                                return trades_made
-        
-        if self.qty_up > 0 and self.qty_down > 0:
-            ratio_up = self.qty_up / self.qty_down
-            ratio_down = self.qty_down / self.qty_up
+                        # Only buy if it IMPROVES locked profit
+                        if new_locked > locked:
+                            if self.execute_buy(lagging_side, lagging_price, test_qty, timestamp):
+                                trades_made.append((lagging_side, lagging_price, test_qty))
+                                print(f"🔧 [REBALANCE] Bought {test_qty:.1f} {lagging_side} @ ${lagging_price:.3f} | locked ${locked:.2f}→${new_locked:.2f}")
+                            return trades_made
             
-            if ratio_up > self.rebalance_trigger:
-                should, qty, reason = self.should_buy('DOWN', down_price, up_price, is_rebalance=True, time_to_close=time_to_close)
-                if should:
-                    if self.execute_buy('DOWN', down_price, qty, timestamp):
-                        trades_made.append(('DOWN', down_price, qty))
-                return trades_made
+            # CASE 2: Balanced but pair_cost >= $1.00 - need cheaper side to reduce avg
+            if pair_cost >= 0.99 and ratio <= 1.10:
+                # Only buy the CHEAPER side to reduce pair_cost
+                cheaper_side = 'UP' if up_price < down_price else 'DOWN'
+                cheaper_price = min(up_price, down_price)
+                
+                # Must be cheap enough to help
+                current_avg = self.avg_up if cheaper_side == 'UP' else self.avg_down
+                
+                if cheaper_price < current_avg and remaining_budget > 3.0:
+                    test_qty = min(remaining_budget / cheaper_price, self.cash * 0.3 / cheaper_price)
+                    
+                    if test_qty >= 3.0:
+                        new_locked = self.locked_profit_after_buy(cheaper_side, cheaper_price, test_qty)
+                        _, new_pair_cost = self.simulate_buy(cheaper_side, cheaper_price, test_qty)
+                        
+                        if new_locked > locked or new_pair_cost < pair_cost:
+                            if self.execute_buy(cheaper_side, cheaper_price, test_qty, timestamp):
+                                trades_made.append((cheaper_side, cheaper_price, test_qty))
+                                print(f"📉 [REDUCE PAIR] Bought {test_qty:.1f} {cheaper_side} @ ${cheaper_price:.3f} | pair ${pair_cost:.3f}→${new_pair_cost:.3f}")
+                            return trades_made
             
-            if ratio_down > self.rebalance_trigger:
-                should, qty, reason = self.should_buy('UP', up_price, down_price, is_rebalance=True, time_to_close=time_to_close)
-                if should:
-                    if self.execute_buy('UP', up_price, qty, timestamp):
-                        trades_made.append(('UP', up_price, qty))
-                return trades_made
+            # CASE 3: Already good ratio, pair_cost OK - just wait
+            return trades_made
         
-        # === PRIORITY: HEDGE if we only have one side! ===
+        # === ONLY HAVE ONE SIDE - NEED TO HEDGE ===
         if self.qty_up > 0 and self.qty_down == 0:
-            # Have UP, need DOWN
-            should, qty, reason = self.should_buy('DOWN', down_price, up_price, time_to_close=time_to_close)
-            if should:
+            # Have UP, need DOWN to complete pair
+            potential_pair = self.avg_up + down_price
+            
+            # 10-second rule: after 10s, REFUSE if pair > $1.00
+            time_since_first = time.time() - self.first_trade_time if self.first_trade_time else 0
+            if time_since_first > 10 and potential_pair > 1.00:
+                return trades_made  # Refuse bad hedge
+            
+            # Match qty for balance
+            target_qty = self.qty_up
+            max_spend = min(target_qty * down_price, remaining_budget, self.cash * 0.8)
+            qty = max_spend / down_price
+            
+            if qty >= 1.0:
                 if self.execute_buy('DOWN', down_price, qty, timestamp):
                     trades_made.append(('DOWN', down_price, qty))
-            return trades_made  # Always return after attempting hedge
+                    print(f"🔒 [HEDGE] Bought {qty:.1f} DOWN @ ${down_price:.3f} | pair: ${self.pair_cost:.3f}")
+            return trades_made
         
         if self.qty_down > 0 and self.qty_up == 0:
             # Have DOWN, need UP
-            should, qty, reason = self.should_buy('UP', up_price, down_price, time_to_close=time_to_close)
-            if should:
+            potential_pair = up_price + self.avg_down
+            
+            time_since_first = time.time() - self.first_trade_time if self.first_trade_time else 0
+            if time_since_first > 10 and potential_pair > 1.00:
+                return trades_made
+            
+            target_qty = self.qty_down
+            max_spend = min(target_qty * up_price, remaining_budget, self.cash * 0.8)
+            qty = max_spend / up_price
+            
+            if qty >= 1.0:
                 if self.execute_buy('UP', up_price, qty, timestamp):
                     trades_made.append(('UP', up_price, qty))
-            return trades_made  # Always return after attempting hedge
+                    print(f"🔒 [HEDGE] Bought {qty:.1f} UP @ ${up_price:.3f} | pair: ${self.pair_cost:.3f}")
+            return trades_made
         
-        # === Normal trading when both sides have positions ===
-        if up_price < down_price:
-            should_buy_up, qty_up, _ = self.should_buy('UP', up_price, down_price, time_to_close=time_to_close)
-            if should_buy_up:
-                if self.execute_buy('UP', up_price, qty_up, timestamp):
-                    trades_made.append(('UP', up_price, qty_up))
+        # === NO POSITION - LOOK FOR ENTRY ===
+        if self.qty_up == 0 and self.qty_down == 0:
+            # Only enter if price is cheap
+            if up_price <= self.cheap_threshold and up_price < down_price:
+                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.5)
+                qty = max_spend / up_price
+                
+                if qty >= 1.0:
+                    self.first_trade_time = time.time()
+                    if self.execute_buy('UP', up_price, qty, timestamp):
+                        trades_made.append(('UP', up_price, qty))
+                        print(f"🎯 [ENTRY] Bought {qty:.1f} UP @ ${up_price:.3f}")
+                return trades_made
             
-            should_buy_down, qty_down, _ = self.should_buy('DOWN', down_price, up_price, time_to_close=time_to_close)
-            if should_buy_down:
-                if self.execute_buy('DOWN', down_price, qty_down, timestamp):
-                    trades_made.append(('DOWN', down_price, qty_down))
-        else:
-            should_buy_down, qty_down, _ = self.should_buy('DOWN', down_price, up_price, time_to_close=time_to_close)
-            if should_buy_down:
-                if self.execute_buy('DOWN', down_price, qty_down, timestamp):
-                    trades_made.append(('DOWN', down_price, qty_down))
-            
-            should_buy_up, qty_up, _ = self.should_buy('UP', up_price, down_price, time_to_close=time_to_close)
-            if should_buy_up:
-                if self.execute_buy('UP', up_price, qty_up, timestamp):
-                    trades_made.append(('UP', up_price, qty_up))
+            if down_price <= self.cheap_threshold and down_price < up_price:
+                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.5)
+                qty = max_spend / down_price
+                
+                if qty >= 1.0:
+                    self.first_trade_time = time.time()
+                    if self.execute_buy('DOWN', down_price, qty, timestamp):
+                        trades_made.append(('DOWN', down_price, qty))
+                        print(f"🎯 [ENTRY] Bought {qty:.1f} DOWN @ ${down_price:.3f}")
+                return trades_made
         
         return trades_made
     
