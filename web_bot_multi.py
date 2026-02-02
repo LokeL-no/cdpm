@@ -619,7 +619,7 @@ HTML_TEMPLATE = """
 
 
 class PaperTrader:
-    """Gabagool v4 paper trading bot - BALANCED HEDGING STRATEGY"""
+    """Gabagool v7 paper trading bot - RECOVERY MODE ENABLED"""
     
     def __init__(self, cash_ref: dict, market_slug: str):
         """
@@ -638,61 +638,36 @@ class PaperTrader:
         self.resolution_outcome = None
         self.final_pnl = None
         self.payout = 0.0
+        self.starting_balance = 1000.0
         
-        # Gabagool v6 - PROFITABLE ONLY Strategy
-        # Core principle: ONLY trade when pair_cost < 1.00 (guaranteed profit)
+        # === GABAGOOL v7 - RECOVERY MODE STRATEGY ===
+        # Core principle: Get pair_cost < $1.00 by ANY means necessary
         
-        # STRICT profit thresholds
-        self.target_pair_cost = 0.96      # Target: 4% profit per pair
-        self.max_pair_cost = 0.99         # Maximum: 1% profit per pair  
-        self.absolute_max_pair_cost = 1.005  # Emergency: accept 0.5% loss max
-        self.min_profit_per_pair = 0.005  # Minimum 0.5 cent profit per pair
-        
-        # Entry thresholds - be more aggressive to find opportunities
-        self.cheap_threshold = 0.50       # First trade: need price < this
-        self.very_cheap_threshold = 0.45  # Bonus buying threshold
-        self.rebalance_threshold_price = 0.55
-        self.emergency_rebalance_price = 0.60
+        # Trading strategy parameters
+        self.cheap_threshold = 0.45      # What we consider "cheap"
+        self.very_cheap_threshold = 0.38 # Very cheap - accumulate
+        self.force_balance_threshold = 0.52  # Max price to pay when balancing
+        self.max_balance_price = 0.60    # Absolute max for emergency balance
+        self.target_pair_cost = 0.95     # Ideal pair cost target
+        self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
         # Position sizing
         self.min_trade_size = 3.0
-        self.max_single_trade = 12.0      # Smaller trades for safety
-        self.cooldown_seconds = 5         # Longer cooldown for better prices
+        self.max_single_trade = 15.0
+        self.cooldown_seconds = 4
         self.last_trade_time = 0
         self.first_trade_time = 0
         self.initial_trade_usd = 35.0
-        self.max_loss_per_market = 50.0     # Stop trading if expected loss > this
-        self.sell_mode = False
-        self.sell_mode_trigger_seconds = 300
-        self.sell_mode_min_profit = 1.0
+        self.max_position_pct = 0.50     # Max 50% of balance per market
+        self.force_balance_after_seconds = 120
         
-        # Timing - be more patient before accepting bad hedges
-        self.emergency_after_seconds = 300
-        self.patience_before_breakeven = 420  # Wait 7 minutes before accepting break-even
-        self.patience_before_small_loss = 540  # Wait 9 minutes before accepting small loss
-        self.max_qty_ratio = 1.02         # Keep positions very balanced
-        self.target_qty_ratio = 1.0
-        self.rebalance_trigger = 1.015
-        self.partial_hedge_threshold = 0.70
-        
-        # Imbalanced market (one side > 65 cent)
-        self.imbalanced_threshold = 0.65
-        self.imbalanced_max_pair_cost = 1.00  # Break-even in imbalanced
-        self.imbalanced_cheap_buy_fraction = 0.4
-        self.imbalanced_expensive_hedge_threshold = 0.82
-        self.gradual_hedge_increment = 0.25
-        
-        # SAFETY: Max unhedged exposure to prevent large losses
-        self.max_unhedged_cost = 15.0      # Max $ spent on one side without hedge
-        self.forced_hedge_threshold = 0.70 # Force hedge even at this price if unhedged too long
-        self.forced_hedge_time = 480       # Force hedge after 8 minutes unhedged
-        
-        
-        # SMART HEDGE: Over-hedge to guarantee profit on hedge side
-        self.enable_smart_hedge = True     # Enable over-hedging strategy
-        self.smart_hedge_max_price = 0.75  # Max price to use smart hedge (avoid extreme prices)
-        self.smart_hedge_min_profit = 1.0  # Min $ profit to trigger smart hedge
-        self.smart_hedge_max_spend = 50.0  # Max $ to spend on smart hedge
+        # === RECOVERY MODE PARAMETERS ===
+        # When pair_cost > $1.00, we need to be aggressive to fix it
+        self.max_qty_ratio = 1.35       # Normal max imbalance (35%)
+        self.emergency_ratio = 2.0      # Allow HIGH imbalance when fixing pair_cost > $1.00
+        self.recovery_ratio = 2.5       # Max ratio when actively recovering (EXTREME)
+        self.target_qty_ratio = 1.0     # Perfect balance
+        self.rebalance_trigger = 1.15   # Start rebalancing when ratio exceeds this
         
     @property
     def cash(self):
@@ -923,255 +898,180 @@ class PaperTrader:
         return result
     
     def should_buy(self, side: str, price: float, other_price: float, is_rebalance: bool = False, is_emergency: bool = False, time_to_close: float = None) -> tuple:
+        """
+        GABAGOOL v7 - RECOVERY MODE ENABLED
+        
+        THE ONLY WAY TO GUARANTEE PROFIT:
+        - pair_cost (avg_UP + avg_DOWN) < $1.00
+        - qty_UP ≈ qty_DOWN (balanced positions)
+        
+        RECOVERY MODE: When pair_cost > $1.00, allow high imbalance
+        to aggressively cost-average and get pair_cost under $1.00
+        """
         if self.market_status != 'open':
             return False, 0, "Market not open"
         
         now = time.time()
-        cooldown = self.cooldown_seconds / 3 if (is_rebalance or is_emergency) else self.cooldown_seconds
+        cooldown = self.cooldown_seconds / 2 if is_rebalance else self.cooldown_seconds
         if now - self.last_trade_time < cooldown:
             return False, 0, "Cooldown active"
         
         my_qty = self.qty_up if side == 'UP' else self.qty_down
+        my_cost = self.cost_up if side == 'UP' else self.cost_down
+        my_avg = my_cost / my_qty if my_qty > 0 else 0
         other_qty = self.qty_down if side == 'UP' else self.qty_up
+        other_cost = self.cost_down if side == 'UP' else self.cost_up
+        other_avg = other_cost / other_qty if other_qty > 0 else 0
         other_side = 'DOWN' if side == 'UP' else 'UP'
-
-        def approve_buy(qty: float, reason: str) -> tuple:
-            if qty <= 0:
-                return False, 0, "Invalid qty"
-            # For scaling (both sides have positions), require pair_cost AND locked_profit improvement
-            # For first trade or hedge (one side is 0), allow freely
-            is_scaling = self.qty_up > 0 and self.qty_down > 0
-            if is_scaling:
-                if not self.improves_pair_cost(side, price, qty) or not self.improves_locked_profit(side, price, qty):
-                    return False, 0, "Scaling blocked: must improve pair cost AND locked profit"
-            allowed, block_reason = self.sell_mode_allows_buy(side, price, qty)
-            if not allowed:
-                return False, 0, block_reason
-            return True, qty, reason
-
-        if self.sell_mode and my_qty == 0 and other_qty == 0:
-            return False, 0, "Sell mode: waiting for lockable profit"
         
-        # ═══════════════════════════════════════════════════════════════════
-        # MARKET ANALYSIS
-        # ═══════════════════════════════════════════════════════════════════
-        combined_ask = price + other_price
+        # === POSITION SIZE LIMIT ===
+        total_spent = self.cost_up + self.cost_down
+        max_total_spend = self.starting_balance * self.max_position_pct
+        remaining_budget = max_total_spend - total_spent
         
-        # Detect imbalanced market
-        cheap_price = min(price, other_price)
-        expensive_price = max(price, other_price)
-        is_imbalanced_market = cheap_price < 0.38 and expensive_price > 0.62
-        is_cheap_side = price < other_price
+        if remaining_budget <= self.min_trade_size and not is_emergency and not (my_qty == 0 and other_qty > 0):
+            return False, 0, f"Position limit reached (spent ${total_spent:.0f})"
         
-        # ═══════════════════════════════════════════════════════════════════
-        # FIRST TRADE: Enter with cheap side, expect to hedge later
-        # Strategy: Buy cheap now, hope to hedge when other side dips
-        # ═══════════════════════════════════════════════════════════════════
+        # === FIRST TRADE: Only start if we can get good pair_cost ===
         if my_qty == 0 and other_qty == 0:
             if price > self.cheap_threshold:
                 return False, 0, f"First trade needs price < ${self.cheap_threshold}"
             
-            # For first trade, we estimate what hedge might cost
-            # Assume we can hedge at slightly better than current other_price
-            estimated_hedge_price = other_price * 0.98  # Hope for 2% improvement
-            estimated_pair_cost = price + estimated_hedge_price
+            potential_pair_cost = price + other_price
+            if potential_pair_cost > self.max_pair_cost:
+                return False, 0, f"Pair would be ${potential_pair_cost:.2f} > ${self.max_pair_cost} - waiting"
             
-            # Only enter if we have reasonable expectation of profit
-            if estimated_pair_cost >= self.absolute_max_pair_cost:
-                return False, 0, f"Estimated pair ${estimated_pair_cost:.3f} too risky"
-            
-            # SAFETY: Limit first trade size to max_unhedged_cost
-            # This prevents large losses if we never find a good hedge
-            max_first_trade = min(self.max_unhedged_cost, self.initial_trade_usd, self.cash)
-            
-            # Imbalanced market: even smaller position
-            if is_imbalanced_market:
-                max_spend = min(max_first_trade * self.imbalanced_cheap_buy_fraction, self.max_single_trade * 0.4)
-            else:
-                max_spend = min(max_first_trade, self.max_single_trade)
-            
+            max_spend = min(self.initial_trade_usd, self.max_single_trade, remaining_budget, self.cash)
             qty = max_spend / price
             self.first_trade_time = now
-            expected_profit = (1.0 - estimated_pair_cost) * qty
-            return approve_buy(qty, f"First trade @ ${price:.2f} (max exposure: ${max_spend:.2f})")
+            return True, qty, f"🎯 First trade (pair potential: ${potential_pair_cost:.2f})"
         
-        # Must balance before adding more
-        if other_qty == 0 and my_qty > 0:
-            return False, 0, f"Must buy {other_side} first"
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # HEDGE MODE: Complete the pair to lock in profit or minimize loss
-        # ═══════════════════════════════════════════════════════════════════
+        # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
         if my_qty == 0 and other_qty > 0:
-            # Calculate what pair cost would be if we hedge now
-            other_avg = self.avg_up if side == 'DOWN' else self.avg_down
-            other_cost = self.cost_up if side == 'DOWN' else self.cost_down
-            simulated_pair_cost = other_avg + price
-            
-            profit_per_pair = 1.0 - simulated_pair_cost
             time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
+            potential_pair_cost = other_avg + price
             
-            # PROFIT SCENARIO: We can hedge profitably!
-            if profit_per_pair >= self.min_profit_per_pair:
-                target_qty = other_qty
-                max_spend = min(target_qty * price, self.cash * 0.3, self.max_single_trade * 2)
-                qty = max_spend / price
-                total_profit = profit_per_pair * min(qty, other_qty)
-                return approve_buy(qty, f"✅ PROFIT hedge: ${total_profit:.2f} (pair: ${simulated_pair_cost:.3f})")
+            if time_unhedged > self.force_balance_after_seconds:
+                if potential_pair_cost < self.max_pair_cost:
+                    price_threshold = self.max_balance_price
+                    reason = f"🚨 FORCE BALANCE ({time_unhedged:.0f}s unhedged)"
+                else:
+                    return False, 0, f"🚨 Pair cost ${potential_pair_cost:.2f} too high even for emergency"
+            elif potential_pair_cost < self.target_pair_cost:
+                price_threshold = self.force_balance_threshold
+                reason = f"✅ GOOD PAIR COST (${potential_pair_cost:.2f})"
+            else:
+                price_threshold = self.cheap_threshold
+                reason = "⏳ Waiting for better price"
             
-            # ═══════════════════════════════════════════════════════════════════
-            # SMART HEDGE: Over-hedge to guarantee profit on hedge side
-            # Use when pair_cost > 1.0 but price is reasonable
-            # ═══════════════════════════════════════════════════════════════════
-            if self.enable_smart_hedge and simulated_pair_cost > 1.0:
-                smart = self.calculate_smart_hedge(price)
-                
-                if smart['viable']:
-                    # Use smart hedge - buy more than 1:1 to guarantee profit if this side wins
-                    qty = smart['smart_qty']
-                    if qty * price <= self.cash:
-                        win_profit = smart['pnl_if_hedge_wins']
-                        lose_loss = smart['pnl_if_original_wins']
-                        return approve_buy(qty, f"🎯 SMART hedge: +${win_profit:.2f} if {side} wins, ${lose_loss:.2f} if not")
+            if price > price_threshold:
+                return False, 0, f"Need {side} < ${price_threshold:.2f} (pair would be ${potential_pair_cost:.2f})"
             
-            # SAFETY CHECK: If we've spent too much unhedged, force a hedge
-            # to limit maximum possible loss
-            expected_loss_if_no_hedge = other_cost  # We'd lose everything if market closes
-            time_pressure = time_to_close is not None and time_to_close < 300  # 5 min left
-            waited_too_long = time_unhedged > self.forced_hedge_time
+            target_qty = other_qty
+            max_spend = min(target_qty * price, self.cash * 0.3, remaining_budget + 20)
+            qty = max_spend / price
             
-            # FORCED HEDGE: Accept loss to prevent total loss
-            if (waited_too_long or time_pressure) and other_cost > self.max_unhedged_cost * 0.5:
-                # Calculate max acceptable loss
-                max_acceptable_pair_cost = 1.0 + (self.max_loss_per_market / other_qty)
-                
-                if simulated_pair_cost <= max_acceptable_pair_cost:
-                    target_qty = other_qty
-                    max_spend = min(target_qty * price, self.cash * 0.35)
-                    qty = max_spend / price
-                    expected_loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
-                    reason = f"{time_to_close:.0f}s left" if time_pressure else f"waited {time_unhedged:.0f}s"
-                    return approve_buy(qty, f"🛡️ FORCED hedge to limit loss: -${expected_loss:.2f} ({reason})")
-            
-            # BREAK-EVEN SCENARIO: Accept minimal loss/gain to secure position
-            # But be patient - try to find a better opportunity first!
-            if simulated_pair_cost <= 1.01:  # Within 1% of break-even
-                # Check urgency - but be more patient
-                urgency = False
-                urgency_reason = ""
-                
-                # Time-based urgency: market closing soon
-                if time_to_close is not None and time_to_close < 120:  # Less than 2 minutes
-                    urgency = True
-                    urgency_reason = f"{time_to_close:.0f}s left"
-                
-                # Position-based urgency: been unhedged too long
-                # Only accept break-even after waiting long enough
-                if time_unhedged > self.patience_before_breakeven:  # 7+ minutes unhedged
-                    if simulated_pair_cost <= 1.005:  # Only if almost break-even
-                        urgency = True
-                        urgency_reason = f"waited {time_unhedged:.0f}s"
-                
-                if urgency:
-                    target_qty = other_qty
-                    max_spend = min(target_qty * price, self.cash * 0.25)
-                    qty = max_spend / price
-                    return approve_buy(qty, f"⚖️ Break-even hedge (pair: ${simulated_pair_cost:.3f}, {urgency_reason})")
-            
-            # EMERGENCY SCENARIO: Market closing very soon
-            if time_to_close is not None and time_to_close < 60:  # Less than 1 minute
-                # Accept any hedge that limits our loss
-                max_loss_pair_cost = 1.0 + (self.max_loss_per_market / other_qty)
-                if simulated_pair_cost <= max_loss_pair_cost:
-                    target_qty = other_qty
-                    max_spend = min(target_qty * price, self.cash * 0.4)
-                    qty = max_spend / price
-                    loss = (simulated_pair_cost - 1.0) * min(qty, other_qty)
-                    return approve_buy(qty, f"⚠️ EMERGENCY: -${loss:.2f} loss ({time_to_close:.0f}s left!)")
-            
-            # Not urgent yet - keep waiting for better prices
-            wait_msg = f"waited {time_unhedged:.0f}s" if time_unhedged > 0 else ""
-            potential_loss = other_cost if simulated_pair_cost > 1.0 else 0
-            return False, 0, f"Waiting: pair ${simulated_pair_cost:.3f} ({wait_msg}) [risk: ${potential_loss:.2f}]"
+            if qty < target_qty * 0.5:
+                qty = max(qty, self.min_trade_size / price)
+            return True, qty, reason
         
-        # ═══════════════════════════════════════════════════════════════════
-        # BOTH SIDES HAVE POSITIONS: Add more only if profitable
-        # ═══════════════════════════════════════════════════════════════════
-        ratio = my_qty / other_qty
+        # === BOTH SIDES HAVE POSITIONS - OPTIMIZE PAIR COST ===
         current_pair_cost = self.pair_cost
-        current_profit = 1.0 - current_pair_cost
+        ratio = my_qty / other_qty if other_qty > 0 else 1.0
         
-        # If currently losing, don't add more unless it helps
-        if current_profit < 0:
-            # Only add cheap side to improve ratio
-            if not is_cheap_side:
-                return False, 0, f"Losing position - only add cheap side"
-            
-            # Check if adding improves our situation
-            test_qty = self.min_trade_size / price
-            new_avg, new_pair_cost = self.simulate_buy(side, price, test_qty)
-            if new_pair_cost >= current_pair_cost:
-                return False, 0, f"Would not improve pair cost"
+        # === RECOVERY MODE: When pair_cost > $1.00, be VERY aggressive ===
+        recovery_mode = current_pair_cost >= 1.0
         
-        # Simulate adding more
-        test_qty = self.min_trade_size / price
-        new_avg, new_pair_cost = self.simulate_buy(side, price, test_qty)
-        new_profit = 1.0 - new_pair_cost
-        
-        # RULE: Only add if it doesn't hurt our profit margin significantly
-        if new_pair_cost >= self.absolute_max_pair_cost:
-            return False, 0, f"Would exceed limit (${new_pair_cost:.3f})"
-        
-        # If we already have good profit, only add if it improves or maintains
-        if current_profit > 0.02 and new_profit < current_profit * 0.7:
-            return False, 0, f"Would reduce profit too much"
-        
-        # Ratio checks
-        if ratio >= self.max_qty_ratio:
-            return False, 0, f"{side} at max ratio ({ratio:.2f})"
-        
-        # Price threshold based on ratio
-        if ratio < 0.97:
-            price_threshold = self.rebalance_threshold_price
-            qty_multiplier = 1.3
-        elif ratio < 1.0:
-            price_threshold = self.cheap_threshold
-            qty_multiplier = 1.0
+        # Dynamic ratio limit based on how critical the situation is
+        if recovery_mode:
+            if current_pair_cost >= 1.05:
+                effective_max_ratio = self.recovery_ratio  # 2.5x - extreme
+            elif current_pair_cost >= 1.02:
+                effective_max_ratio = self.emergency_ratio  # 2.0x - high
+            else:
+                effective_max_ratio = 1.80
         else:
-            price_threshold = self.very_cheap_threshold
-            qty_multiplier = 0.5
+            effective_max_ratio = self.max_qty_ratio  # 1.35x - normal
         
-        if price > price_threshold:
-            return False, 0, f"{side} price ${price:.2f} > ${price_threshold:.2f}"
+        if ratio >= effective_max_ratio:
+            return False, 0, f"BLOCKED: {side} at max ratio ({ratio:.2f}x, limit {effective_max_ratio:.2f}x)"
         
-        # Calculate quantity
-        max_qty_allowed = other_qty * self.max_qty_ratio - my_qty
+        max_qty_allowed = other_qty * effective_max_ratio - my_qty
         if max_qty_allowed <= 0:
-            return False, 0, "At balance limit"
+            return False, 0, "At ratio limit"
         
-        base_spend = min(self.cash * 0.025, self.max_single_trade)
-        max_spend = base_spend * qty_multiplier
-        qty = min(max_spend / price, max_qty_allowed)
-        
-        if qty * price < self.min_trade_size:
-            return False, 0, "Trade too small"
-        
-        # Final pair cost check
-        final_avg, final_pair_cost = self.simulate_buy(side, price, qty)
-        if final_pair_cost >= self.max_pair_cost:
-            # Reduce quantity to stay profitable
-            while qty > self.min_trade_size / price and final_pair_cost >= self.max_pair_cost:
-                qty *= 0.7
-                final_avg, final_pair_cost = self.simulate_buy(side, price, qty)
+        # === RECOVERY MODE: AGGRESSIVE COST AVERAGING ===
+        if recovery_mode and price < my_avg:
+            spend_pct = 0.15 if current_pair_cost >= 1.02 else 0.10
+            max_spend = min(self.cash * spend_pct, self.max_single_trade * 2, remaining_budget + 50)
+            qty = min(max_spend / price, max_qty_allowed)
             
-            if final_pair_cost >= self.max_pair_cost:
-                return False, 0, f"Can't add without hurting profit"
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost < current_pair_cost:
+                    improvement = current_pair_cost - new_pair_cost
+                    
+                    if new_pair_cost < 1.0:
+                        return True, qty, f"🎯 RECOVERY SUCCESS: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (UNDER $1.00!)"
+                    
+                    if improvement >= 0.002:
+                        return True, qty, f"🚨 RECOVERY: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
-        profit_per_pair = 1.0 - final_pair_cost
-        min_hedged = min(my_qty + qty, other_qty)
-        total_profit = profit_per_pair * min_hedged
+        # === NORMAL MODE: COST AVERAGING ===
+        if not recovery_mode and price < my_avg:
+            spend_pct = 0.04
+            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
+            
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost < current_pair_cost:
+                    improvement = current_pair_cost - new_pair_cost
+                    if improvement >= 0.003:
+                        return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
-        return approve_buy(qty, f"Add {side} (profit: ${total_profit:.2f}, pair: ${final_pair_cost:.3f})")
+        # === REBALANCING: Buy lagging side ===
+        if ratio < 0.92:
+            price_threshold = self.max_balance_price if recovery_mode else self.force_balance_threshold
+            if price <= price_threshold:
+                spend_pct = 0.10 if recovery_mode else 0.05
+                max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+                qty = min(max_spend / price, max_qty_allowed)
+                
+                if qty * price >= self.min_trade_size:
+                    new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                    pair_cost_improving = new_pair_cost < current_pair_cost
+                    
+                    if recovery_mode and pair_cost_improving:
+                        return True, qty, f"🚨 REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
+                    elif new_pair_cost <= self.max_pair_cost:
+                        return True, qty, f"⚖️ REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
+        
+        # === CHEAP ACCUMULATION: Very cheap prices ===
+        if price < self.very_cheap_threshold and ratio < 1.1:
+            spend_pct = 0.08 if recovery_mode else 0.04
+            max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
+            
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                pair_cost_improving = new_pair_cost < current_pair_cost
+                
+                if (recovery_mode and pair_cost_improving) or (new_pair_cost <= self.max_pair_cost):
+                    prefix = "🚨" if recovery_mode else "🔥"
+                    return True, qty, f"{prefix} CHEAP @ ${price:.3f}"
+        
+        # === STANDARD BUYING ===
+        if ratio <= 1.0 and price < self.cheap_threshold and not recovery_mode:
+            max_spend = min(self.cash * 0.03, self.max_single_trade, remaining_budget)
+            qty = min(max_spend / price, max_qty_allowed)
+            
+            if qty * price >= self.min_trade_size:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_pair_cost <= self.max_pair_cost:
+                    return True, qty, f"OK (${price:.3f})"
+        
+        return False, 0, f"{side} ${price:.3f}: no opportunity"
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         cost = price * qty
