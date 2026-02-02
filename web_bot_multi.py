@@ -2,7 +2,7 @@
 """
 Polymarket Multi-Market Bot - BTC, ETH, SOL, XRP Up/Down Tracker
 Web-based interface with real-time updates via WebSocket.
-Gabagool v4 Strategy with auto market discovery.
+V10 Strategy with auto market discovery.
 """
 
 import asyncio
@@ -270,7 +270,7 @@ HTML_TEMPLATE = """
         <div class="header">
             <h1>🤖 Polymarket Multi-Market Bot</h1>
             <div style="color: #888; font-size: 12px;">
-                Gabagool v4 Strategy | Auto Market Discovery | 
+                V10 Strategy | Auto Market Discovery | 
                 <span id="current-time">--:--:--</span>
             </div>
             <div style="margin-top: 10px;">
