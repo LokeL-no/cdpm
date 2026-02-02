@@ -1,4 +1,4 @@
-name: Bot 6h
+name: Bot 5h30m
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 365
+    timeout-minutes: 335
 
     steps:
       - uses: actions/checkout@v4
@@ -18,21 +18,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install bore tunnel
+      - name: Install bore
         run: |
           wget -q https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
           tar -xzf bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
           chmod +x bore
 
-      - name: Start bot and tunnel
+      - name: Run bot with tunnel
         run: |
-          echo "🚀 Starting bot..."
+          echo "🚀 Starting Multi-Market Bot (5h30m)"
+          echo "⏰ Start: $(date)"
+          
+          # Start bot
           python web_bot_multi.py &
+          BOT_PID=$!
           sleep 5
           
-          # Test bot is working
-          curl -s http://127.0.0.1:8080 > /dev/null && echo "✅ Bot is responding on port 8080"
-          
+          # Start bore tunnel
           echo ""
           echo "🌐 Starting bore tunnel..."
           ./bore local 8080 --to bore.pub &
@@ -40,20 +42,13 @@ jobs:
           
           echo ""
           echo "=========================================="
-          echo "📱 OPEN URL: http://bore.pub:XXXXX"
-          echo "   (Check tunnel output above for port)"
+          echo "📱 URL: http://bore.pub:PORT"
+          echo "   (se port i linjene over)"
           echo "=========================================="
           echo ""
           
-          # Run for 6 hours
-          sleep 21600
+          # Run for 5h30m = 19800 seconds
+          sleep 19800
           
-          echo "✅ Done"
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 3
+          kill $BOT_PID 2>/dev/null || true
+          echo "✅ Done: $(date)"
