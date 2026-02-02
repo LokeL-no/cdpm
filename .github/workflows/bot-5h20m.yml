@@ -1,0 +1,49 @@
+name: Multi Bot 5h20m
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duration in seconds (default: 5h20m = 19200s)'
+        required: false
+        default: '19200'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 325  # 5h20m + 5 min buffer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Multi-Market Bot
+        env:
+          BOT_DURATION: ${{ github.event.inputs.duration || '19200' }}
+        run: |
+          echo "🚀 Starting Multi-Market Bot for $BOT_DURATION seconds (5h20m)"
+          echo "⏰ Started at: $(date)"
+          
+          timeout ${BOT_DURATION}s python web_bot_multi.py || true
+          
+          echo "✅ Bot finished at: $(date)"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: |
+            *.log
+            *.json
+          retention-days: 7
