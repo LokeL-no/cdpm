@@ -26,38 +26,14 @@ jobs:
       - name: Start bot and tunnel
         run: |
           echo "🚀 Starting bot..."
-          
-          # Start bot
           python web_bot_multi.py &
-          sleep 8
+          sleep 5
           
-          # Verify bot is listening
-          curl -s http://127.0.0.1:8080 > /dev/null && echo "✅ Bot is running on port 8080"
-          
-          # Start tunnel (runs in foreground, logs to stderr)
-          ./cloudflared tunnel --url http://127.0.0.1:8080 2>&1 &
-          sleep 15
-          
-          # Get URL from cloudflared metrics
-          URL=$(curl -s http://127.0.0.1:8080 > /dev/null && ./cloudflared tunnel --url http://127.0.0.1:8080 2>&1 | grep -m1 'https://' | grep -o 'https://[^ ]*')
-          
-          # Alternative: just run cloudflared and let it print URL
-          pkill cloudflared || true
-          sleep 2
-          
-          echo ""
-          echo "Starting tunnel..."
+          echo "🌐 Starting tunnel..."
           ./cloudflared tunnel --url http://127.0.0.1:8080 &
-          CF_PID=$!
-          
-          # Wait and show URL
-          sleep 20
           
           echo ""
-          echo "=========================================="
-          echo "📱 Check the lines above for URL like:"
-          echo "   https://xxxxx.trycloudflare.com"
-          echo "=========================================="
+          echo "⏳ Waiting for tunnel URL (check above for https://xxx.trycloudflare.com)..."
           echo ""
           
           # Run for 6 hours
