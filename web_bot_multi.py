@@ -501,12 +501,18 @@ HTML_TEMPLATE = """
                                     <div class="holding-value">${pt.qty_up.toFixed(1)}</div>
                                     <div class="holding-label" style="margin-top: 4px;">Avg: $${pt.avg_up.toFixed(3)}</div>
                                     <div class="holding-label" style="color: #f59e0b;">Spent: $${pt.cost_up.toFixed(2)}</div>
+                                    ${pt.qty_up > 0 && pt.qty_down === 0 ? 
+                                        `<div class="holding-label" style="color: #3b82f6; margin-top: 4px;">Need DOWN &lt;$${pt.max_hedge_down.toFixed(3)}</div>` 
+                                        : ''}
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Qty DOWN</div>
                                     <div class="holding-value">${pt.qty_down.toFixed(1)}</div>
                                     <div class="holding-label" style="margin-top: 4px;">Avg: $${pt.avg_down.toFixed(3)}</div>
                                     <div class="holding-label" style="color: #f59e0b;">Spent: $${pt.cost_down.toFixed(2)}</div>
+                                    ${pt.qty_down > 0 && pt.qty_up === 0 ? 
+                                        `<div class="holding-label" style="color: #3b82f6; margin-top: 4px;">Need UP &lt;$${pt.max_hedge_up.toFixed(3)}</div>` 
+                                        : ''}
                                 </div>
                             </div>
                             <div class="holdings-row-2">
@@ -634,31 +640,42 @@ class PaperTrader:
         self.payout = 0.0
         self.starting_balance = 100.0
         
-        # === GABAGOOL v7 - RECOVERY MODE STRATEGY ===
-        # Core principle: Get pair_cost < $1.00 by ANY means necessary
+        # === GABAGOOL v10 - POSITION IMPROVEMENT STRATEGY ===
+        # Core principle: Continuously improve position to make hedging easier
+        # If we buy UP @ $0.46, and later UP is $0.38, buy more to lower average!
+        # This widens the profitable hedge window.
         
         # Trading strategy parameters
-        self.cheap_threshold = 0.48      # What we consider "cheap"
+        self.cheap_threshold = 0.48      # What we consider "cheap" for entry
         self.very_cheap_threshold = 0.40 # Very cheap - accumulate more
         self.force_balance_threshold = 0.55  # Max price to pay when balancing
         self.max_balance_price = 0.65    # Absolute max for emergency balance
         self.target_pair_cost = 0.95     # Ideal pair cost target
         self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
-        # Position sizing for $100 bankroll - FREED UP for profit hunting!
+        # === POSITION IMPROVEMENT PARAMETERS ===
+        # Key insight: Buying more at lower price LOWERS the average!
+        # Example: avg_UP=$0.46, buy more @$0.38 → new avg ~$0.42
+        # Now DOWN only needs to be <$0.58 instead of <$0.54!
+        self.improvement_threshold = 0.005   # Buy more if price is 0.5 cents below average (LOWERED!)
+        self.min_improvement_pct = 0.01      # Or 1% below average (LOWERED!)
+        self.max_imbalance_for_improvement = 2.0  # Max qty ratio during improvement phase
+        self.improvement_trade_pct = 0.25    # Use 25% of budget per improvement trade (INCREASED!)
+        
+        # Position sizing - NO RESTRICTIONS FOR TESTING
         self.min_trade_size = 0.10       # Polymarket minimum (~$0.10)
-        self.max_single_trade = 25.0     # Can go BIG when opportunity is good (up to 25% of bankroll)
-        self.cooldown_seconds = 2        # FASTER - only 2 second cooldown!
+        self.max_single_trade = 10000.0  # No limit
+        self.cooldown_seconds = 1        # Fast cooldown
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 5.0     # Bigger initial trade to lock profit faster
-        self.max_position_pct = 0.50     # Max 50% of balance per market ($50 with $100 bankroll)
+        self.initial_trade_usd = 50.0    # Bigger initial trade
+        self.max_position_pct = 1.0      # No position limit (100%)
         self.force_balance_after_seconds = 120
         
         # === GUARANTEED PROFIT PARAMETERS ===
         # NEW STRATEGY: Ensure min(qty_up, qty_down) > total_spent
         # This guarantees profit regardless of outcome!
-        self.max_qty_ratio = 1.20       # Max 20% imbalance - MUCH STRICTER
+        self.max_qty_ratio = 1.20       # Max 20% imbalance when BOTH sides have positions
         self.emergency_ratio = 1.35     # Emergency: max 35% imbalance
         self.recovery_ratio = 1.50      # Recovery: max 50% (only when pair_cost > 1.05)
         self.target_qty_ratio = 1.0     # Perfect balance
@@ -799,6 +816,78 @@ class PaperTrader:
         
         total_cost = new_cost_up + new_cost_down
         return min(new_qty_up, new_qty_down) - total_cost - total_fees
+    
+    def should_improve_position(self, side: str, price: float) -> tuple:
+        """
+        POSITION IMPROVEMENT STRATEGY
+        
+        Check if we should buy MORE of the same side to lower our average cost.
+        This widens the profitable window for hedging the other side.
+        
+        Example:
+        - Current: avg_DOWN = $0.51, max UP = $0.48 for profit
+        - If DOWN drops to $0.45, buy more!
+        - New avg_DOWN = $0.48, now max UP = $0.51 (easier to hit!)
+        
+        Returns: (should_buy, qty, reason)
+        """
+        my_qty = self.qty_up if side == 'UP' else self.qty_down
+        my_cost = self.cost_up if side == 'UP' else self.cost_down
+        my_avg = my_cost / my_qty if my_qty > 0 else 0
+        other_qty = self.qty_down if side == 'UP' else self.qty_up
+        other_cost = self.cost_down if side == 'UP' else self.cost_up
+        other_avg = other_cost / other_qty if other_qty > 0 else 0
+        other_side = 'DOWN' if side == 'UP' else 'UP'
+        
+        # Only improve if we have a position on this side
+        if my_qty == 0:
+            return False, 0, "No position to improve"
+        
+        # Check if current price is below our average (ANY amount!)
+        price_improvement = my_avg - price
+        price_improvement_pct = price_improvement / my_avg if my_avg > 0 else 0
+        
+        # DEBUG
+        print(f"  🔍 [IMPROVE CHECK {side}] price=${price:.3f} avg=${my_avg:.3f} diff=${price_improvement:.3f} ({price_improvement_pct*100:.1f}%)")
+        
+        if price >= my_avg:
+            return False, 0, f"Price ${price:.3f} >= avg ${my_avg:.3f}"
+        
+        if price_improvement < self.improvement_threshold and price_improvement_pct < self.min_improvement_pct:
+            return False, 0, f"Improvement only ${price_improvement:.3f} ({price_improvement_pct*100:.1f}%) - need >{self.improvement_threshold} or >{self.min_improvement_pct*100}%"
+        
+        # If we have both sides, check imbalance
+        if other_qty > 0:
+            current_ratio = my_qty / other_qty
+            # If we're already the larger side by a lot, don't improve further
+            if current_ratio > 3.0:  # Very relaxed - allow up to 3x imbalance
+                return False, 0, f"Already ahead: {current_ratio:.2f}x ratio"
+        # No budget limits for testing
+        
+        # Calculate optimal improvement quantity - UNLIMITED FOR TESTING
+        budget = 10000.0  # Always have budget to improve
+        
+        if budget < self.min_trade_size:
+            return False, 0, f"Insufficient budget ${budget:.2f}"
+        
+        qty = budget / price
+        
+        # Simulate the new average
+        new_cost = my_cost + (qty * price)
+        new_qty = my_qty + qty
+        new_avg = new_cost / new_qty
+        avg_improvement = my_avg - new_avg
+        
+        # Check: new average must be meaningfully better
+        if avg_improvement < 0.01:
+            return False, 0, f"Would only improve avg by ${avg_improvement:.3f}"
+        
+        # Calculate new hedge requirement
+        old_max_hedge_price = 1.0 - my_avg
+        new_max_hedge_price = 1.0 - new_avg
+        window_expansion = new_max_hedge_price - old_max_hedge_price
+        
+        return True, qty, f"📈 IMPROVE: avg ${my_avg:.3f}→${new_avg:.3f} | hedge window expands by ${window_expansion:.3f}"
 
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         cost = price * qty
@@ -964,9 +1053,19 @@ class PaperTrader:
             self.first_trade_time = now
             return True, qty, f"🎯 ENTRY @ ${price:.3f}"
         
-        # === PHASE 2: HEDGE - Must have both sides ===
+        # === PHASE 2: HEDGE or IMPROVE - One side only ===
         if my_qty == 0 and other_qty > 0:
             potential_pair = other_avg + price
+            
+            # === NEW: POSITION IMPROVEMENT ===
+            # Before accepting a bad hedge, check if we can IMPROVE the existing position!
+            # If the OTHER side (which we own) has a better price now, buy more to lower avg
+            other_side_local = 'DOWN' if side == 'UP' else 'UP'
+            should_improve, improve_qty, improve_reason = self.should_improve_position(other_side_local, other_price)
+            
+            if should_improve and potential_pair > 0.96:
+                # The hedge would be expensive - try improving instead!
+                return False, 0, f"⏳ Hedge expensive (pair ${potential_pair:.3f}). {improve_reason}"
             
             # After 10 seconds, NEVER accept pair > $1.00!
             market_elapsed = 900.0 - time_to_close if time_to_close is not None else 0.0
@@ -1051,8 +1150,7 @@ class PaperTrader:
     
     def execute_buy(self, side: str, price: float, qty: float, timestamp: str):
         cost = price * qty
-        if cost > self.cash:
-            return False
+        # No cash limit for testing - just track spending
         
         self.cash -= cost
         self.trade_count += 1
@@ -1105,7 +1203,7 @@ class PaperTrader:
             cheaper_price = min(up_price, down_price)
             
             if cheaper_price <= self.cheap_threshold:
-                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.4)
+                max_spend = 500.0  # Fixed amount for entry - unlimited
                 qty = max_spend / cheaper_price
                 
                 if qty >= 1.0:
@@ -1115,7 +1213,7 @@ class PaperTrader:
                         print(f"🎯 [ENTRY] Bought {qty:.1f} {cheaper_side} @ ${cheaper_price:.3f}")
             return trades_made
         
-        # === ONLY ONE SIDE - HEDGE (BUT NEVER AT A LOSS!) ===
+        # === ONLY ONE SIDE - HEDGE OR IMPROVE! ===
         if self.qty_up > 0 and self.qty_down == 0:
             potential_pair = self.avg_up + down_price
             
@@ -1124,12 +1222,31 @@ class PaperTrader:
             # With fees (~1.5%), we need pair_cost < $0.985 to profit
             MAX_ACCEPTABLE_PAIR = 0.99  # Strict limit - must leave room for fees
             
+            # === NEW: POSITION IMPROVEMENT ===
+            # Before refusing hedge, check if we can IMPROVE the UP position!
+            # If UP price dropped since our purchase, buy more to lower avg_UP
+            # This widens the profitable hedge window!
+            should_improve, improve_qty, improve_reason = self.should_improve_position('UP', up_price)
+            
+            # DEBUG
+            print(f"  → should_improve={should_improve}, improve_qty={improve_qty:.1f}, reason={improve_reason}")
+            print(f"  → remaining_budget=${remaining_budget:.2f}, min_trade=${self.min_trade_size}")
+            
             if potential_pair >= MAX_ACCEPTABLE_PAIR:
+                # Hedge would be bad - can we improve instead?
+                if should_improve:
+                    if self.execute_buy('UP', up_price, improve_qty, timestamp):
+                        trades_made.append(('UP', up_price, improve_qty))
+                        new_max_hedge = 1.0 - self.avg_up
+                        print(f"📈 [IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
+                              f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
+                        return trades_made
+                
                 print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR} - waiting for better price")
                 return trades_made
             
             target_qty = self.qty_up
-            max_spend = min(target_qty * down_price, remaining_budget, self.cash * 0.6)
+            max_spend = target_qty * down_price  # Match quantity, unlimited
             qty = max_spend / down_price
             
             if qty >= 0.5:
@@ -1141,21 +1258,52 @@ class PaperTrader:
         if self.qty_down > 0 and self.qty_up == 0:
             potential_pair = up_price + self.avg_down
             
+            # Calculate the max UP price we can afford for profit
+            max_up_for_profit = 0.99 - self.avg_down
+            
+            # DEBUG: Always show state for one-sided positions
+            print(f"🔵 [ONE-SIDED DOWN] qty={self.qty_down:.1f} avg=${self.avg_down:.3f} | "
+                  f"UP=${up_price:.3f} | pair=${potential_pair:.3f} | max_UP=${max_up_for_profit:.3f} | budget=${remaining_budget:.2f}")
+            
             # CRITICAL: NEVER hedge if it guarantees a loss!
             MAX_ACCEPTABLE_PAIR = 0.99
             
+            # === POSITION IMPROVEMENT STRATEGY ===
+            # When hedge is too expensive, we have options:
+            # 1. Buy more DOWN at lower price → reduces avg_down → increases max_up_for_profit
+            # 2. Wait for UP to drop below max_up_for_profit
+            
+            should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price)
+            
             if potential_pair >= MAX_ACCEPTABLE_PAIR:
-                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR} - waiting for better price")
+                # Hedge would be bad - can we improve DOWN position to widen the window?
+                if should_improve:
+                    if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
+                        trades_made.append(('DOWN', down_price, improve_qty))
+                        new_max_up = 0.99 - self.avg_down
+                        print(f"📈 [IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
+                              f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
+                        return trades_made
+                
+                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} | avg_DOWN=${self.avg_down:.3f} | "
+                      f"UP=${up_price:.3f} | need UP <${max_up_for_profit:.3f}")
                 return trades_made
             
+            # === HEDGE IS PROFITABLE! BUY UP! ===
+            print(f"✅ [HEDGE OK] pair ${potential_pair:.3f} < $0.99 - BUYING UP!")
+            
             target_qty = self.qty_down
-            max_spend = min(target_qty * up_price, remaining_budget, self.cash * 0.6)
+            max_spend = target_qty * up_price  # Match quantity, unlimited
             qty = max_spend / up_price
+            
+            print(f"   target_qty={target_qty:.1f} | max_spend=${max_spend:.2f} | qty={qty:.1f}")
             
             if qty >= 0.5:
                 if self.execute_buy('UP', up_price, qty, timestamp):
                     trades_made.append(('UP', up_price, qty))
                     print(f"🔒 [HEDGE] Bought {qty:.1f} UP @ ${up_price:.3f} | pair: ${self.pair_cost:.3f}")
+            else:
+                print(f"⚠️ [SKIP HEDGE] qty {qty:.1f} < 0.5 minimum")
             return trades_made
         
         # === HAVE BOTH SIDES - OPTIMIZE UNTIL PROFIT LOCKED ===
@@ -1169,31 +1317,99 @@ class PaperTrader:
             print(f"✅ [PROFIT LOCKED] locked=${locked:.2f} - stopping")
             return trades_made
         
-        # ⚠️ PROFIT NOT LOCKED (locked={locked:.2f}) - MUST IMPROVE!
-        # Strategy: Try buying each side and pick the one that improves locked profit most
-        
+        # ⚠️ PROFIT NOT LOCKED - MUST IMPROVE!
         if remaining_budget < self.min_trade_size:
             print(f"⚠️ [NO BUDGET] locked=${locked:.2f} but only ${remaining_budget:.2f} budget left!")
-            return trades_made  # No budget left
+            return trades_made
         
-        # DEBUG: Show current state when not profitable
+        # === CRITICAL FIX: Check for "CATCH UP + COST AVERAGE" opportunity ===
+        # When one side is behind AND price is below average, this is a DOUBLE WIN:
+        # 1. Increases min_qty (the smaller side grows)
+        # 2. Lowers pair_cost (buying below average lowers the average)
+        
+        # Find the lagging side
+        if self.qty_up < self.qty_down:
+            lagging_side = 'UP'
+            lagging_qty = self.qty_up
+            lagging_avg = self.avg_up
+            lagging_price = up_price
+            leading_qty = self.qty_down
+        else:
+            lagging_side = 'DOWN'
+            lagging_qty = self.qty_down
+            lagging_avg = self.avg_down
+            lagging_price = down_price
+            leading_qty = self.qty_up
+        
+        imbalance_ratio = leading_qty / lagging_qty if lagging_qty > 0 else 999
+        price_below_avg = lagging_price < lagging_avg
+        price_discount = lagging_avg - lagging_price
+        
+        # DEBUG: Show current state
         if locked < 0:
-            print(f"🔴 [LOSING] pair=${pair_cost:.3f} | min_qty={min_qty:.1f} | spent=${total_spent:.2f} | locked=${locked:.2f} | budget=${remaining_budget:.2f}")
+            print(f"🔴 [LOSING] pair=${pair_cost:.3f} | {lagging_side}: {lagging_qty:.1f} @ ${lagging_avg:.3f} (price ${lagging_price:.3f}) | "
+                  f"imbalance={imbalance_ratio:.1f}x | locked=${locked:.2f} | budget=${remaining_budget:.2f}")
         
+        # === AGGRESSIVE CATCH-UP when lagging side's price is below average ===
+        if price_below_avg and imbalance_ratio > 1.3:
+            # Calculate how much we need to catch up
+            qty_gap = leading_qty - lagging_qty
+            
+            # Calculate optimal buy: enough to significantly improve both metrics
+            # Start with catching up to at least 80% of leading side
+            target_catch_up = leading_qty * 0.8 - lagging_qty
+            if target_catch_up > 0:
+                cost_to_catch_up = target_catch_up * lagging_price
+                
+                # NO BUDGET LIMITS FOR TESTING
+                max_spend = cost_to_catch_up  # Use full amount needed
+                qty_to_buy = max_spend / lagging_price
+                
+                if qty_to_buy >= 1.0:
+                    # Simulate the result
+                    if lagging_side == 'UP':
+                        new_qty_up = self.qty_up + qty_to_buy
+                        new_cost_up = self.cost_up + (qty_to_buy * lagging_price)
+                        new_avg_up = new_cost_up / new_qty_up
+                        new_pair_cost = new_avg_up + self.avg_down
+                        new_min_qty = min(new_qty_up, self.qty_down)
+                        new_total_spent = new_cost_up + self.cost_down
+                    else:
+                        new_qty_down = self.qty_down + qty_to_buy
+                        new_cost_down = self.cost_down + (qty_to_buy * lagging_price)
+                        new_avg_down = new_cost_down / new_qty_down
+                        new_pair_cost = self.avg_up + new_avg_down
+                        new_min_qty = min(self.qty_up, new_qty_down)
+                        new_total_spent = self.cost_up + new_cost_down
+                    
+                    new_locked = new_min_qty - new_total_spent
+                    improvement = new_locked - locked
+                    
+                    # Only execute if it actually improves locked profit
+                    if improvement > 0.5 and new_pair_cost < pair_cost:
+                        if self.execute_buy(lagging_side, lagging_price, qty_to_buy, timestamp):
+                            trades_made.append((lagging_side, lagging_price, qty_to_buy))
+                            print(f"🚀 [CATCH-UP] Bought {qty_to_buy:.1f} {lagging_side} @ ${lagging_price:.3f} (below avg ${lagging_avg:.3f}) | "
+                                  f"pair ${pair_cost:.3f}→${new_pair_cost:.3f} | locked ${locked:.2f}→${new_locked:.2f} (+${improvement:.2f})")
+                            return trades_made
+        
+        # === Standard optimization: try different trade sizes ===
         best_side = None
         best_qty = 0
         best_improvement = 0
         best_new_pair = pair_cost
         best_new_locked = locked
         
-        # Try different trade sizes - from small to large
-        trade_sizes = [0.25, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0]  # USD amounts
+        # Try larger trade sizes - NO LIMITS
+        trade_sizes = [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0]  # USD amounts
         
         for try_side, try_price in [('UP', up_price), ('DOWN', down_price)]:
+            my_qty = self.qty_up if try_side == 'UP' else self.qty_down
+            my_avg = self.avg_up if try_side == 'UP' else self.avg_down
+            other_qty = self.qty_down if try_side == 'UP' else self.qty_up
+            
             for trade_usd in trade_sizes:
-                if trade_usd > remaining_budget or trade_usd > self.cash * 0.5:
-                    continue
-                
+                # No cash limit - test all sizes
                 test_qty = trade_usd / try_price
                 if test_qty < 0.5:
                     continue
@@ -1228,16 +1444,30 @@ class PaperTrader:
                 if improvement > best_improvement:
                     # Extra check: don't make pair_cost worse if it's already bad
                     if pair_cost >= 1.00 and new_pair_cost > pair_cost:
-                        continue  # Don't make pair worse
+                        continue
                     
-                    best_side = try_side
-                    best_qty = test_qty
-                    best_improvement = improvement
-                    best_new_pair = new_pair_cost
-                    best_new_locked = new_locked
+                    # Prefer buying the lagging side
+                    is_lagging_side = (my_qty < other_qty)
+                    
+                    # Bonus for buying below average (cost averaging)
+                    is_below_avg = (try_price < my_avg)
+                    
+                    # Give priority to trades that are both lagging AND below avg
+                    effective_improvement = improvement
+                    if is_lagging_side and is_below_avg:
+                        effective_improvement *= 1.5  # 50% bonus
+                    elif is_lagging_side or is_below_avg:
+                        effective_improvement *= 1.2  # 20% bonus
+                    
+                    if effective_improvement > best_improvement:
+                        best_side = try_side
+                        best_qty = test_qty
+                        best_improvement = improvement  # Store actual improvement
+                        best_new_pair = new_pair_cost
+                        best_new_locked = new_locked
         
         # Execute the best trade if we found one that helps
-        if best_side and best_improvement > 0.01:  # At least 1 cent improvement
+        if best_side and best_improvement > 0.05:  # At least 5 cents improvement
             best_price = up_price if best_side == 'UP' else down_price
             if self.execute_buy(best_side, best_price, best_qty, timestamp):
                 trades_made.append((best_side, best_price, best_qty))
@@ -1269,6 +1499,11 @@ class PaperTrader:
         self.market_status = 'closed'
     
     def get_state(self) -> dict:
+        # Calculate hedge windows - max price we can pay for the other side
+        # Use 0.99 threshold (not 1.0) to account for fees
+        max_hedge_up = 0.99 - self.avg_down if self.avg_down > 0 else 0.99
+        max_hedge_down = 0.99 - self.avg_up if self.avg_up > 0 else 0.99
+        
         return {
             'qty_up': self.qty_up,
             'qty_down': self.qty_down,
@@ -1284,7 +1519,10 @@ class PaperTrader:
             'market_status': self.market_status,
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
-            'payout': self.payout
+            'payout': self.payout,
+            # Hedge window info - max price for profitable hedge (pair < $0.99)
+            'max_hedge_up': max_hedge_up,    # Max UP price for profit if we only have DOWN
+            'max_hedge_down': max_hedge_down  # Max DOWN price for profit if we only have UP
         }
 
 
@@ -1960,7 +2198,7 @@ class MultiMarketBot:
 
 
 if __name__ == '__main__':
-    bot = MultiMarketBot(starting_balance=1000.0)
+    bot = MultiMarketBot(starting_balance=1000000.0)  # Unlimited for testing
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
