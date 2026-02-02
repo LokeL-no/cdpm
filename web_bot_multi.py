@@ -638,21 +638,21 @@ class PaperTrader:
         # Core principle: Get pair_cost < $1.00 by ANY means necessary
         
         # Trading strategy parameters
-        self.cheap_threshold = 0.45      # What we consider "cheap"
-        self.very_cheap_threshold = 0.38 # Very cheap - accumulate
-        self.force_balance_threshold = 0.52  # Max price to pay when balancing
-        self.max_balance_price = 0.60    # Absolute max for emergency balance
+        self.cheap_threshold = 0.48      # What we consider "cheap"
+        self.very_cheap_threshold = 0.40 # Very cheap - accumulate more
+        self.force_balance_threshold = 0.55  # Max price to pay when balancing
+        self.max_balance_price = 0.65    # Absolute max for emergency balance
         self.target_pair_cost = 0.95     # Ideal pair cost target
         self.max_pair_cost = 0.995       # CRITICAL: Never buy if this would push pair over
         
-        # Position sizing (scaled down 10x for $100 bankroll)
-        self.min_trade_size = 0.3
-        self.max_single_trade = 1.5
-        self.cooldown_seconds = 4
+        # Position sizing for $100 bankroll - FREED UP for profit hunting!
+        self.min_trade_size = 0.10       # Polymarket minimum (~$0.10)
+        self.max_single_trade = 25.0     # Can go BIG when opportunity is good (up to 25% of bankroll)
+        self.cooldown_seconds = 2        # FASTER - only 2 second cooldown!
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 3.5
-        self.max_position_pct = 0.50     # Max 50% of balance per market
+        self.initial_trade_usd = 5.0     # Bigger initial trade to lock profit faster
+        self.max_position_pct = 0.50     # Max 50% of balance per market ($50 with $100 bankroll)
         self.force_balance_after_seconds = 120
         
         # === GUARANTEED PROFIT PARAMETERS ===
@@ -1081,185 +1081,170 @@ class PaperTrader:
     
     def check_and_trade(self, up_price: float, down_price: float, timestamp: str, time_to_close: float = None, up_bid: Optional[float] = None, down_bid: Optional[float] = None):
         """
-        GABAGOOL v8 - GUARANTEED PROFIT LOGIC
+        GABAGOOL v9 - ULTRA AGGRESSIVE PROFIT HUNTER
         
-        GOAL: Ensure min(qty_up, qty_down) > total_spent + fees
-        This means we profit regardless of outcome!
+        RULE: If locked profit < 0, ALWAYS try to buy something to improve it!
+        Buy small amounts constantly until profit is locked.
         
-        CONSTRAINTS:
-        1. pair_cost MUST be < $1.00 (otherwise impossible to profit)
-        2. Budget limit: max 50% of starting balance per market
-        3. Stop trading once profit is secured
+        GOAL: min(qty_up, qty_down) > total_spent + fees
         """
         trades_made = []
+        
+        # Cooldown check
+        now = time.time()
+        if now - self.last_trade_time < self.cooldown_seconds:
+            return trades_made
         
         total_spent = self.cost_up + self.cost_down
         budget_limit = self.starting_balance * self.max_position_pct
         remaining_budget = max(0, budget_limit - total_spent)
         
-        # === HAVE BOTH SIDES - CHECK PROFIT STATUS ===
-        if self.qty_up > 0 and self.qty_down > 0:
-            min_qty = min(self.qty_up, self.qty_down)
-            fees = self.calculate_total_fees()
-            locked = min_qty - total_spent - fees
+        # === NO POSITION - ENTRY ===
+        if self.qty_up == 0 and self.qty_down == 0:
+            cheaper_side = 'UP' if up_price <= down_price else 'DOWN'
+            cheaper_price = min(up_price, down_price)
             
-            # ✅ PROFIT SECURED - STOP ALL TRADING!
-            if locked > 0:
-                return trades_made
-            
-            # ⚠️ PROFIT NOT SECURED - ANALYZE AND FIX
-            ratio = max(self.qty_up, self.qty_down) / min(self.qty_up, self.qty_down)
-            pair_cost = self.pair_cost
-            
-            # CASE 1: Position is unbalanced - need to buy the lagging side
-            if ratio > 1.10:
-                if self.qty_up < self.qty_down:
-                    # Need more UP
-                    lagging_side = 'UP'
-                    lagging_price = up_price
-                    needed_qty = self.qty_down - self.qty_up
-                else:
-                    # Need more DOWN
-                    lagging_side = 'DOWN'
-                    lagging_price = down_price
-                    needed_qty = self.qty_up - self.qty_down
+            if cheaper_price <= self.cheap_threshold:
+                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.4)
+                qty = max_spend / cheaper_price
                 
-                # Calculate max price we can pay while keeping pair_cost < $1.00
-                # New pair_cost ≈ (cost_up + cost_down + new_cost) / min(new_qty_up, new_qty_down)
-                # We want this < $1.00
-                
-                # Simpler: just ensure the new buy improves locked profit
-                if remaining_budget > 3.0:  # Have budget
-                    # Try buying to improve locked profit
-                    test_qty = min(needed_qty, remaining_budget / lagging_price, self.cash * 0.4 / lagging_price)
-                    
-                    if test_qty >= 3.0:
-                        new_locked = self.locked_profit_after_buy(lagging_side, lagging_price, test_qty)
-                        
-                        # Only buy if it IMPROVES locked profit
-                        if new_locked > locked:
-                            if self.execute_buy(lagging_side, lagging_price, test_qty, timestamp):
-                                trades_made.append((lagging_side, lagging_price, test_qty))
-                                print(f"🔧 [REBALANCE] Bought {test_qty:.1f} {lagging_side} @ ${lagging_price:.3f} | locked ${locked:.2f}→${new_locked:.2f}")
-                            return trades_made
-            
-            # CASE 2: pair_cost >= $1.00 - aggressively buy cheaper side to push below $1.00
-            if pair_cost >= 1.00:
-                cheaper_side = 'UP' if up_price < down_price else 'DOWN'
-                cheaper_price = min(up_price, down_price)
-
-                if remaining_budget > 3.0:
-                    max_spend = min(remaining_budget, self.cash * 0.6, self.max_single_trade * 2)
-                    max_qty = max_spend / cheaper_price
-
-                    # Try larger sizes first to aggressively reduce pair_cost
-                    for factor in [1.0, 0.75, 0.5, 0.25]:
-                        test_qty = max_qty * factor
-                        if test_qty * cheaper_price < self.min_trade_size:
-                            continue
-
-                        # Simulate new position
-                        if cheaper_side == 'UP':
-                            new_qty_up = self.qty_up + test_qty
-                            new_qty_down = self.qty_down
-                            new_cost_up = self.cost_up + (test_qty * cheaper_price)
-                            new_cost_down = self.cost_down
-                        else:
-                            new_qty_down = self.qty_down + test_qty
-                            new_qty_up = self.qty_up
-                            new_cost_down = self.cost_down + (test_qty * cheaper_price)
-                            new_cost_up = self.cost_up
-
-                        if new_qty_up == 0 or new_qty_down == 0:
-                            continue
-
-                        new_avg_up = new_cost_up / new_qty_up
-                        new_avg_down = new_cost_down / new_qty_down
-                        new_pair_cost = new_avg_up + new_avg_down
-
-                        fee_up = self.calculate_fee(new_avg_up, new_qty_up)
-                        fee_down = self.calculate_fee(new_avg_down, new_qty_down)
-                        new_fees = fee_up + fee_down
-
-                        new_total_spent = new_cost_up + new_cost_down
-                        new_min_qty = min(new_qty_up, new_qty_down)
-
-                        # STRICT: each side qty must exceed total_spent + fees AND pair_cost < $1.00
-                        if new_pair_cost < pair_cost and new_pair_cost < 1.00 and new_min_qty > (new_total_spent + new_fees):
-                            if self.execute_buy(cheaper_side, cheaper_price, test_qty, timestamp):
-                                trades_made.append((cheaper_side, cheaper_price, test_qty))
-                                print(
-                                    f"📉 [AGGRESSIVE REDUCE] Bought {test_qty:.1f} {cheaper_side} @ ${cheaper_price:.3f} | "
-                                    f"pair ${pair_cost:.3f}→${new_pair_cost:.3f} | min_qty ${new_min_qty:.1f} > spent ${new_total_spent + new_fees:.2f}"
-                                )
-                            return trades_made
-            
-            # CASE 3: Already good ratio, pair_cost OK - just wait
+                if qty >= 1.0:
+                    self.first_trade_time = now
+                    if self.execute_buy(cheaper_side, cheaper_price, qty, timestamp):
+                        trades_made.append((cheaper_side, cheaper_price, qty))
+                        print(f"🎯 [ENTRY] Bought {qty:.1f} {cheaper_side} @ ${cheaper_price:.3f}")
             return trades_made
         
-        # === ONLY HAVE ONE SIDE - NEED TO HEDGE ===
+        # === ONLY ONE SIDE - HEDGE (BUT NEVER AT A LOSS!) ===
         if self.qty_up > 0 and self.qty_down == 0:
-            # Have UP, need DOWN to complete pair
             potential_pair = self.avg_up + down_price
             
-            # 10-second rule: after 10s, REFUSE if pair > $1.00
-            time_since_first = time.time() - self.first_trade_time if self.first_trade_time else 0
-            if time_since_first > 10 and potential_pair > 1.00:
-                return trades_made  # Refuse bad hedge
+            # CRITICAL: NEVER hedge if it guarantees a loss!
+            # pair_cost >= $1.00 means we LOSE money no matter what!
+            # With fees (~1.5%), we need pair_cost < $0.985 to profit
+            MAX_ACCEPTABLE_PAIR = 0.99  # Strict limit - must leave room for fees
             
-            # Match qty for balance
+            if potential_pair >= MAX_ACCEPTABLE_PAIR:
+                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR} - waiting for better price")
+                return trades_made
+            
             target_qty = self.qty_up
-            max_spend = min(target_qty * down_price, remaining_budget, self.cash * 0.8)
+            max_spend = min(target_qty * down_price, remaining_budget, self.cash * 0.6)
             qty = max_spend / down_price
             
-            if qty >= 1.0:
+            if qty >= 0.5:
                 if self.execute_buy('DOWN', down_price, qty, timestamp):
                     trades_made.append(('DOWN', down_price, qty))
                     print(f"🔒 [HEDGE] Bought {qty:.1f} DOWN @ ${down_price:.3f} | pair: ${self.pair_cost:.3f}")
             return trades_made
         
         if self.qty_down > 0 and self.qty_up == 0:
-            # Have DOWN, need UP
             potential_pair = up_price + self.avg_down
             
-            time_since_first = time.time() - self.first_trade_time if self.first_trade_time else 0
-            if time_since_first > 10 and potential_pair > 1.00:
+            # CRITICAL: NEVER hedge if it guarantees a loss!
+            MAX_ACCEPTABLE_PAIR = 0.99
+            
+            if potential_pair >= MAX_ACCEPTABLE_PAIR:
+                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR} - waiting for better price")
                 return trades_made
             
             target_qty = self.qty_down
-            max_spend = min(target_qty * up_price, remaining_budget, self.cash * 0.8)
+            max_spend = min(target_qty * up_price, remaining_budget, self.cash * 0.6)
             qty = max_spend / up_price
             
-            if qty >= 1.0:
+            if qty >= 0.5:
                 if self.execute_buy('UP', up_price, qty, timestamp):
                     trades_made.append(('UP', up_price, qty))
                     print(f"🔒 [HEDGE] Bought {qty:.1f} UP @ ${up_price:.3f} | pair: ${self.pair_cost:.3f}")
             return trades_made
         
-        # === NO POSITION - LOOK FOR ENTRY ===
-        if self.qty_up == 0 and self.qty_down == 0:
-            # Only enter if price is cheap
-            if up_price <= self.cheap_threshold and up_price < down_price:
-                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.5)
-                qty = max_spend / up_price
+        # === HAVE BOTH SIDES - OPTIMIZE UNTIL PROFIT LOCKED ===
+        min_qty = min(self.qty_up, self.qty_down)
+        fees = self.calculate_total_fees()
+        locked = min_qty - total_spent - fees
+        pair_cost = self.pair_cost
+        
+        # ✅ PROFIT SECURED - STOP!
+        if locked > 0.02:  # Small positive buffer
+            print(f"✅ [PROFIT LOCKED] locked=${locked:.2f} - stopping")
+            return trades_made
+        
+        # ⚠️ PROFIT NOT LOCKED (locked={locked:.2f}) - MUST IMPROVE!
+        # Strategy: Try buying each side and pick the one that improves locked profit most
+        
+        if remaining_budget < self.min_trade_size:
+            print(f"⚠️ [NO BUDGET] locked=${locked:.2f} but only ${remaining_budget:.2f} budget left!")
+            return trades_made  # No budget left
+        
+        # DEBUG: Show current state when not profitable
+        if locked < 0:
+            print(f"🔴 [LOSING] pair=${pair_cost:.3f} | min_qty={min_qty:.1f} | spent=${total_spent:.2f} | locked=${locked:.2f} | budget=${remaining_budget:.2f}")
+        
+        best_side = None
+        best_qty = 0
+        best_improvement = 0
+        best_new_pair = pair_cost
+        best_new_locked = locked
+        
+        # Try different trade sizes - from small to large
+        trade_sizes = [0.25, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0]  # USD amounts
+        
+        for try_side, try_price in [('UP', up_price), ('DOWN', down_price)]:
+            for trade_usd in trade_sizes:
+                if trade_usd > remaining_budget or trade_usd > self.cash * 0.5:
+                    continue
                 
-                if qty >= 1.0:
-                    self.first_trade_time = time.time()
-                    if self.execute_buy('UP', up_price, qty, timestamp):
-                        trades_made.append(('UP', up_price, qty))
-                        print(f"🎯 [ENTRY] Bought {qty:.1f} UP @ ${up_price:.3f}")
-                return trades_made
-            
-            if down_price <= self.cheap_threshold and down_price < up_price:
-                max_spend = min(self.initial_trade_usd, remaining_budget, self.cash * 0.5)
-                qty = max_spend / down_price
+                test_qty = trade_usd / try_price
+                if test_qty < 0.5:
+                    continue
                 
-                if qty >= 1.0:
-                    self.first_trade_time = time.time()
-                    if self.execute_buy('DOWN', down_price, qty, timestamp):
-                        trades_made.append(('DOWN', down_price, qty))
-                        print(f"🎯 [ENTRY] Bought {qty:.1f} DOWN @ ${down_price:.3f}")
-                return trades_made
+                # Simulate the trade
+                if try_side == 'UP':
+                    new_qty_up = self.qty_up + test_qty
+                    new_qty_down = self.qty_down
+                    new_cost_up = self.cost_up + trade_usd
+                    new_cost_down = self.cost_down
+                else:
+                    new_qty_down = self.qty_down + test_qty
+                    new_qty_up = self.qty_up
+                    new_cost_down = self.cost_down + trade_usd
+                    new_cost_up = self.cost_up
+                
+                new_avg_up = new_cost_up / new_qty_up
+                new_avg_down = new_cost_down / new_qty_down
+                new_pair_cost = new_avg_up + new_avg_down
+                
+                fee_up = self.calculate_fee(new_avg_up, new_qty_up)
+                fee_down = self.calculate_fee(new_avg_down, new_qty_down)
+                new_fees = fee_up + fee_down
+                
+                new_total_spent = new_cost_up + new_cost_down
+                new_min_qty = min(new_qty_up, new_qty_down)
+                new_locked = new_min_qty - new_total_spent - new_fees
+                
+                improvement = new_locked - locked
+                
+                # Accept if it improves locked profit
+                if improvement > best_improvement:
+                    # Extra check: don't make pair_cost worse if it's already bad
+                    if pair_cost >= 1.00 and new_pair_cost > pair_cost:
+                        continue  # Don't make pair worse
+                    
+                    best_side = try_side
+                    best_qty = test_qty
+                    best_improvement = improvement
+                    best_new_pair = new_pair_cost
+                    best_new_locked = new_locked
+        
+        # Execute the best trade if we found one that helps
+        if best_side and best_improvement > 0.01:  # At least 1 cent improvement
+            best_price = up_price if best_side == 'UP' else down_price
+            if self.execute_buy(best_side, best_price, best_qty, timestamp):
+                trades_made.append((best_side, best_price, best_qty))
+                print(
+                    f"💰 [OPTIMIZE] Bought {best_qty:.1f} {best_side} @ ${best_price:.3f} | "
+                    f"pair ${pair_cost:.3f}→${best_new_pair:.3f} | locked ${locked:.2f}→${best_new_locked:.2f} (+${best_improvement:.2f})"
+                )
         
         return trades_made
     
