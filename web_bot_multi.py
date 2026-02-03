@@ -751,6 +751,11 @@ class PaperTrader:
         self.max_acceptable_pair_profit = 0.99  # Normal: require profit (pair < 0.99)
         self.max_acceptable_pair_breakeven = 1.00  # Fallback: accept break-even (pair <= 1.00)
         
+        # === STOP BUYING GUARD ===
+        # CRITICAL: Stop buying when opposite side is too expensive for ANY hedge
+        # If opposite > this, even break-even is impossible with reasonable avg
+        self.stop_buying_opposite_price = 0.85  # Stop if opposite > $0.85
+        
         # === ACCELERATED LADDER ===
         # Buy more when price is low to drag down average faster
         # But with lower amounts to stay within break-even limits
@@ -1145,7 +1150,7 @@ class PaperTrader:
         total_cost = new_cost_up + new_cost_down
         return min(new_qty_up, new_qty_down) - total_cost - total_fees
     
-    def should_improve_position(self, side: str, price: float) -> tuple:
+    def should_improve_position(self, side: str, price: float, opposing_price: float = None) -> tuple:
         """
         POSITION IMPROVEMENT STRATEGY
         
@@ -1170,6 +1175,14 @@ class PaperTrader:
         # Only improve if we have a position on this side
         if my_qty == 0:
             return False, 0, "No position to improve"
+        
+        # CRITICAL: Stop buying if opposite side is too expensive for ANY hedge
+        # Even break-even requires pair <= 1.00, so if opposite > stop_threshold,
+        # we'd need avg < (1.00 - opposite) which may be impossible
+        if opposing_price is not None and opposing_price > self.stop_buying_opposite_price:
+            max_avg_for_breakeven = 1.00 - opposing_price
+            if my_avg > max_avg_for_breakeven:
+                return False, 0, f"🛑 STOP: opposite ${opposing_price:.2f} too expensive, need avg <${max_avg_for_breakeven:.2f}"
         
         # Check if current price is below our average (ANY amount!)
         price_improvement = my_avg - price
@@ -1442,7 +1455,7 @@ class PaperTrader:
             # Before accepting a bad hedge, check if we can IMPROVE the existing position!
             # If the OTHER side (which we own) has a better price now, buy more to lower avg
             other_side_local = 'DOWN' if side == 'UP' else 'UP'
-            should_improve, improve_qty, improve_reason = self.should_improve_position(other_side_local, other_price)
+            should_improve, improve_qty, improve_reason = self.should_improve_position(other_side_local, other_price, opposing_price=price)
             
             if should_improve and potential_pair > 0.96:
                 # The hedge would be expensive - try improving instead!
@@ -1621,7 +1634,7 @@ class PaperTrader:
             
             # === CONTINUOUS POSITION IMPROVEMENT CHECK ===
             # Always check if we can lower avg_UP - this widens the hedge window
-            should_improve, improve_qty, improve_reason = self.should_improve_position('UP', up_price)
+            should_improve, improve_qty, improve_reason = self.should_improve_position('UP', up_price, opposing_price=down_price)
             
             # DEBUG
             print(f"  → should_improve={should_improve}, improve_qty={improve_qty:.1f}, reason={improve_reason}")
@@ -1705,7 +1718,7 @@ class PaperTrader:
                   f"UP=${up_price:.3f} | pair=${potential_pair:.3f} | max_UP=${max_up_for_profit:.3f} | budget=${remaining_budget:.2f}")
             
             # === POSITION IMPROVEMENT - CHECK FIRST! ===
-            should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price)
+            should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price, opposing_price=up_price)
             
             force_improve = should_improve and self.avg_down > 0 and down_price <= self.avg_down * (1 - self.force_improve_pct)
 
