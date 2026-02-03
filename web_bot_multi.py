@@ -662,6 +662,7 @@ class PaperTrader:
         # Now DOWN only needs to be <$0.58 instead of <$0.54!
         self.improvement_threshold = 0.005   # Buy more if price is 0.5 cents below average (LOWERED!)
         self.min_improvement_pct = 0.01      # Or 1% below average (LOWERED!)
+        self.force_improve_pct = 0.25        # Force average-down if price drops 25%+ vs avg
         self.max_imbalance_for_improvement = 2.0  # Max qty ratio during improvement phase
         self.improvement_trade_pct = 0.25    # Use 25% of budget per improvement trade (INCREASED!)
         
@@ -1325,8 +1326,10 @@ class PaperTrader:
             print(f"  → should_improve={should_improve}, improve_qty={improve_qty:.1f}, reason={improve_reason}")
             print(f"  → remaining_budget=${remaining_budget:.2f}, min_trade=${self.min_trade_size}")
             
-            if potential_pair >= MAX_ACCEPTABLE_PAIR:
-                # Hedge would be bad - can we improve instead?
+            force_improve = should_improve and self.avg_up > 0 and up_price <= self.avg_up * (1 - self.force_improve_pct)
+
+            if potential_pair >= MAX_ACCEPTABLE_PAIR or force_improve:
+                # Hedge would be bad OR price dropped hard - improve instead
                 if should_improve:
                     ok, reason = self.reserve_ok('UP', up_price, improve_qty, down_price)
                     if not ok:
@@ -1377,8 +1380,10 @@ class PaperTrader:
             
             should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price)
             
-            if potential_pair >= MAX_ACCEPTABLE_PAIR:
-                # Hedge would be bad - can we improve DOWN position to widen the window?
+            force_improve = should_improve and self.avg_down > 0 and down_price <= self.avg_down * (1 - self.force_improve_pct)
+
+            if potential_pair >= MAX_ACCEPTABLE_PAIR or force_improve:
+                # Hedge would be bad OR price dropped hard - improve instead
                 if should_improve:
                     ok, reason = self.reserve_ok('DOWN', down_price, improve_qty, up_price)
                     if not ok:
