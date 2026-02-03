@@ -744,6 +744,13 @@ class PaperTrader:
         self.breakeven_hedge_price = 0.90     # Worst case hedge price assumption
         self.enable_breakeven_check = True    # Enable break-even reserve check
         
+        # === BREAK-EVEN HEDGE TRIGGERS ===
+        # When to accept pair <= 1.00 instead of waiting for pair < 0.99
+        self.breakeven_time_threshold = 180   # Accept break-even when < 3 min to close
+        self.breakeven_price_threshold = 0.92 # Accept break-even when opposite side > $0.92
+        self.max_acceptable_pair_profit = 0.99  # Normal: require profit (pair < 0.99)
+        self.max_acceptable_pair_breakeven = 1.00  # Fallback: accept break-even (pair <= 1.00)
+        
         # === ACCELERATED LADDER ===
         # Buy more when price is low to drag down average faster
         # But with lower amounts to stay within break-even limits
@@ -1599,10 +1606,18 @@ class PaperTrader:
         if self.qty_up > 0 and self.qty_down == 0:
             potential_pair = self.avg_up + down_price
             
-            # CRITICAL: NEVER hedge if it guarantees a loss!
-            # pair_cost >= $1.00 means we LOSE money no matter what!
-            # With fees (~1.5%), we need pair_cost < $0.985 to profit
-            MAX_ACCEPTABLE_PAIR = 0.99  # Strict limit - must leave room for fees
+            # CRITICAL: Dynamic pair threshold based on urgency
+            # Normal: require profit (pair < 0.99)
+            # Fallback: accept break-even (pair <= 1.00) when time is short or price is extreme
+            urgent_time = time_to_close is not None and time_to_close < self.breakeven_time_threshold
+            urgent_price = down_price > self.breakeven_price_threshold
+            
+            if urgent_time or urgent_price:
+                MAX_ACCEPTABLE_PAIR = self.max_acceptable_pair_breakeven
+                urgency_reason = f"time={time_to_close:.0f}s" if urgent_time else f"price=${down_price:.2f}"
+                print(f"⏰ [URGENT MODE] Accepting break-even hedge ({urgency_reason})")
+            else:
+                MAX_ACCEPTABLE_PAIR = self.max_acceptable_pair_profit
             
             # === CONTINUOUS POSITION IMPROVEMENT CHECK ===
             # Always check if we can lower avg_UP - this widens the hedge window
@@ -1639,13 +1654,17 @@ class PaperTrader:
                     if self.execute_buy('UP', up_price, improve_qty, timestamp):
                         trades_made.append(('UP', up_price, improve_qty))
                         self.record_improvement_spend('UP', up_price * improve_qty)
-                        new_max_hedge = 1.0 - self.avg_up
+                        new_max_hedge = MAX_ACCEPTABLE_PAIR - self.avg_up
                         print(f"📈 [IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
                               f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
                         return trades_made
                 
-                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR} - waiting for better price")
+                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR:.2f} - waiting for better price")
                 return trades_made
+            
+            # === HEDGE IS ACCEPTABLE! BUY DOWN! ===
+            hedge_type = "PROFIT" if potential_pair < 0.99 else "BREAK-EVEN"
+            print(f"✅ [HEDGE OK - {hedge_type}] pair ${potential_pair:.3f} < ${MAX_ACCEPTABLE_PAIR:.2f} - BUYING DOWN!")
             
             target_qty = self.qty_up
             desired_spend = target_qty * down_price
@@ -1665,15 +1684,25 @@ class PaperTrader:
         if self.qty_down > 0 and self.qty_up == 0:
             potential_pair = up_price + self.avg_down
             
+            # CRITICAL: Dynamic pair threshold based on urgency
+            # Normal: require profit (pair < 0.99)
+            # Fallback: accept break-even (pair <= 1.00) when time is short or price is extreme
+            urgent_time = time_to_close is not None and time_to_close < self.breakeven_time_threshold
+            urgent_price = up_price > self.breakeven_price_threshold
+            
+            if urgent_time or urgent_price:
+                MAX_ACCEPTABLE_PAIR = self.max_acceptable_pair_breakeven
+                urgency_reason = f"time={time_to_close:.0f}s" if urgent_time else f"price=${up_price:.2f}"
+                print(f"⏰ [URGENT MODE] Accepting break-even hedge ({urgency_reason})")
+            else:
+                MAX_ACCEPTABLE_PAIR = self.max_acceptable_pair_profit
+            
             # Calculate the max UP price we can afford for profit
-            max_up_for_profit = 0.99 - self.avg_down
+            max_up_for_profit = MAX_ACCEPTABLE_PAIR - self.avg_down
             
             # DEBUG: Always show state for one-sided positions
             print(f"🔵 [ONE-SIDED DOWN] qty={self.qty_down:.1f} avg=${self.avg_down:.3f} | "
                   f"UP=${up_price:.3f} | pair=${potential_pair:.3f} | max_UP=${max_up_for_profit:.3f} | budget=${remaining_budget:.2f}")
-            
-            # CRITICAL: NEVER hedge if it guarantees a loss!
-            MAX_ACCEPTABLE_PAIR = 0.99
             
             # === POSITION IMPROVEMENT - CHECK FIRST! ===
             should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price)
@@ -1689,7 +1718,7 @@ class PaperTrader:
                     if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
                         trades_made.append(('DOWN', down_price, improve_qty))
                         self.record_improvement_spend('DOWN', down_price * improve_qty)
-                        new_max_up = 0.99 - self.avg_down
+                        new_max_up = MAX_ACCEPTABLE_PAIR - self.avg_down
                         print(f"🔥 [FORCE IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
                               f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
                         return trades_made
@@ -1704,7 +1733,7 @@ class PaperTrader:
                     if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
                         trades_made.append(('DOWN', down_price, improve_qty))
                         self.record_improvement_spend('DOWN', down_price * improve_qty)
-                        new_max_up = 0.99 - self.avg_down
+                        new_max_up = MAX_ACCEPTABLE_PAIR - self.avg_down
                         print(f"📈 [IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
                               f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
                         return trades_made
@@ -1713,8 +1742,9 @@ class PaperTrader:
                       f"UP=${up_price:.3f} | need UP <${max_up_for_profit:.3f}")
                 return trades_made
             
-            # === HEDGE IS PROFITABLE! BUY UP! ===
-            print(f"✅ [HEDGE OK] pair ${potential_pair:.3f} < $0.99 - BUYING UP!")
+            # === HEDGE IS ACCEPTABLE! BUY UP! ===
+            hedge_type = "PROFIT" if potential_pair < 0.99 else "BREAK-EVEN"
+            print(f"✅ [HEDGE OK - {hedge_type}] pair ${potential_pair:.3f} < ${MAX_ACCEPTABLE_PAIR:.2f} - BUYING UP!")
             
             target_qty = self.qty_down
             desired_spend = target_qty * up_price
