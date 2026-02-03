@@ -662,7 +662,7 @@ class PaperTrader:
         # Now DOWN only needs to be <$0.58 instead of <$0.54!
         self.improvement_threshold = 0.005   # Buy more if price is 0.5 cents below average (LOWERED!)
         self.min_improvement_pct = 0.01      # Or 1% below average (LOWERED!)
-        self.force_improve_pct = 0.25        # Force average-down if price drops 25%+ vs avg
+        self.force_improve_pct = 0.10        # Force average-down if price drops 10%+ vs avg (was 25%)
         self.max_imbalance_for_improvement = 2.0  # Max qty ratio during improvement phase
         self.improvement_trade_pct = 0.25    # Use 25% of budget per improvement trade (INCREASED!)
         
@@ -1316,19 +1316,31 @@ class PaperTrader:
             # With fees (~1.5%), we need pair_cost < $0.985 to profit
             MAX_ACCEPTABLE_PAIR = 0.99  # Strict limit - must leave room for fees
             
-            # === NEW: POSITION IMPROVEMENT ===
-            # Before refusing hedge, check if we can IMPROVE the UP position!
-            # If UP price dropped since our purchase, buy more to lower avg_UP
-            # This widens the profitable hedge window!
+            # === CONTINUOUS POSITION IMPROVEMENT CHECK ===
+            # Always check if we can lower avg_UP - this widens the hedge window
             should_improve, improve_qty, improve_reason = self.should_improve_position('UP', up_price)
             
             # DEBUG
             print(f"  → should_improve={should_improve}, improve_qty={improve_qty:.1f}, reason={improve_reason}")
             print(f"  → remaining_budget=${remaining_budget:.2f}, min_trade=${self.min_trade_size}")
             
+            # If price dropped enough below avg, ALWAYS buy to lower avg (even if hedge is possible)
             force_improve = should_improve and self.avg_up > 0 and up_price <= self.avg_up * (1 - self.force_improve_pct)
 
-            if potential_pair >= MAX_ACCEPTABLE_PAIR or force_improve:
+            # === CONTINUOUS IMPROVEMENT - CHECK EVERY TICK ===
+            if force_improve:
+                ok, reason = self.reserve_ok('UP', up_price, improve_qty, down_price)
+                if not ok:
+                    print(f"⚠️ [FORCE IMPROVE UP BLOCKED] {reason}")
+                else:
+                    if self.execute_buy('UP', up_price, improve_qty, timestamp):
+                        trades_made.append(('UP', up_price, improve_qty))
+                        new_max_hedge = 1.0 - self.avg_up
+                        print(f"🔥 [FORCE IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
+                              f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
+                        return trades_made
+
+            if potential_pair >= MAX_ACCEPTABLE_PAIR:
                 # Hedge would be bad OR price dropped hard - improve instead
                 if should_improve:
                     ok, reason = self.reserve_ok('UP', up_price, improve_qty, down_price)
@@ -1373,16 +1385,25 @@ class PaperTrader:
             # CRITICAL: NEVER hedge if it guarantees a loss!
             MAX_ACCEPTABLE_PAIR = 0.99
             
-            # === POSITION IMPROVEMENT STRATEGY ===
-            # When hedge is too expensive, we have options:
-            # 1. Buy more DOWN at lower price → reduces avg_down → increases max_up_for_profit
-            # 2. Wait for UP to drop below max_up_for_profit
-            
+            # === POSITION IMPROVEMENT - CHECK FIRST! ===
             should_improve, improve_qty, improve_reason = self.should_improve_position('DOWN', down_price)
             
             force_improve = should_improve and self.avg_down > 0 and down_price <= self.avg_down * (1 - self.force_improve_pct)
 
-            if potential_pair >= MAX_ACCEPTABLE_PAIR or force_improve:
+            # === ALWAYS IMPROVE ON DEEP DISCOUNT - BEFORE CHECKING HEDGE ===
+            if force_improve:
+                ok, reason = self.reserve_ok('DOWN', down_price, improve_qty, up_price)
+                if not ok:
+                    print(f"⚠️ [FORCE IMPROVE DOWN BLOCKED] {reason}")
+                else:
+                    if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
+                        trades_made.append(('DOWN', down_price, improve_qty))
+                        new_max_up = 0.99 - self.avg_down
+                        print(f"🔥 [FORCE IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
+                              f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
+                        return trades_made
+
+            if potential_pair >= MAX_ACCEPTABLE_PAIR:
                 # Hedge would be bad OR price dropped hard - improve instead
                 if should_improve:
                     ok, reason = self.reserve_ok('DOWN', down_price, improve_qty, up_price)
