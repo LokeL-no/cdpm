@@ -283,11 +283,11 @@ HTML_TEMPLATE = """
         <div class="global-stats">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
-                <div class="value neutral">$<span id="starting-balance">400.00</span></div>
+                <div class="value neutral">$<span id="starting-balance">800.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">True Balance</div>
-                <div class="value neutral">$<span id="current-balance">400.00</span></div>
+                <div class="value neutral">$<span id="current-balance">800.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">Total PnL</div>
@@ -402,7 +402,7 @@ HTML_TEMPLATE = """
         }
         
         function resetBot() {
-            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $400.')) {
+            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $800.')) {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
@@ -710,7 +710,7 @@ class PaperTrader:
         self.cooldown_seconds = 1        # Fast cooldown
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = min(5.0, market_budget)
+        self.initial_trade_usd = min(1.0, market_budget)
         self.max_position_pct = 1.0      # No position limit (100%)
         self.force_balance_after_seconds = 120
         
@@ -742,6 +742,12 @@ class PaperTrader:
         self.improvement_spend_log = {
             'UP': deque(),
             'DOWN': deque()
+        }
+        self.improvement_step_price = 0.02   # Require $0.02 drop before next ladder fill
+        self.improvement_step_spend = 2.0    # Spend $2 per improvement rung
+        self.last_improvement_price = {
+            'UP': None,
+            'DOWN': None
         }
     
     @staticmethod
@@ -1125,11 +1131,19 @@ class PaperTrader:
         
         if available < self.min_trade_size:
             return False, 0, f"Insufficient budget ${available:.2f}"
+
+        desired_spend = available
+        if other_qty == 0:
+            last_price = self.last_improvement_price.get(side)
+            if last_price is not None and price > last_price - self.improvement_step_price + 1e-6:
+                required = max(0.0, last_price - self.improvement_step_price)
+                return False, 0, f"Need price <= ${required:.3f} for next ladder"
+            desired_spend = min(self.improvement_step_spend, available)
         
         spend = self.capped_spend_until_ok(
             side,
             price,
-            desired_spend=available,
+            desired_spend=desired_spend,
             opposing_price=other_avg if other_qty > 0 else None,
             fraction=1.0,
             min_spend=self.min_trade_size
@@ -1443,6 +1457,9 @@ class PaperTrader:
         else:
             self.qty_down += qty
             self.cost_down += cost
+
+        # Update ladder anchor for this side
+        self.last_improvement_price[side] = price
         
         self.trade_log.append({
             'time': timestamp,
@@ -1905,7 +1922,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 100.0):
+    def __init__(self, starting_balance: float = 800.0, per_market_budget: float = 200.0):
         self.initial_starting_balance = starting_balance
         self.initial_per_market_budget = per_market_budget
         self.starting_balance = starting_balance
