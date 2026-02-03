@@ -282,11 +282,11 @@ HTML_TEMPLATE = """
         <div class="global-stats">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
-                <div class="value neutral">$<span id="starting-balance">1000.00</span></div>
+                <div class="value neutral">$<span id="starting-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">True Balance</div>
-                <div class="value neutral">$<span id="current-balance">1000.00</span></div>
+                <div class="value neutral">$<span id="current-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">Total PnL</div>
@@ -385,7 +385,7 @@ HTML_TEMPLATE = """
         }
         
         function resetBot() {
-            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $1000.')) {
+            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $400.')) {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
@@ -474,7 +474,9 @@ HTML_TEMPLATE = """
                     const statusClass = pt.market_status === 'open' ? 'status-open' : 
                                        pt.market_status === 'resolved' ? 'status-resolved' : 'status-closed';
                     
-                    const lockedPnl = Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
+                    const lockedPnl = typeof pt.locked_profit === 'number'
+                        ? pt.locked_profit
+                        : Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
                     
                     html += `
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
@@ -621,7 +623,7 @@ HTML_TEMPLATE = """
 class PaperTrader:
     """Gabagool v7 paper trading bot - RECOVERY MODE ENABLED"""
     
-    def __init__(self, cash_ref: dict, market_slug: str):
+    def __init__(self, cash_ref: dict, market_slug: str, market_budget: float):
         """
         cash_ref: A dict with 'balance' key that's shared across all traders
         market_slug: The market this trader is for
@@ -638,7 +640,8 @@ class PaperTrader:
         self.resolution_outcome = None
         self.final_pnl = None
         self.payout = 0.0
-        self.starting_balance = 100.0
+        self.market_budget = market_budget
+        self.starting_balance = market_budget
         
         # === GABAGOOL v10 - POSITION IMPROVEMENT STRATEGY ===
         # Core principle: Continuously improve position to make hedging easier
@@ -662,13 +665,13 @@ class PaperTrader:
         self.max_imbalance_for_improvement = 2.0  # Max qty ratio during improvement phase
         self.improvement_trade_pct = 0.25    # Use 25% of budget per improvement trade (INCREASED!)
         
-        # Position sizing - NO RESTRICTIONS FOR TESTING
+        # Position sizing - scaled to bankroll
         self.min_trade_size = 0.10       # Polymarket minimum (~$0.10)
-        self.max_single_trade = 10000.0  # No limit
+        self.max_single_trade = market_budget
         self.cooldown_seconds = 1        # Fast cooldown
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 50.0    # Bigger initial trade
+        self.initial_trade_usd = min(5.0, market_budget)
         self.max_position_pct = 1.0      # No position limit (100%)
         self.force_balance_after_seconds = 120
         
@@ -687,6 +690,12 @@ class PaperTrader:
         # CRITICAL: For guaranteed profit, pair_cost MUST be < $1.00
         # With ~1.5% avg fees, we need pair_cost < ~$0.985 to profit
         self.max_entry_pair_potential = 0.98  # STRICT: Only enter if pair < $0.98
+
+        # === BANKROLL RESERVES ===
+        self.pre_hedge_reserve_ratio = 0.10   # Keep 10% of budget before hedging
+        self.post_hedge_reserve_ratio = 0.05  # Keep 5% once both sides exist
+        self.min_reserve_cash = 5.0           # Always keep at least $5 available
+        self.reserve_price_floor = 0.05       # Minimal assumed hedge price
     
     @staticmethod
     def calculate_fee(price: float, qty: float) -> float:
@@ -737,6 +746,88 @@ class PaperTrader:
         fee_up = self.calculate_fee(self.avg_up, self.qty_up) if self.qty_up > 0 else 0
         fee_down = self.calculate_fee(self.avg_down, self.qty_down) if self.qty_down > 0 else 0
         return fee_up + fee_down
+    
+    def remaining_budget(self) -> float:
+        total_spent = self.cost_up + self.cost_down
+        budget_limit = self.starting_balance * self.max_position_pct
+        return max(0.0, budget_limit - total_spent)
+    
+    def affordable_cash(self, fraction: float = 1.0) -> float:
+        fraction = max(0.0, min(1.0, fraction))
+        return max(0.0, min(self.cash * fraction, self.remaining_budget()))
+    
+    def capped_spend(self, desired_spend: float, fraction: float = 1.0) -> float:
+        return min(desired_spend, self.affordable_cash(fraction))
+
+    def _reserve_cash_needed_for_state(
+        self,
+        qty_up: float,
+        qty_down: float,
+        opposing_price: Optional[float] = None,
+        cost_up: Optional[float] = None,
+        cost_down: Optional[float] = None
+    ) -> float:
+        opposing_price = opposing_price if opposing_price is not None else 0.0
+        cost_up = cost_up if cost_up is not None else self.cost_up
+        cost_down = cost_down if cost_down is not None else self.cost_down
+
+        if qty_up <= 0 and qty_down <= 0:
+            return max(self.min_reserve_cash, self.market_budget * self.pre_hedge_reserve_ratio)
+
+        if qty_up == 0 or qty_down == 0:
+            qty_single = qty_up if qty_down == 0 else qty_down
+            if qty_single <= 0:
+                return max(self.min_reserve_cash, self.market_budget * self.pre_hedge_reserve_ratio)
+
+            if qty_down == 0 and qty_up > 0:
+                avg_single = cost_up / qty_up
+            elif qty_up == 0 and qty_down > 0:
+                avg_single = cost_down / qty_down
+            else:
+                avg_single = 0.0
+
+            max_profitable_price = max(0.01, min(0.99, 0.99 - avg_single))
+            observed_price = opposing_price if opposing_price > 0 else max_profitable_price
+            est_price = max(self.reserve_price_floor, min(max_profitable_price, observed_price))
+
+            dynamic = qty_single * est_price
+            base = self.market_budget * self.pre_hedge_reserve_ratio
+            return max(self.min_reserve_cash, base, dynamic)
+
+        base = self.market_budget * self.post_hedge_reserve_ratio
+        return max(self.min_reserve_cash, base)
+
+    def reserve_ok(self, side: str, price: float, qty: float, opposing_price: Optional[float] = None) -> tuple:
+        if price <= 0 or qty <= 0:
+            return False, "Invalid trade sizing"
+        cost = price * qty
+        new_qty_up = self.qty_up + (qty if side == 'UP' else 0.0)
+        new_qty_down = self.qty_down + (qty if side == 'DOWN' else 0.0)
+        new_cost_up = self.cost_up + (cost if side == 'UP' else 0.0)
+        new_cost_down = self.cost_down + (cost if side == 'DOWN' else 0.0)
+
+        reserve_needed = self._reserve_cash_needed_for_state(
+            new_qty_up,
+            new_qty_down,
+            opposing_price,
+            new_cost_up,
+            new_cost_down
+        )
+        budget_limit = self.market_budget * self.max_position_pct
+        new_total_spent = new_cost_up + new_cost_down
+        remaining_budget_after = budget_limit - new_total_spent
+        cash_after = self.cash - cost
+
+        if remaining_budget_after < -1e-6 or cash_after < -1e-6:
+            return False, "Insufficient funds"
+
+        if remaining_budget_after + 1e-6 < reserve_needed:
+            return False, f"Need ${reserve_needed:.2f} budget reserved (have ${remaining_budget_after:.2f})"
+
+        if cash_after + 1e-6 < reserve_needed:
+            return False, f"Need ${reserve_needed:.2f} cash reserved (have ${cash_after:.2f})"
+
+        return True, ""
         
     @property
     def cash(self):
@@ -862,15 +953,12 @@ class PaperTrader:
             # If we're already the larger side by a lot, don't improve further
             if current_ratio > 3.0:  # Very relaxed - allow up to 3x imbalance
                 return False, 0, f"Already ahead: {current_ratio:.2f}x ratio"
-        # No budget limits for testing
+        available = min(self.affordable_cash(self.improvement_trade_pct), self.max_single_trade)
         
-        # Calculate optimal improvement quantity - UNLIMITED FOR TESTING
-        budget = 10000.0  # Always have budget to improve
+        if available < self.min_trade_size:
+            return False, 0, f"Insufficient budget ${available:.2f}"
         
-        if budget < self.min_trade_size:
-            return False, 0, f"Insufficient budget ${budget:.2f}"
-        
-        qty = budget / price
+        qty = available / price
         
         # Simulate the new average
         new_cost = my_cost + (qty * price)
@@ -1201,16 +1289,21 @@ class PaperTrader:
         if self.qty_up == 0 and self.qty_down == 0:
             cheaper_side = 'UP' if up_price <= down_price else 'DOWN'
             cheaper_price = min(up_price, down_price)
+            opposing_price = down_price if cheaper_side == 'UP' else up_price
             
             if cheaper_price <= self.cheap_threshold:
-                max_spend = 500.0  # Fixed amount for entry - unlimited
-                qty = max_spend / cheaper_price
-                
-                if qty >= 1.0:
-                    self.first_trade_time = now
-                    if self.execute_buy(cheaper_side, cheaper_price, qty, timestamp):
-                        trades_made.append((cheaper_side, cheaper_price, qty))
-                        print(f"🎯 [ENTRY] Bought {qty:.1f} {cheaper_side} @ ${cheaper_price:.3f}")
+                max_spend = self.capped_spend(min(self.initial_trade_usd, self.max_single_trade))
+                if max_spend >= self.min_trade_size:
+                    qty = max_spend / cheaper_price
+                    if qty >= 1.0:
+                        ok, reason = self.reserve_ok(cheaper_side, cheaper_price, qty, opposing_price)
+                        if not ok:
+                            print(f"⚠️ [ENTRY BLOCKED] {reason}")
+                            return trades_made
+                        self.first_trade_time = now
+                        if self.execute_buy(cheaper_side, cheaper_price, qty, timestamp):
+                            trades_made.append((cheaper_side, cheaper_price, qty))
+                            print(f"🎯 [ENTRY] Bought {qty:.1f} {cheaper_side} @ ${cheaper_price:.3f}")
             return trades_made
         
         # === ONLY ONE SIDE - HEDGE OR IMPROVE! ===
@@ -1235,6 +1328,10 @@ class PaperTrader:
             if potential_pair >= MAX_ACCEPTABLE_PAIR:
                 # Hedge would be bad - can we improve instead?
                 if should_improve:
+                    ok, reason = self.reserve_ok('UP', up_price, improve_qty, down_price)
+                    if not ok:
+                        print(f"⚠️ [IMPROVE UP BLOCKED] {reason}")
+                        return trades_made
                     if self.execute_buy('UP', up_price, improve_qty, timestamp):
                         trades_made.append(('UP', up_price, improve_qty))
                         new_max_hedge = 1.0 - self.avg_up
@@ -1246,13 +1343,18 @@ class PaperTrader:
                 return trades_made
             
             target_qty = self.qty_up
-            max_spend = target_qty * down_price  # Match quantity, unlimited
-            qty = max_spend / down_price
+            desired_spend = target_qty * down_price
+            max_spend = self.capped_spend(desired_spend, fraction=0.8)
+            qty = max_spend / down_price if down_price > 0 else 0.0
             
-            if qty >= 0.5:
+            if qty >= 0.5 and max_spend >= self.min_trade_size:
+                ok, reason = self.reserve_ok('DOWN', down_price, qty, up_price)
+                if not ok:
+                    print(f"⚠️ [HEDGE BLOCKED] {reason}")
+                    return trades_made
                 if self.execute_buy('DOWN', down_price, qty, timestamp):
                     trades_made.append(('DOWN', down_price, qty))
-                    print(f"🔒 [HEDGE] Bought {qty:.1f} DOWN @ ${down_price:.3f} | pair: ${self.pair_cost:.3f}")
+                    print(f"🔒 [HEDGE] Bought {qty:.1f} DOWN @ ${down_price:.3f} | spend ${max_spend:.2f} | pair: ${self.pair_cost:.3f}")
             return trades_made
         
         if self.qty_down > 0 and self.qty_up == 0:
@@ -1278,6 +1380,10 @@ class PaperTrader:
             if potential_pair >= MAX_ACCEPTABLE_PAIR:
                 # Hedge would be bad - can we improve DOWN position to widen the window?
                 if should_improve:
+                    ok, reason = self.reserve_ok('DOWN', down_price, improve_qty, up_price)
+                    if not ok:
+                        print(f"⚠️ [IMPROVE DOWN BLOCKED] {reason}")
+                        return trades_made
                     if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
                         trades_made.append(('DOWN', down_price, improve_qty))
                         new_max_up = 0.99 - self.avg_down
@@ -1293,15 +1399,20 @@ class PaperTrader:
             print(f"✅ [HEDGE OK] pair ${potential_pair:.3f} < $0.99 - BUYING UP!")
             
             target_qty = self.qty_down
-            max_spend = target_qty * up_price  # Match quantity, unlimited
-            qty = max_spend / up_price
+            desired_spend = target_qty * up_price
+            max_spend = self.capped_spend(desired_spend, fraction=0.8)
+            qty = max_spend / up_price if up_price > 0 else 0.0
             
-            print(f"   target_qty={target_qty:.1f} | max_spend=${max_spend:.2f} | qty={qty:.1f}")
+            print(f"   target_qty={target_qty:.1f} | afford=${max_spend:.2f} | qty={qty:.1f}")
             
-            if qty >= 0.5:
+            if qty >= 0.5 and max_spend >= self.min_trade_size:
+                ok, reason = self.reserve_ok('UP', up_price, qty, down_price)
+                if not ok:
+                    print(f"⚠️ [HEDGE BLOCKED] {reason}")
+                    return trades_made
                 if self.execute_buy('UP', up_price, qty, timestamp):
                     trades_made.append(('UP', up_price, qty))
-                    print(f"🔒 [HEDGE] Bought {qty:.1f} UP @ ${up_price:.3f} | pair: ${self.pair_cost:.3f}")
+                    print(f"🔒 [HEDGE] Bought {qty:.1f} UP @ ${up_price:.3f} | spend ${max_spend:.2f} | pair: ${self.pair_cost:.3f}")
             else:
                 print(f"⚠️ [SKIP HEDGE] qty {qty:.1f} < 0.5 minimum")
             return trades_made
@@ -1360,12 +1471,15 @@ class PaperTrader:
             target_catch_up = leading_qty * 0.8 - lagging_qty
             if target_catch_up > 0:
                 cost_to_catch_up = target_catch_up * lagging_price
+                max_spend = self.capped_spend(cost_to_catch_up, fraction=0.5)
+                qty_to_buy = max_spend / lagging_price if lagging_price > 0 else 0.0
                 
-                # NO BUDGET LIMITS FOR TESTING
-                max_spend = cost_to_catch_up  # Use full amount needed
-                qty_to_buy = max_spend / lagging_price
-                
-                if qty_to_buy >= 1.0:
+                if qty_to_buy >= 1.0 and max_spend >= self.min_trade_size:
+                    opp_price = down_price if lagging_side == 'UP' else up_price
+                    ok, reason = self.reserve_ok(lagging_side, lagging_price, qty_to_buy, opp_price)
+                    if not ok:
+                        print(f"⚠️ [CATCH-UP BLOCKED] {reason}")
+                        return trades_made
                     # Simulate the result
                     if lagging_side == 'UP':
                         new_qty_up = self.qty_up + qty_to_buy
@@ -1400,18 +1514,26 @@ class PaperTrader:
         best_new_pair = pair_cost
         best_new_locked = locked
         
-        # Try larger trade sizes - NO LIMITS
+        # Try larger trade sizes - limited by bankroll availability
         trade_sizes = [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0]  # USD amounts
+        affordable_for_tests = self.affordable_cash(0.5)
         
         for try_side, try_price in [('UP', up_price), ('DOWN', down_price)]:
             my_qty = self.qty_up if try_side == 'UP' else self.qty_down
             my_avg = self.avg_up if try_side == 'UP' else self.avg_down
             other_qty = self.qty_down if try_side == 'UP' else self.qty_up
+            opp_price = down_price if try_side == 'UP' else up_price
             
             for trade_usd in trade_sizes:
-                # No cash limit - test all sizes
+                if trade_usd > affordable_for_tests:
+                    continue
+                
+                # Evaluate only sizes we can fund
                 test_qty = trade_usd / try_price
                 if test_qty < 0.5:
+                    continue
+                ok, _ = self.reserve_ok(try_side, try_price, test_qty, opp_price)
+                if not ok:
                     continue
                 
                 # Simulate the trade
@@ -1469,6 +1591,11 @@ class PaperTrader:
         # Execute the best trade if we found one that helps
         if best_side and best_improvement > 0.05:  # At least 5 cents improvement
             best_price = up_price if best_side == 'UP' else down_price
+            opp_price = down_price if best_side == 'UP' else up_price
+            ok, reason = self.reserve_ok(best_side, best_price, best_qty, opp_price)
+            if not ok:
+                print(f"⚠️ [OPTIMIZE BLOCKED] {reason}")
+                return trades_made
             if self.execute_buy(best_side, best_price, best_qty, timestamp):
                 trades_made.append((best_side, best_price, best_qty))
                 print(
@@ -1529,7 +1656,7 @@ class PaperTrader:
 class MarketTracker:
     """Tracks a single market"""
     
-    def __init__(self, slug: str, asset: str, cash_ref: dict):
+    def __init__(self, slug: str, asset: str, cash_ref: dict, market_budget: float):
         self.slug = slug
         self.asset = asset
         self.up_token_id = None
@@ -1540,7 +1667,8 @@ class MarketTracker:
         self.down_price = None
         self.last_up_bid = 0.0
         self.last_down_bid = 0.0
-        self.paper_trader = PaperTrader(cash_ref, slug)
+        self.market_budget = market_budget
+        self.paper_trader = PaperTrader(cash_ref, slug, market_budget)
         self.initialized = False
         self.last_update = 0
 
@@ -1549,8 +1677,11 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 100.0):
+    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 200.0):
+        self.initial_starting_balance = starting_balance
+        self.initial_per_market_budget = per_market_budget
         self.starting_balance = starting_balance
+        self.per_market_budget = per_market_budget
         self.cash_ref = {'balance': starting_balance}
         self.active_markets: Dict[str, MarketTracker] = {}
         self.history: List[dict] = []
@@ -1636,7 +1767,7 @@ class MultiMarketBot:
                                     down_token = tokens[0]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -1740,7 +1871,7 @@ class MultiMarketBot:
                                         down_token = tokens[i]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -2152,16 +2283,17 @@ class MultiMarketBot:
                         
                         elif action == 'reset':
                             # Reset everything
-                            self.starting_balance = 100.0
-                            self.cash_ref['balance'] = 100.0
+                            self.starting_balance = self.initial_starting_balance
+                            self.per_market_budget = self.initial_per_market_budget
+                            self.cash_ref['balance'] = self.initial_starting_balance
                             self.history = []
                             self.trade_log = []
                             self.active_markets = {}
-                            print(f"🔄 Bot RESET - Balance: $100.00")
+                            print(f"🔄 Bot RESET - Balance: ${self.starting_balance:.2f}")
                             await self.broadcast({
                                 'starting_balance': self.starting_balance,
                                 'current_balance': self.cash_ref['balance'],
-                                'true_balance': 100.0,
+                                'true_balance': self.starting_balance,
                                 'total_locked_profit': 0,
                                 'active_markets': {},
                                 'history': [],
@@ -2198,7 +2330,7 @@ class MultiMarketBot:
 
 
 if __name__ == '__main__':
-    bot = MultiMarketBot(starting_balance=1000000.0)  # Unlimited for testing
+    bot = MultiMarketBot()
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
