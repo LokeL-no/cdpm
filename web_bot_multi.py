@@ -15,7 +15,7 @@ from aiohttp import web
 import os
 
 # Supported assets
-SUPPORTED_ASSETS = ['btc', 'eth']
+SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
@@ -282,11 +282,11 @@ HTML_TEMPLATE = """
         <div class="global-stats">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
-                <div class="value neutral">$<span id="starting-balance">4000.00</span></div>
+                <div class="value neutral">$<span id="starting-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">True Balance</div>
-                <div class="value neutral">$<span id="current-balance">4000.00</span></div>
+                <div class="value neutral">$<span id="current-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">Total PnL</div>
@@ -300,7 +300,7 @@ HTML_TEMPLATE = """
         
         <div class="asset-stats" style="margin-bottom: 20px;">
             <h2 style="color: #3b82f6; margin-bottom: 10px;">📊 W/D/L per Asset</h2>
-            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;" id="asset-wdl-stats">
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;" id="asset-wdl-stats">
                 <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
                     <span class="asset-badge asset-btc">BTC</span>
                     <div style="margin-top: 8px; font-size: 12px;">
@@ -311,6 +311,22 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
                     <span class="asset-badge asset-eth">ETH</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-sol">SOL</span>
+                    <div style="margin-top: 8px; font-size: 12px;">
+                        <span class="profit">W: --</span> | 
+                        <span style="color: #888;">D: --</span> | 
+                        <span class="loss">L: --</span>
+                    </div>
+                </div>
+                <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
+                    <span class="asset-badge asset-xrp">XRP</span>
                     <div style="margin-top: 8px; font-size: 12px;">
                         <span class="profit">W: --</span> | 
                         <span style="color: #888;">D: --</span> | 
@@ -385,7 +401,7 @@ HTML_TEMPLATE = """
         }
         
         function resetBot() {
-            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $4000.')) {
+            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $400.')) {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
@@ -432,15 +448,21 @@ HTML_TEMPLATE = """
             // Update W/D/L per asset
             if (data.asset_wdl) {
                 const wdlContainer = document.getElementById('asset-wdl-stats');
+                const assets = (data.supported_assets && data.supported_assets.length)
+                    ? data.supported_assets
+                    : Object.keys(data.asset_wdl);
+                if (assets.length > 0) {
+                    wdlContainer.style.gridTemplateColumns = `repeat(${assets.length}, 1fr)`;
+                }
                 let wdlHtml = '';
-                const assets = ['btc', 'eth'];
                 for (const asset of assets) {
                     const stats = data.asset_wdl[asset] || { wins: 0, draws: 0, losses: 0, total: 0, total_pnl: 0 };
                     const winPct = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(0) : '--';
                     const drawPct = stats.total > 0 ? ((stats.draws / stats.total) * 100).toFixed(0) : '--';
                     const lossPct = stats.total > 0 ? ((stats.losses / stats.total) * 100).toFixed(0) : '--';
-                    const pnlClass = stats.total_pnl >= 0 ? 'profit' : 'loss';
-                    const pnlSign = stats.total_pnl >= 0 ? '+' : '';
+                    const pnl = stats.total_pnl || 0;
+                    const pnlClass = pnl >= 0 ? 'profit' : 'loss';
+                    const pnlSign = pnl >= 0 ? '+' : '';
                     
                     wdlHtml += `
                         <div class="asset-wdl-card" style="background: #1a1a2e; padding: 12px; border-radius: 8px; text-align: center;">
@@ -454,7 +476,7 @@ HTML_TEMPLATE = """
                                 (${stats.wins}/${stats.draws}/${stats.losses}) n=${stats.total}
                             </div>
                             <div style="margin-top: 6px; font-size: 14px; font-weight: bold;" class="${pnlClass}">
-                                ${pnlSign}$${stats.total_pnl.toFixed(2)}
+                                ${pnlSign}$${pnl.toFixed(2)}
                             </div>
                         </div>
                     `;
@@ -477,6 +499,9 @@ HTML_TEMPLATE = """
                     const lockedPnl = typeof pt.locked_profit === 'number'
                         ? pt.locked_profit
                         : Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
+                    const finalPnl = pt.final_pnl ?? 0;
+                    const finalGross = pt.final_pnl_gross ?? finalPnl;
+                    const feesPaid = pt.fees_paid ?? 0;
                     
                     html += `
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
@@ -537,7 +562,7 @@ HTML_TEMPLATE = """
                                     ${lockedPnl >= 0 ? '+' : ''}$${lockedPnl.toFixed(2)}
                                 </span>
                                 ${pt.market_status === 'resolved' ? 
-                                    `<br><span style="color: #3b82f6;">Outcome: ${pt.resolution_outcome} | Final: ${pt.final_pnl >= 0 ? '+' : ''}$${pt.final_pnl?.toFixed(2)}</span>` 
+                                    `<br><span style="color: #3b82f6;">Outcome: ${pt.resolution_outcome} | Final: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}${Math.abs(finalGross - finalPnl) > 0.005 || feesPaid > 0 ? ` <span style="color:#888;">(gross $${finalGross.toFixed(2)} | fees $${feesPaid.toFixed(2)})</span>` : ''}</span>` 
                                     : ''}
                             </div>
                         </div>
@@ -553,7 +578,12 @@ HTML_TEMPLATE = """
             } else {
                 let html = '';
                 for (const h of data.history.slice().reverse()) {
-                    const pnlClass = h.pnl >= 0 ? 'profit' : 'loss';
+                    const netPayout = (h.net_payout !== undefined) ? h.net_payout : h.payout;
+                    const fees = h.fees !== undefined ? h.fees : 0;
+                    const grossPayout = h.payout !== undefined ? h.payout : netPayout;
+                    const pnlValue = h.pnl_after_fees !== undefined ? h.pnl_after_fees : h.pnl;
+                    const pnlGross = h.gross_pnl !== undefined ? h.gross_pnl : pnlValue;
+                    const pnlClass = pnlValue >= 0 ? 'profit' : 'loss';
                     html += `
                         <tr>
                             <td>${h.resolved_at}</td>
@@ -563,8 +593,13 @@ HTML_TEMPLATE = """
                             <td>${h.qty_up.toFixed(1)}</td>
                             <td>${h.qty_down.toFixed(1)}</td>
                             <td>$${h.pair_cost.toFixed(3)}</td>
-                            <td>$${h.payout.toFixed(2)}</td>
-                            <td class="${pnlClass}">${h.pnl >= 0 ? '+' : ''}$${h.pnl.toFixed(2)}</td>
+                            <td>
+                                $${netPayout.toFixed(2)}
+                                ${fees > 0 ? `<div style="font-size: 10px; color: #888;">gross $${grossPayout.toFixed(2)} | fees $${fees.toFixed(2)}</div>` : ''}
+                            </td>
+                            <td class="${pnlClass}">${pnlValue >= 0 ? '+' : ''}$${pnlValue.toFixed(2)}
+                                ${Math.abs(pnlGross - pnlValue) > 0.005 ? `<div style="font-size: 10px; color: #888;">gross $${pnlGross.toFixed(2)}</div>` : ''}
+                            </td>
                         </tr>
                     `;
                 }
@@ -639,7 +674,9 @@ class PaperTrader:
         self.market_status = 'open'
         self.resolution_outcome = None
         self.final_pnl = None
+        self.final_pnl_gross = None
         self.payout = 0.0
+        self.last_fees_paid = 0.0
         self.market_budget = market_budget
         self.starting_balance = market_budget
         
@@ -759,6 +796,88 @@ class PaperTrader:
     
     def capped_spend(self, desired_spend: float, fraction: float = 1.0) -> float:
         return min(desired_spend, self.affordable_cash(fraction))
+
+    def cap_qty_to_reserve(
+        self,
+        side: str,
+        price: float,
+        desired_qty: float,
+        opposing_price: Optional[float] = None,
+        iterations: int = 20
+    ) -> float:
+        """Shrink qty until reserve_ok passes while staying within budget."""
+        if price <= 0 or desired_qty <= 0:
+            return 0.0
+
+        ok, _ = self.reserve_ok(side, price, desired_qty, opposing_price)
+        if ok:
+            return desired_qty
+
+        low = 0.0
+        high = desired_qty
+
+        for _ in range(iterations):
+            mid = (low + high) / 2.0
+            ok, _ = self.reserve_ok(side, price, mid, opposing_price)
+            if ok:
+                low = mid
+            else:
+                high = mid
+
+        return low
+
+    def capped_spend_until_ok(
+        self,
+        side: str,
+        price: float,
+        desired_spend: float,
+        opposing_price: Optional[float] = None,
+        fraction: float = 1.0,
+        min_spend: float = 0.10,
+        reduction_factor: float = 0.5,
+        max_iter: int = 6
+    ) -> float:
+        """Try smaller spends until reserve_ok passes or min_spend reached."""
+        spend = self.capped_spend(desired_spend, fraction)
+        iteration = 0
+
+        while spend >= min_spend and iteration < max_iter:
+            qty = spend / price if price > 0 else 0.0
+            if qty <= 0:
+                break
+            ok, _ = self.reserve_ok(side, price, qty, opposing_price)
+            if ok:
+                return spend
+            spend *= reduction_factor
+            iteration += 1
+
+        return 0.0
+
+    def cap_qty_to_reserve(
+        self,
+        side: str,
+        price: float,
+        desired_qty: float,
+        opposing_price: Optional[float] = None,
+        iterations: int = 20
+    ) -> float:
+        if price <= 0 or desired_qty <= 0:
+            return 0.0
+        ok, _ = self.reserve_ok(side, price, desired_qty, opposing_price)
+        if ok:
+            return desired_qty
+
+        low = 0.0
+        high = desired_qty
+        for _ in range(iterations):
+            mid = (low + high) / 2.0
+            ok, _ = self.reserve_ok(side, price, mid, opposing_price)
+            if ok:
+                low = mid
+            else:
+                high = mid
+
+        return low
 
     def _reserve_cash_needed_for_state(
         self,
@@ -959,7 +1078,19 @@ class PaperTrader:
         if available < self.min_trade_size:
             return False, 0, f"Insufficient budget ${available:.2f}"
         
-        qty = available / price
+        spend = self.capped_spend_until_ok(
+            side,
+            price,
+            desired_spend=available,
+            opposing_price=other_avg if other_qty > 0 else None,
+            fraction=1.0,
+            min_spend=self.min_trade_size
+        )
+
+        if spend < self.min_trade_size:
+            return False, 0, f"Insufficient reserve for improvement"
+
+        qty = spend / price
         
         # Simulate the new average
         new_cost = my_cost + (qty * price)
@@ -975,8 +1106,8 @@ class PaperTrader:
         old_max_hedge_price = 1.0 - my_avg
         new_max_hedge_price = 1.0 - new_avg
         window_expansion = new_max_hedge_price - old_max_hedge_price
-        
-        return True, qty, f"📈 IMPROVE: avg ${my_avg:.3f}→${new_avg:.3f} | hedge window expands by ${window_expansion:.3f}"
+
+        return True, qty, f"📈 IMPROVE: +${spend:.2f} avg ${my_avg:.3f}→${new_avg:.3f} | hedge window expands by ${window_expansion:.3f}"
 
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         cost = price * qty
@@ -1641,10 +1772,14 @@ class PaperTrader:
             self.payout = self.qty_down * 1.0
         
         total_cost = self.cost_up + self.cost_down
-        self.final_pnl = self.payout - total_cost
+        fees = self.calculate_total_fees()
+        self.last_fees_paid = fees
+        self.final_pnl_gross = self.payout - total_cost
+        self.final_pnl = self.final_pnl_gross - fees
+        net_payout = max(0.0, self.payout - fees)
         
-        # Add payout back to cash
-        self.cash += self.payout
+        # Add net payout back to cash
+        self.cash += net_payout
         
         return self.final_pnl
     
@@ -1672,6 +1807,8 @@ class PaperTrader:
             'market_status': self.market_status,
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
+            'final_pnl_gross': self.final_pnl_gross,
+            'fees_paid': self.last_fees_paid,
             'payout': self.payout,
             # Hedge window info - max price for profitable hedge (pair < $0.99)
             'max_hedge_up': max_hedge_up,    # Max UP price for profit if we only have DOWN
@@ -1703,7 +1840,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 4000.0, per_market_budget: float = 2000.0):
+    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 100.0):
         self.initial_starting_balance = starting_balance
         self.initial_per_market_budget = per_market_budget
         self.starting_balance = starting_balance
@@ -1942,19 +2079,12 @@ class MultiMarketBot:
                 outcome = 'DOWN'
                 payout = pt.qty_down  # $1 per DOWN share
             
-            total_cost = pt.cost_up + pt.cost_down
-            pnl = payout - total_cost
+            pnl = pt.resolve_market(outcome)
+            fees_paid = getattr(pt, 'last_fees_paid', 0.0)
+            gross_pnl = getattr(pt, 'final_pnl_gross', pnl + fees_paid)
+            net_payout = max(0.0, pt.payout - fees_paid)
             
-            # Add payout back to cash
-            self.cash_ref['balance'] += payout
-            
-            # Mark as resolved
-            pt.market_status = 'resolved'
-            pt.resolution_outcome = outcome
-            pt.payout = payout
-            pt.final_pnl = pnl
-            
-            print(f"🏁 [{tracker.asset.upper()}] Market closed: {outcome} won | Payout: ${payout:.2f} | PnL: ${pnl:+.2f}")
+            print(f"🏁 [{tracker.asset.upper()}] Market closed: {outcome} won | Net: ${pnl:+.2f} (fees ${fees_paid:.2f})")
             
             # Add to history
             self.history.append({
@@ -1965,8 +2095,12 @@ class MultiMarketBot:
                 'qty_up': pt.qty_up,
                 'qty_down': pt.qty_down,
                 'pair_cost': pt.pair_cost,
-                'payout': payout,
-                'pnl': pnl
+                'payout': pt.payout,
+                'net_payout': net_payout,
+                'fees': fees_paid,
+                'gross_pnl': gross_pnl,
+                'pnl': pnl,
+                'pnl_after_fees': pnl
             })
             return
         
@@ -2097,7 +2231,10 @@ class MultiMarketBot:
                                     continue
                                 
                                 pnl = pt.resolve_market(resolution)
-                                print(f"🏁 [{tracker.asset.upper()}] Resolved: {resolution} | PnL: ${pnl:.2f}")
+                                fees_paid = getattr(pt, 'last_fees_paid', 0.0)
+                                gross_pnl = getattr(pt, 'final_pnl_gross', pnl + fees_paid)
+                                net_payout = max(0.0, pt.payout - fees_paid)
+                                print(f"🏁 [{tracker.asset.upper()}] Resolved: {resolution} | Net: ${pnl:.2f} (fees ${fees_paid:.2f})")
                                 
                                 # Add to history
                                 self.history.append({
@@ -2109,7 +2246,11 @@ class MultiMarketBot:
                                     'qty_down': pt.qty_down,
                                     'pair_cost': pt.pair_cost,
                                     'payout': pt.payout,
-                                    'pnl': pnl
+                                    'net_payout': net_payout,
+                                    'fees': fees_paid,
+                                    'gross_pnl': gross_pnl,
+                                    'pnl': pnl,
+                                    'pnl_after_fees': pnl
                                 })
                                 return
                         
@@ -2124,17 +2265,22 @@ class MultiMarketBot:
                                 if liquidation_value == 0 and (pt.qty_up > 0 or pt.qty_down > 0):
                                     liquidation_value = min(pt.qty_up, pt.qty_down)
                                 total_cost = pt.cost_up + pt.cost_down
-                                pnl = liquidation_value - total_cost
+                                fees_paid = pt.calculate_total_fees()
+                                net_liquidation = max(0.0, liquidation_value - fees_paid)
+                                pnl_after_fees = net_liquidation - total_cost
+                                gross_pnl = liquidation_value - total_cost
                                 
-                                # Add payout back to cash
-                                self.cash_ref['balance'] += liquidation_value
+                                # Add net payout back to cash
+                                self.cash_ref['balance'] += net_liquidation
                                 
                                 pt.market_status = 'resolved'
                                 pt.resolution_outcome = 'TIMEOUT'
                                 pt.payout = liquidation_value
-                                pt.final_pnl = pnl
+                                pt.final_pnl = pnl_after_fees
+                                pt.final_pnl_gross = gross_pnl
+                                pt.last_fees_paid = fees_paid
                                 
-                                print(f"⚠️ [{tracker.asset.upper()}] Resolution timeout | Liquidated: ${liquidation_value:.2f} | PnL: ${pnl:+.2f}")
+                                print(f"⚠️ [{tracker.asset.upper()}] Resolution timeout | Net: ${pnl_after_fees:+.2f} (fees ${fees_paid:.2f})")
                                 
                                 self.history.append({
                                     'resolved_at': datetime.now(timezone.utc).strftime('%H:%M:%S'),
@@ -2145,7 +2291,11 @@ class MultiMarketBot:
                                     'qty_down': pt.qty_down,
                                     'pair_cost': pt.pair_cost,
                                     'payout': liquidation_value,
-                                    'pnl': pnl
+                                    'net_payout': net_liquidation,
+                                    'fees': fees_paid,
+                                    'gross_pnl': gross_pnl,
+                                    'pnl': pnl_after_fees,
+                                    'pnl_after_fees': pnl_after_fees
                                 })
                                 
         except Exception as e:
@@ -2222,11 +2372,14 @@ class MultiMarketBot:
                     
                     for slug, tracker in self.active_markets.items():
                         pt = tracker.paper_trader
-                        # Calculate position value (what we'd get if market resolved now)
-                        min_qty = min(pt.qty_up, pt.qty_down)
-                        position_value = min_qty  # Locked pairs pay out $1 per pair
-                        total_position_value += position_value
-                        total_locked_profit += pt.locked_profit
+                        is_active = pt.market_status != 'resolved'
+                        if is_active:
+                            # Calculate position value (what we'd get if market resolved now) minus fees
+                            min_qty = min(pt.qty_up, pt.qty_down)
+                            fees_estimate = pt.calculate_total_fees()
+                            position_value = max(0.0, min_qty - fees_estimate)
+                            total_position_value += position_value
+                            total_locked_profit += pt.locked_profit
                         
                         # Only include newest market per asset in UI data
                         if slug in newest_slugs:
@@ -2249,7 +2402,7 @@ class MultiMarketBot:
                         draws = sum(1 for h in asset_history if h['pnl'] == 0)
                         losses = sum(1 for h in asset_history if h['pnl'] < 0)
                         total = len(asset_history)
-                        total_pnl = sum(h['pnl'] for h in asset_history)
+                        total_pnl = sum(h.get('pnl_after_fees', h['pnl']) for h in asset_history)
                         asset_wdl[asset] = {
                             'wins': wins,
                             'draws': draws,
@@ -2267,7 +2420,8 @@ class MultiMarketBot:
                         'history': self.history,
                         'trade_log': self.trade_log,
                         'paused': self.paused,
-                        'asset_wdl': asset_wdl
+                        'asset_wdl': asset_wdl,
+                        'supported_assets': SUPPORTED_ASSETS
                     }
                     
                     await self.broadcast(data)
