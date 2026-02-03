@@ -873,7 +873,7 @@ class PaperTrader:
         breakeven_hedge_price = min(1.0 - new_avg, self.breakeven_hedge_price)
         hedge_cost = new_qty * breakeven_hedge_price
         
-        cash_after = self.cash() - desired_spend
+        cash_after = self.cash - desired_spend
         
         if cash_after < hedge_cost:
             # Calculate max spend that allows break-even hedge
@@ -883,7 +883,7 @@ class PaperTrader:
             # cash - my_qty * bhp >= spend * (1 + bhp / price)
             # spend <= (cash - my_qty * bhp) / (1 + bhp / price)
             current_hedge_cost = my_qty * breakeven_hedge_price
-            available_for_spend = self.cash() - current_hedge_cost
+            available_for_spend = self.cash - current_hedge_cost
             max_spend = available_for_spend / (1 + breakeven_hedge_price / price)
             
             if max_spend < self.min_trade_size:
