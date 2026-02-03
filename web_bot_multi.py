@@ -9,6 +9,7 @@ import asyncio
 import aiohttp
 import json
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from aiohttp import web
@@ -734,6 +735,14 @@ class PaperTrader:
         self.post_hedge_reserve_ratio = 0.05  # Keep 5% once both sides exist
         self.min_reserve_cash = 5.0           # Always keep at least $5 available
         self.reserve_price_floor = 0.05       # Minimal assumed hedge price
+
+        # === IMPROVEMENT THROTTLE ===
+        self.improvement_spend_window = 2.0   # Seconds to look back when throttling
+        self.improvement_spend_cap = 15.0     # Max spend allowed per window on improvements
+        self.improvement_spend_log = {
+            'UP': deque(),
+            'DOWN': deque()
+        }
     
     @staticmethod
     def calculate_fee(price: float, qty: float) -> float:
@@ -796,6 +805,45 @@ class PaperTrader:
     
     def capped_spend(self, desired_spend: float, fraction: float = 1.0) -> float:
         return min(desired_spend, self.affordable_cash(fraction))
+
+    def _prune_improvement_window(self, side: str, now: Optional[float] = None):
+        now = now if now is not None else time.time()
+        log = self.improvement_spend_log.get(side)
+        if log is None:
+            return
+        window = self.improvement_spend_window
+        while log and now - log[0][0] > window:
+            log.popleft()
+
+    def _recent_improvement_spend(self, side: str, now: Optional[float] = None) -> float:
+        now = now if now is not None else time.time()
+        self._prune_improvement_window(side, now)
+        log = self.improvement_spend_log.get(side)
+        if not log:
+            return 0.0
+        return sum(amount for _, amount in log)
+
+    def _evaluate_improvement_throttle(self, side: str, desired_spend: float) -> tuple:
+        if desired_spend <= 0:
+            return True, 0.0, ""
+        now = time.time()
+        recent_spend = self._recent_improvement_spend(side, now)
+        remaining_allowance = max(0.0, self.improvement_spend_cap - recent_spend)
+        if desired_spend <= remaining_allowance + 1e-6:
+            return True, desired_spend, ""
+        return False, remaining_allowance, (
+            f"Throttle: ${recent_spend:.2f} used last {self.improvement_spend_window:.0f}s (cap ${self.improvement_spend_cap:.2f})"
+        )
+
+    def record_improvement_spend(self, side: str, spend: float):
+        if spend <= 0:
+            return
+        now = time.time()
+        log = self.improvement_spend_log.get(side)
+        if log is None:
+            return
+        self._prune_improvement_window(side, now)
+        log.append((now, spend))
 
     def cap_qty_to_reserve(
         self,
@@ -1087,6 +1135,15 @@ class PaperTrader:
             min_spend=self.min_trade_size
         )
 
+        throttle_ok, allowed_spend, throttle_reason = self._evaluate_improvement_throttle(side, spend)
+        throttled = False
+        if not throttle_ok:
+            if allowed_spend >= self.min_trade_size:
+                spend = allowed_spend
+                throttled = True
+            else:
+                return False, 0, throttle_reason
+
         if spend < self.min_trade_size:
             return False, 0, f"Insufficient reserve for improvement"
 
@@ -1107,7 +1164,11 @@ class PaperTrader:
         new_max_hedge_price = 1.0 - new_avg
         window_expansion = new_max_hedge_price - old_max_hedge_price
 
-        return True, qty, f"📈 IMPROVE: +${spend:.2f} avg ${my_avg:.3f}→${new_avg:.3f} | hedge window expands by ${window_expansion:.3f}"
+        reason = f"📈 IMPROVE: +${spend:.2f} avg ${my_avg:.3f}→${new_avg:.3f} | hedge window expands by ${window_expansion:.3f}"
+        if throttled:
+            reason += f" | throttle cap ${self.improvement_spend_cap:.0f}/{self.improvement_spend_window:.0f}s"
+
+        return True, qty, reason
 
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         cost = price * qty
@@ -1466,6 +1527,7 @@ class PaperTrader:
                 else:
                     if self.execute_buy('UP', up_price, improve_qty, timestamp):
                         trades_made.append(('UP', up_price, improve_qty))
+                        self.record_improvement_spend('UP', up_price * improve_qty)
                         new_max_hedge = 1.0 - self.avg_up
                         print(f"🔥 [FORCE IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
                               f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
@@ -1480,6 +1542,7 @@ class PaperTrader:
                         return trades_made
                     if self.execute_buy('UP', up_price, improve_qty, timestamp):
                         trades_made.append(('UP', up_price, improve_qty))
+                        self.record_improvement_spend('UP', up_price * improve_qty)
                         new_max_hedge = 1.0 - self.avg_up
                         print(f"📈 [IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
                               f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
@@ -1529,6 +1592,7 @@ class PaperTrader:
                 else:
                     if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
                         trades_made.append(('DOWN', down_price, improve_qty))
+                        self.record_improvement_spend('DOWN', down_price * improve_qty)
                         new_max_up = 0.99 - self.avg_down
                         print(f"🔥 [FORCE IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
                               f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
@@ -1543,6 +1607,7 @@ class PaperTrader:
                         return trades_made
                     if self.execute_buy('DOWN', down_price, improve_qty, timestamp):
                         trades_made.append(('DOWN', down_price, improve_qty))
+                        self.record_improvement_spend('DOWN', down_price * improve_qty)
                         new_max_up = 0.99 - self.avg_down
                         print(f"📈 [IMPROVE DOWN] Bought {improve_qty:.1f} DOWN @ ${down_price:.3f} | "
                               f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
