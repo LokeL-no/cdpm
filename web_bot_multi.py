@@ -282,11 +282,11 @@ HTML_TEMPLATE = """
         <div class="global-stats">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
-                <div class="value neutral">$<span id="starting-balance">400.00</span></div>
+                <div class="value neutral">$<span id="starting-balance">4000.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">True Balance</div>
-                <div class="value neutral">$<span id="current-balance">400.00</span></div>
+                <div class="value neutral">$<span id="current-balance">4000.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">Total PnL</div>
@@ -385,7 +385,7 @@ HTML_TEMPLATE = """
         }
         
         function resetBot() {
-            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $400.')) {
+            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $4000.')) {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
@@ -1703,7 +1703,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 200.0):
+    def __init__(self, starting_balance: float = 4000.0, per_market_budget: float = 2000.0):
         self.initial_starting_balance = starting_balance
         self.initial_per_market_budget = per_market_budget
         self.starting_balance = starting_balance
