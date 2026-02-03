@@ -736,6 +736,25 @@ class PaperTrader:
         self.min_reserve_cash = 5.0           # Always keep at least $5 available
         self.reserve_price_floor = 0.05       # Minimal assumed hedge price
 
+        # === GUARANTEED BREAK-EVEN SYSTEM ===
+        # CRITICAL: Always keep enough cash to hedge entire position to break-even
+        # Formula: max_spend = budget * min_expected_avg_price
+        # With avg floor ~$0.15: max_spend = $200 * 0.15 = $30
+        self.max_spend_per_side = 35.0        # Hard limit per side ($35 of $200)
+        self.breakeven_hedge_price = 0.90     # Worst case hedge price assumption
+        self.enable_breakeven_check = True    # Enable break-even reserve check
+        
+        # === ACCELERATED LADDER ===
+        # Buy more when price is low to drag down average faster
+        # But with lower amounts to stay within break-even limits
+        self.ladder_tiers = [
+            # (price_threshold, spend_amount)
+            (0.10, 5.0),    # Below $0.10: spend $5 per rung
+            (0.20, 4.0),    # $0.10 - $0.20: spend $4 per rung  
+            (0.30, 3.0),    # $0.20 - $0.30: spend $3 per rung
+            (1.00, 2.0),    # Above $0.30: spend $2 per rung
+        ]
+
         # === IMPROVEMENT THROTTLE ===
         self.improvement_spend_window = 2.0   # Seconds to look back when throttling
         self.improvement_spend_cap = 15.0     # Max spend allowed per window on improvements
@@ -744,7 +763,6 @@ class PaperTrader:
             'DOWN': deque()
         }
         self.improvement_step_price = 0.02   # Require $0.02 drop before next ladder fill
-        self.improvement_step_spend = 2.0    # Spend $2 per improvement rung
         self.last_improvement_price = {
             'UP': None,
             'DOWN': None
@@ -828,6 +846,44 @@ class PaperTrader:
         if not log:
             return 0.0
         return sum(amount for _, amount in log)
+
+    def _check_breakeven_reserve(self, side: str, price: float, my_qty: float, my_cost: float, desired_spend: float) -> tuple:
+        """
+        Check if we have enough cash to hedge the entire position to break-even after this purchase.
+        
+        For break-even: pair_cost = 1.00, so hedge_price = 1 - avg_price
+        Hedge cost = qty * hedge_price
+        
+        We must have: remaining_cash >= hedge_cost after the purchase
+        
+        Returns: (ok, allowed_spend, reason)
+        """
+        new_qty = my_qty + (desired_spend / price)
+        new_cost = my_cost + desired_spend
+        new_avg = new_cost / new_qty if new_qty > 0 else price
+        
+        # Worst case hedge price: use breakeven_hedge_price as ceiling
+        breakeven_hedge_price = min(1.0 - new_avg, self.breakeven_hedge_price)
+        hedge_cost = new_qty * breakeven_hedge_price
+        
+        cash_after = self.cash() - desired_spend
+        
+        if cash_after < hedge_cost:
+            # Calculate max spend that allows break-even hedge
+            # cash - spend >= (my_qty + spend/price) * breakeven_hedge_price
+            # cash - spend >= my_qty * bhp + spend * bhp / price
+            # cash - my_qty * bhp >= spend + spend * bhp / price
+            # cash - my_qty * bhp >= spend * (1 + bhp / price)
+            # spend <= (cash - my_qty * bhp) / (1 + bhp / price)
+            current_hedge_cost = my_qty * breakeven_hedge_price
+            available_for_spend = self.cash() - current_hedge_cost
+            max_spend = available_for_spend / (1 + breakeven_hedge_price / price)
+            
+            if max_spend < self.min_trade_size:
+                return False, 0, f"Break-even reserve: need ${hedge_cost:.2f} for hedge, only ${cash_after:.2f} available"
+            return True, max_spend, f"Capped to ${max_spend:.2f} for break-even reserve"
+        
+        return True, desired_spend, ""
 
     def _evaluate_improvement_throttle(self, side: str, desired_spend: float) -> tuple:
         if desired_spend <= 0:
@@ -1138,7 +1194,30 @@ class PaperTrader:
             if last_price is not None and price > last_price - self.improvement_step_price + 1e-6:
                 required = max(0.0, last_price - self.improvement_step_price)
                 return False, 0, f"Need price <= ${required:.3f} for next ladder"
-            desired_spend = min(self.improvement_step_spend, available)
+            
+            # Accelerated ladder: spend more at lower prices
+            ladder_spend = self.ladder_tiers[-1][1]  # default
+            for threshold, spend_amt in self.ladder_tiers:
+                if price <= threshold:
+                    ladder_spend = spend_amt
+                    break
+            desired_spend = min(ladder_spend, available)
+            
+            # Check max spend per side limit
+            if my_cost + desired_spend > self.max_spend_per_side:
+                remaining_allowed = self.max_spend_per_side - my_cost
+                if remaining_allowed < self.min_trade_size:
+                    return False, 0, f"Max spend per side ${self.max_spend_per_side:.0f} reached"
+                desired_spend = min(desired_spend, remaining_allowed)
+            
+            # Check break-even hedge reserve
+            if self.enable_breakeven_check:
+                can_spend, allowed_spend, reason = self._check_breakeven_reserve(side, price, my_qty, my_cost, desired_spend)
+                if not can_spend:
+                    return False, 0, reason
+                if allowed_spend < desired_spend:
+                    print(f"  💰 [BREAKEVEN CAP] {reason}")
+                    desired_spend = allowed_spend
         
         spend = self.capped_spend_until_ok(
             side,
