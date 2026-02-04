@@ -698,11 +698,11 @@ class PaperTrader:
         # Key insight: Buying more at lower price LOWERS the average!
         # Example: avg_UP=$0.46, buy more @$0.38 → new avg ~$0.42
         # Now DOWN only needs to be <$0.58 instead of <$0.54!
-        self.improvement_threshold = 0.005   # Buy more if price is 0.5 cents below average (LOWERED!)
-        self.min_improvement_pct = 0.01      # Or 1% below average (LOWERED!)
-        self.force_improve_pct = 0.10        # Force average-down if price drops 10%+ vs avg (was 25%)
-        self.max_imbalance_for_improvement = 2.0  # Max qty ratio during improvement phase
-        self.improvement_trade_pct = 0.25    # Use 25% of budget per improvement trade (INCREASED!)
+        self.improvement_threshold = 0.001   # Buy more if price is 0.1 cents below average (VERY LOW!)
+        self.min_improvement_pct = 0.005     # Or 0.5% below average (VERY LOW!)
+        self.force_improve_pct = 0.05        # Force average-down if price drops 5%+ vs avg
+        self.max_imbalance_for_improvement = 3.0  # Max qty ratio during improvement phase
+        self.improvement_trade_pct = 0.30    # Use 30% of budget per improvement trade
         
         # Position sizing - scaled to bankroll
         self.min_trade_size = 0.10       # Polymarket minimum (~$0.10)
@@ -729,6 +729,12 @@ class PaperTrader:
         # CRITICAL: For guaranteed profit, pair_cost MUST be < $1.00
         # With ~1.5% avg fees, we need pair_cost < ~$0.985 to profit
         self.max_entry_pair_potential = 0.98  # STRICT: Only enter if pair < $0.98
+
+        # === PROFIT GROWTH MODE ===
+        # Allow continued buying after locked profit is secured, but only if it
+        # improves locked profit and keeps pair_cost under target.
+        self.allow_profit_growth = True
+        self.min_locked_profit_increase = 0.01  # Only 1 cent improvement needed
 
         # === BANKROLL RESERVES ===
         self.pre_hedge_reserve_ratio = 0.10   # Keep 10% of budget before hedging
@@ -1149,6 +1155,63 @@ class PaperTrader:
         
         total_cost = new_cost_up + new_cost_down
         return min(new_qty_up, new_qty_down) - total_cost - total_fees
+
+    def pair_cost_for_state(self, qty_up: float, cost_up: float, qty_down: float, cost_down: float) -> float:
+        if qty_up <= 0 or qty_down <= 0:
+            return float("inf")
+        return (cost_up / qty_up) + (cost_down / qty_down)
+
+    def best_pair_cost_after_spend(self, qty_up: float, cost_up: float, qty_down: float, cost_down: float,
+                                   up_price: float, down_price: float, spend: float) -> float:
+        best = self.pair_cost_for_state(qty_up, cost_up, qty_down, cost_down)
+        if spend <= 0:
+            return best
+
+        for side, price in (("UP", up_price), ("DOWN", down_price)):
+            if price <= 0:
+                continue
+            qty = spend / price
+            if side == "UP":
+                new_qty_up = qty_up + qty
+                new_cost_up = cost_up + spend
+                new_qty_down = qty_down
+                new_cost_down = cost_down
+            else:
+                new_qty_down = qty_down + qty
+                new_cost_down = cost_down + spend
+                new_qty_up = qty_up
+                new_cost_up = cost_up
+
+            new_pair_cost = self.pair_cost_for_state(new_qty_up, new_cost_up, new_qty_down, new_cost_down)
+            if new_pair_cost < best:
+                best = new_pair_cost
+
+        return best
+
+    def can_recover_pair_cost(self, up_price: float, down_price: float, remaining_budget: float,
+                              qty_up: Optional[float] = None, cost_up: Optional[float] = None,
+                              qty_down: Optional[float] = None, cost_down: Optional[float] = None) -> bool:
+        qty_up = self.qty_up if qty_up is None else qty_up
+        cost_up = self.cost_up if cost_up is None else cost_up
+        qty_down = self.qty_down if qty_down is None else qty_down
+        cost_down = self.cost_down if cost_down is None else cost_down
+
+        current_pair = self.pair_cost_for_state(qty_up, cost_up, qty_down, cost_down)
+        if current_pair <= 1.0:
+            return True
+        if remaining_budget < self.min_trade_size:
+            return False
+
+        best = self.best_pair_cost_after_spend(
+            qty_up,
+            cost_up,
+            qty_down,
+            cost_down,
+            up_price,
+            down_price,
+            remaining_budget
+        )
+        return best <= 1.0
     
     def should_improve_position(self, side: str, price: float, opposing_price: float = None) -> tuple:
         """
@@ -1200,9 +1263,11 @@ class PaperTrader:
         # If we have both sides, check imbalance
         if other_qty > 0:
             current_ratio = my_qty / other_qty
-            # If we're already the larger side by a lot, don't improve further
-            if current_ratio > 3.0:  # Very relaxed - allow up to 3x imbalance
-                return False, 0, f"Already ahead: {current_ratio:.2f}x ratio"
+            # If we're already the larger side by a lot, only improve if profit is not locked
+            if current_ratio > self.max_imbalance_for_improvement:
+                # Allow if we don't have locked profit yet, or if improvement is significant
+                if self.locked_profit > 0 and price_improvement_pct < 0.10:  # < 10% improvement
+                    return False, 0, f"Already ahead: {current_ratio:.2f}x ratio"
         available = min(self.affordable_cash(self.improvement_trade_pct), self.max_single_trade)
         
         if available < self.min_trade_size:
@@ -1461,10 +1526,40 @@ class PaperTrader:
                 # The hedge would be expensive - try improving instead!
                 return False, 0, f"⏳ Hedge expensive (pair ${potential_pair:.3f}). {improve_reason}"
             
-            # After 10 seconds, NEVER accept pair > $1.00!
+            # After 10 seconds, refuse pair > $1.00 unless it is mathematically recoverable
             market_elapsed = 900.0 - time_to_close if time_to_close is not None else 0.0
             if market_elapsed > 10 and potential_pair > 1.0:
-                return False, 0, f"⛔ REFUSE hedge: pair ${potential_pair:.3f} > $1.00 after {market_elapsed:.0f}s"
+                target_qty = other_qty
+                hedge_cost = target_qty * price
+                remaining_after = remaining_budget - hedge_cost
+
+                if side == 'UP':
+                    qty_up_after = self.qty_up + target_qty
+                    cost_up_after = self.cost_up + hedge_cost
+                    qty_down_after = self.qty_down
+                    cost_down_after = self.cost_down
+                    up_price = price
+                    down_price = other_price
+                else:
+                    qty_down_after = self.qty_down + target_qty
+                    cost_down_after = self.cost_down + hedge_cost
+                    qty_up_after = self.qty_up
+                    cost_up_after = self.cost_up
+                    up_price = other_price
+                    down_price = price
+
+                recoverable = remaining_after >= self.min_trade_size and self.can_recover_pair_cost(
+                    up_price,
+                    down_price,
+                    remaining_after,
+                    qty_up_after,
+                    cost_up_after,
+                    qty_down_after,
+                    cost_down_after
+                )
+
+                if not recoverable:
+                    return False, 0, f"⛔ REFUSE hedge: pair ${potential_pair:.3f} > $1.00 after {market_elapsed:.0f}s"
             
             # Match qty to balance
             target_qty = other_qty
@@ -1493,8 +1588,19 @@ class PaperTrader:
         TARGET_PAIR_COST = 0.97
         
         # === SUCCESS CHECK ===
-        if guaranteed_profit > 0 and current_pair_cost < TARGET_PAIR_COST:
+        profit_growth_mode = guaranteed_profit > 0 and current_pair_cost < TARGET_PAIR_COST
+        if profit_growth_mode and not self.allow_profit_growth:
             return False, 0, f"✅ DONE! profit=${guaranteed_profit:.2f}, pair=${current_pair_cost:.3f}"
+
+        def profit_growth_allows(new_locked: float, new_pair_cost: float) -> bool:
+            if not profit_growth_mode:
+                return True
+            # Allow if pair cost improves OR locked profit increases
+            if new_pair_cost < current_pair_cost:
+                return True
+            if new_locked > guaranteed_profit:
+                return True
+            return False
         
         # === NEED TO IMPROVE ===
         # Strategy: Buy whichever side helps reach the goal
@@ -1512,7 +1618,9 @@ class PaperTrader:
             if qty * price >= self.min_trade_size:
                 new_locked = self.locked_profit_after_buy(side, price, qty)
                 new_ratio = (my_qty + qty) / other_qty
-                return True, qty, f"⚖️ BALANCE: ratio {ratio:.2f}→{new_ratio:.2f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if profit_growth_allows(new_locked, new_pair_cost):
+                    return True, qty, f"⚖️ BALANCE: ratio {ratio:.2f}→{new_ratio:.2f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
         # RULE 3: If pair_cost >= TARGET ($0.97), only buy if it reduces pair_cost
         if current_pair_cost >= TARGET_PAIR_COST:
@@ -1528,7 +1636,8 @@ class PaperTrader:
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
                 new_locked = self.locked_profit_after_buy(side, price, qty)
-                return True, qty, f"📉 REDUCE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
+                if profit_growth_allows(new_locked, new_pair_cost):
+                    return True, qty, f"📉 REDUCE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
         # RULE 4: If pair_cost < TARGET, buy cheap to grow position
         if price <= self.cheap_threshold and ratio <= 1.15:
@@ -1537,7 +1646,8 @@ class PaperTrader:
             
             if qty * price >= self.min_trade_size:
                 new_locked = self.locked_profit_after_buy(side, price, qty)
-                if new_locked > guaranteed_profit:
+                new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
+                if new_locked > guaranteed_profit and profit_growth_allows(new_locked, new_pair_cost):
                     return True, qty, f"💰 CHEAP @ ${price:.3f}: locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
         return False, 0, f"⏳ pair=${current_pair_cost:.3f} (target <${TARGET_PAIR_COST}), locked=${guaranteed_profit:.2f}, ratio={ratio:.2f}x"
@@ -1671,9 +1781,23 @@ class PaperTrader:
                         print(f"📈 [IMPROVE UP] Bought {improve_qty:.1f} UP @ ${up_price:.3f} | "
                               f"avg_UP now ${self.avg_up:.3f} | hedge window <${new_max_hedge:.3f}")
                         return trades_made
-                
-                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR:.2f} - waiting for better price")
-                return trades_made
+
+                target_qty = self.qty_up
+                hedge_cost = target_qty * down_price
+                remaining_after = remaining_budget - hedge_cost
+                recoverable = remaining_after >= self.min_trade_size and self.can_recover_pair_cost(
+                    up_price,
+                    down_price,
+                    remaining_after,
+                    self.qty_up,
+                    self.cost_up,
+                    self.qty_down + target_qty,
+                    self.cost_down + hedge_cost
+                )
+                if not recoverable:
+                    print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR:.2f} - waiting for better price")
+                    return trades_made
+                print(f"🟡 [ALLOW OVER $1.00] pair ${potential_pair:.3f} recoverable by close")
             
             # === HEDGE IS ACCEPTABLE! BUY DOWN! ===
             hedge_type = "PROFIT" if potential_pair < 0.99 else "BREAK-EVEN"
@@ -1751,8 +1875,22 @@ class PaperTrader:
                               f"avg_DOWN ${self.avg_down:.3f} | can now pay UP <${new_max_up:.3f}")
                         return trades_made
                 
-                print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} | avg_DOWN=${self.avg_down:.3f} | "
-                      f"UP=${up_price:.3f} | need UP <${max_up_for_profit:.3f}")
+                target_qty = self.qty_down
+                hedge_cost = target_qty * up_price
+                remaining_after = remaining_budget - hedge_cost
+                recoverable = remaining_after >= self.min_trade_size and self.can_recover_pair_cost(
+                    up_price,
+                    down_price,
+                    remaining_after,
+                    self.qty_up + target_qty,
+                    self.cost_up + hedge_cost,
+                    self.qty_down,
+                    self.cost_down
+                )
+                if not recoverable:
+                    print(f"⛔ [REFUSE HEDGE] pair ${potential_pair:.3f} >= ${MAX_ACCEPTABLE_PAIR:.2f} - waiting for better price")
+                    return trades_made
+                print(f"🟡 [ALLOW OVER $1.00] pair ${potential_pair:.3f} recoverable by close")
                 return trades_made
             
             # === HEDGE IS ACCEPTABLE! BUY UP! ===
@@ -1784,10 +1922,11 @@ class PaperTrader:
         locked = min_qty - total_spent - fees
         pair_cost = self.pair_cost
         
-        # ✅ PROFIT SECURED - STOP!
-        if locked > 0.02:  # Small positive buffer
-            print(f"✅ [PROFIT LOCKED] locked=${locked:.2f} - stopping")
-            return trades_made
+        # ✅ PROFIT SECURED - Continue improving if possible
+        profit_is_locked = locked > 0.02
+        if profit_is_locked:
+            print(f"✅ [PROFIT LOCKED] locked=${locked:.2f} - looking for improvements")
+            # Don't return - keep looking for opportunities to improve further
         
         # ⚠️ PROFIT NOT LOCKED - MUST IMPROVE!
         if remaining_budget < self.min_trade_size:
@@ -1862,6 +2001,21 @@ class PaperTrader:
                     
                     # Only execute if it actually improves locked profit
                     if improvement > 0.5 and new_pair_cost < pair_cost:
+                        if new_pair_cost > 1.0:
+                            remaining_after = remaining_budget - (qty_to_buy * lagging_price)
+                            if remaining_after < self.min_trade_size or not self.can_recover_pair_cost(
+                                up_price,
+                                down_price,
+                                remaining_after,
+                                new_qty_up,
+                                new_cost_up,
+                                new_qty_down,
+                                new_cost_down
+                            ):
+                                return trades_made
+                        # Allow if it improves locked profit or pair cost
+                        if profit_is_locked and improvement < 0.01 and new_pair_cost >= pair_cost:
+                            return trades_made
                         if self.execute_buy(lagging_side, lagging_price, qty_to_buy, timestamp):
                             trades_made.append((lagging_side, lagging_price, qty_to_buy))
                             print(f"🚀 [CATCH-UP] Bought {qty_to_buy:.1f} {lagging_side} @ ${lagging_price:.3f} (below avg ${lagging_avg:.3f}) | "
@@ -1928,6 +2082,24 @@ class PaperTrader:
                     # Extra check: don't make pair_cost worse if it's already bad
                     if pair_cost >= 1.00 and new_pair_cost > pair_cost:
                         continue
+
+                    if new_pair_cost > 1.0:
+                        remaining_after = remaining_budget - trade_usd
+                        if remaining_after < self.min_trade_size or not self.can_recover_pair_cost(
+                            up_price,
+                            down_price,
+                            remaining_after,
+                            new_qty_up,
+                            new_cost_up,
+                            new_qty_down,
+                            new_cost_down
+                        ):
+                            continue
+
+                    if profit_is_locked:
+                        # Allow if it improves pair cost OR locked profit (even slightly)
+                        if new_pair_cost >= current_pair_cost and improvement < 0.01:
+                            continue
                     
                     # Prefer buying the lagging side
                     is_lagging_side = (my_qty < other_qty)
