@@ -1705,14 +1705,25 @@ class PaperTrader:
             if price > price_threshold:
                 return False, 0, f"Need {side} < ${price_threshold:.2f} (pair would be ${potential_pair_cost:.2f})"
             
-            # Buy to match other side for perfect balance
-            target_qty = other_qty
-            max_spend = min(target_qty * price, self.cash * 0.3, remaining_budget + 20)  # Allow slight overspend for balance
-            qty = max_spend / price
+            # Buy to match other side for perfect balance - DYNAMIC SIZING
+            # Calculate exact quantity needed for 1:1 balance
+            needed_qty = other_qty
+            needed_cost = needed_qty * price
             
-            if qty < target_qty * 0.5:
-                # Can't afford enough - buy what we can
-                qty = max(qty, self.min_trade_size / price)
+            # Limit by available cash and budget
+            max_affordable = min(self.cash * 0.3, remaining_budget + 20)
+            
+            if needed_cost <= max_affordable:
+                # We can afford perfect balance - use exact quantity
+                qty = needed_qty
+            else:
+                # Can't afford full balance - buy what we can
+                qty = max_affordable / price
+            
+            # Ensure minimum trade size
+            if qty * price < self.min_trade_size:
+                qty = self.min_trade_size / price
+            
             allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
             if not allowed:
                 return False, 0, reason_block
@@ -1798,9 +1809,24 @@ class PaperTrader:
         if ratio < 0.92:  # We're behind - catch up
             price_threshold = self.max_balance_price if recovery_mode else self.force_balance_threshold
             if price <= price_threshold:
+                # DYNAMIC SIZING: Calculate exact quantity needed to reach 1:1 balance
+                needed_qty = other_qty - my_qty  # Exact difference to balance
+                needed_cost = needed_qty * price
+                
+                # Limit by available budget
                 spend_pct = 0.10 if recovery_mode else 0.05
-                max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
-                qty = min(max_spend / price, max_qty_allowed)
+                max_affordable = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
+                
+                if needed_cost <= max_affordable:
+                    # We can afford exact balance - use precise quantity
+                    qty = min(needed_qty, max_qty_allowed)
+                else:
+                    # Buy what we can afford
+                    qty = min(max_affordable / price, max_qty_allowed)
+                
+                # Ensure minimum trade size
+                if qty * price < self.min_trade_size:
+                    qty = max(self.min_trade_size / price, qty)
                 
                 if qty * price >= self.min_trade_size:
                     new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
