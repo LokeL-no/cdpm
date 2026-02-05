@@ -2,7 +2,7 @@
 """
 Polymarket Multi-Market Bot - BTC, ETH, SOL, XRP Up/Down Tracker
 Web-based interface with real-time updates via WebSocket.
-V10 Strategy with auto market discovery.
+NEW: Dynamic Delta Neutral Arbitrage Strategy - Mean Reversion
 """
 
 import asyncio
@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from aiohttp import web
 import os
+
+# Import new arbitrage strategy
+from arbitrage_strategy import ArbitrageStrategy
 
 # Supported assets
 SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
@@ -262,6 +265,111 @@ HTML_TEMPLATE = """
         
         .connected { background: #22c55e; color: #000; }
         .disconnected { background: #ef4444; color: #fff; }
+
+        .spread-tracker {
+            margin-top: 10px;
+            padding: 10px;
+            background: #0d0d1a;
+            border: 1px solid #1e293b;
+            border-radius: 6px;
+        }
+        .spread-tracker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .spread-tracker-title {
+            color: #60a5fa;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .spread-metrics {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-top: 8px;
+            font-size: 10px;
+        }
+        .spread-metric {
+            text-align: center;
+            padding: 4px;
+            background: #111827;
+            border-radius: 4px;
+        }
+        .spread-metric .sm-label {
+            color: #6b7280;
+            font-size: 9px;
+            text-transform: uppercase;
+        }
+        .spread-metric .sm-value {
+            font-weight: bold;
+            font-size: 12px;
+            margin-top: 2px;
+        }
+        .spread-chart-container {
+            position: relative;
+            width: 100%;
+            height: 80px;
+            margin-top: 6px;
+        }
+        .spread-chart-container canvas {
+            width: 100%;
+            height: 100%;
+        }
+        .mgp-tracker {
+            margin-top: 10px;
+            padding: 10px;
+            background: #0d0d1a;
+            border: 1px solid #1e293b;
+            border-radius: 6px;
+        }
+        .mgp-tracker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .mgp-tracker-title {
+            color: #22c55e;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .mgp-chart-container {
+            position: relative;
+            width: 100%;
+            height: 90px;
+            margin-top: 6px;
+        }
+        .mgp-chart-container canvas {
+            width: 100%;
+            height: 100%;
+        }
+        .mgp-summary {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            margin-top: 8px;
+            font-size: 10px;
+        }
+        .mgp-stat {
+            text-align: center;
+            padding: 4px;
+            background: #111827;
+            border-radius: 4px;
+        }
+        .mgp-stat .ms-label {
+            color: #6b7280;
+            font-size: 9px;
+            text-transform: uppercase;
+        }
+        .mgp-stat .ms-value {
+            font-weight: bold;
+            font-size: 12px;
+            margin-top: 2px;
+        }
     </style>
 </head>
 <body>
@@ -271,7 +379,9 @@ HTML_TEMPLATE = """
         <div class="header">
             <h1>🤖 Polymarket Multi-Market Bot</h1>
             <div style="color: #888; font-size: 12px;">
-                V10 Strategy | Auto Market Discovery | 
+                <span style="color: #3b82f6; font-weight: bold;">
+                💰 MGP ARBITRAGE 💰 | Delta Neutral | Lock Both Scenarios Positive
+                </span> | 
                 <span id="current-time">--:--:--</span>
             </div>
             <div style="margin-top: 10px;">
@@ -434,6 +544,249 @@ HTML_TEMPLATE = """
             };
         }
         
+        function drawSpreadChart(canvasId, zHistory, spreadHistory, bbUpperHist, bbLowerHist, signalHistory) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.parentElement.getBoundingClientRect();
+            const w = rect.width;
+            const h = rect.height;
+            canvas.width = w * dpr;
+            canvas.height = h * dpr;
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            ctx.scale(dpr, dpr);
+
+            const n = zHistory.length;
+            if (n < 2) return;
+
+            // Determine Y range from z-scores
+            let minZ = -3, maxZ = 3;
+            for (const z of zHistory) {
+                if (z < minZ) minZ = z - 0.5;
+                if (z > maxZ) maxZ = z + 0.5;
+            }
+            const rangeZ = maxZ - minZ || 1;
+
+            const padL = 28, padR = 4, padT = 4, padB = 14;
+            const cw = w - padL - padR;
+            const ch = h - padT - padB;
+
+            const xStep = cw / (n - 1);
+            const yOf = (z) => padT + ch - ((z - minZ) / rangeZ) * ch;
+
+            // Background
+            ctx.fillStyle = '#0a0a14';
+            ctx.fillRect(0, 0, w, h);
+
+            // Entry zone bands (z = ±2)
+            const y2p = yOf(2);
+            const y2n = yOf(-2);
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+            ctx.fillRect(padL, padT, cw, y2p - padT);
+            ctx.fillRect(padL, y2n, cw, padT + ch - y2n);
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.06)';
+            ctx.fillRect(padL, y2p, cw, y2n - y2p);
+
+            // Horizontal grid lines at z = -2, 0, +2
+            ctx.strokeStyle = '#1e293b';
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([3, 3]);
+            for (const lvl of [-2, 0, 2]) {
+                const yy = yOf(lvl);
+                ctx.beginPath();
+                ctx.moveTo(padL, yy);
+                ctx.lineTo(padL + cw, yy);
+                ctx.stroke();
+            }
+            ctx.setLineDash([]);
+
+            // Y-axis labels
+            ctx.fillStyle = '#4b5563';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            for (const lvl of [-2, 0, 2]) {
+                ctx.fillText(lvl.toFixed(0), padL - 3, yOf(lvl) + 3);
+            }
+
+            // Signal background markers
+            if (signalHistory && signalHistory.length === n) {
+                for (let i = 0; i < n; i++) {
+                    const sig = signalHistory[i];
+                    if (sig === 'SHORT_UP_LONG_DOWN' || sig === 'LONG_UP_SHORT_DOWN') {
+                        ctx.fillStyle = 'rgba(34, 197, 94, 0.15)';
+                        ctx.fillRect(padL + i * xStep - xStep / 2, padT, xStep, ch);
+                    } else if (sig === 'EXIT_ALL') {
+                        ctx.fillStyle = 'rgba(245, 158, 11, 0.10)';
+                        ctx.fillRect(padL + i * xStep - xStep / 2, padT, xStep, ch);
+                    }
+                }
+            }
+
+            // Z-score line
+            ctx.beginPath();
+            ctx.strokeStyle = '#60a5fa';
+            ctx.lineWidth = 1.5;
+            for (let i = 0; i < n; i++) {
+                const x = padL + i * xStep;
+                const y = yOf(zHistory[i]);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // Current z dot
+            const lastZ = zHistory[n - 1];
+            const dotColor = Math.abs(lastZ) > 2 ? '#f59e0b' : Math.abs(lastZ) > 3 ? '#ef4444' : '#22c55e';
+            ctx.beginPath();
+            ctx.arc(padL + (n - 1) * xStep, yOf(lastZ), 3, 0, Math.PI * 2);
+            ctx.fillStyle = dotColor;
+            ctx.fill();
+
+            // Entry threshold labels
+            ctx.fillStyle = '#ef4444';
+            ctx.font = '8px monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText('+entry', padL + cw - 30, y2p - 2);
+            ctx.fillText('-entry', padL + cw - 30, y2n + 9);
+        }
+
+        function drawMgpChart(canvasId, mgpHistory, pnlUpHistory, pnlDownHistory, arbLocked) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.parentElement.getBoundingClientRect();
+            const w = rect.width;
+            const h = rect.height;
+            canvas.width = w * dpr;
+            canvas.height = h * dpr;
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            ctx.scale(dpr, dpr);
+
+            const n = mgpHistory.length;
+            if (n < 2) return;
+
+            // Determine Y range from all three series
+            const allVals = [...mgpHistory, ...pnlUpHistory, ...pnlDownHistory];
+            let minY = Math.min(...allVals, 0);
+            let maxY = Math.max(...allVals, 0);
+            const pad = Math.max(Math.abs(maxY - minY) * 0.15, 1);
+            minY -= pad;
+            maxY += pad;
+            const rangeY = maxY - minY || 1;
+
+            const padL = 36, padR = 4, padT = 4, padB = 14;
+            const cw = w - padL - padR;
+            const ch = h - padT - padB;
+
+            const xStep = cw / (n - 1);
+            const yOf = (v) => padT + ch - ((v - minY) / rangeY) * ch;
+
+            // Background
+            ctx.fillStyle = '#0a0a14';
+            ctx.fillRect(0, 0, w, h);
+
+            // Positive/negative zones
+            const y0 = yOf(0);
+            if (y0 > padT && y0 < padT + ch) {
+                ctx.fillStyle = 'rgba(34, 197, 94, 0.05)';
+                ctx.fillRect(padL, padT, cw, y0 - padT);
+                ctx.fillStyle = 'rgba(239, 68, 68, 0.05)';
+                ctx.fillRect(padL, y0, cw, padT + ch - y0);
+            }
+
+            // Zero line
+            ctx.strokeStyle = '#374151';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(padL, y0);
+            ctx.lineTo(padL + cw, y0);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Y-axis labels
+            ctx.fillStyle = '#4b5563';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('$0', padL - 3, y0 + 3);
+            const topVal = maxY - pad / 2;
+            const botVal = minY + pad / 2;
+            ctx.fillText('$' + topVal.toFixed(1), padL - 3, padT + 10);
+            ctx.fillText('$' + botVal.toFixed(1), padL - 3, padT + ch - 2);
+
+            // Helper to draw a line
+            function drawLine(data, color, width, dash) {
+                if (data.length < n) return;
+                ctx.beginPath();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = width;
+                if (dash) ctx.setLineDash(dash);
+                for (let i = 0; i < n; i++) {
+                    const x = padL + i * xStep;
+                    const y = yOf(data[i]);
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                if (dash) ctx.setLineDash([]);
+            }
+
+            // PnL if UP wins (dashed blue)
+            drawLine(pnlUpHistory, 'rgba(96, 165, 250, 0.4)', 1, [3, 3]);
+            // PnL if DOWN wins (dashed orange)
+            drawLine(pnlDownHistory, 'rgba(251, 146, 60, 0.4)', 1, [3, 3]);
+            // MGP line (solid green/red)
+            const lastMgp = mgpHistory[n - 1];
+            const mgpColor = lastMgp >= 0 ? '#22c55e' : '#ef4444';
+            drawLine(mgpHistory, mgpColor, 2, null);
+
+            // Fill area under MGP line to zero
+            ctx.beginPath();
+            ctx.moveTo(padL, y0);
+            for (let i = 0; i < n; i++) {
+                ctx.lineTo(padL + i * xStep, yOf(mgpHistory[i]));
+            }
+            ctx.lineTo(padL + (n - 1) * xStep, y0);
+            ctx.closePath();
+            ctx.fillStyle = lastMgp >= 0 ? 'rgba(34, 197, 94, 0.12)' : 'rgba(239, 68, 68, 0.12)';
+            ctx.fill();
+
+            // Current MGP dot
+            const dotColor = lastMgp >= 0 ? '#22c55e' : '#ef4444';
+            ctx.beginPath();
+            ctx.arc(padL + (n - 1) * xStep, yOf(lastMgp), 4, 0, Math.PI * 2);
+            ctx.fillStyle = dotColor;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // Value label at dot
+            ctx.fillStyle = dotColor;
+            ctx.font = 'bold 10px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('$' + lastMgp.toFixed(2), padL + (n - 1) * xStep - 6, yOf(lastMgp) - 6);
+
+            // ARB LOCKED banner
+            if (arbLocked) {
+                ctx.fillStyle = 'rgba(34, 197, 94, 0.15)';
+                ctx.fillRect(padL, padT, cw, ch);
+                ctx.fillStyle = '#22c55e';
+                ctx.font = 'bold 10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('LOCKED', padL + cw / 2, padT + 12);
+            }
+
+            // Legend
+            ctx.font = '8px monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = mgpColor; ctx.fillText('--- MGP', padL + 4, padT + ch + 11);
+            ctx.fillStyle = 'rgba(96, 165, 250, 0.6)'; ctx.fillText('-- UP', padL + 50, padT + ch + 11);
+            ctx.fillStyle = 'rgba(251, 146, 60, 0.6)'; ctx.fillText('-- DN', padL + 82, padT + ch + 11);
+        }
+
         function updateUI(data) {
             // Update global stats
             document.getElementById('starting-balance').textContent = data.starting_balance.toFixed(2);
@@ -607,7 +960,8 @@ HTML_TEMPLATE = """
                             </div>
                             ` : ''}
                             <div class="market-pnl">
-                                <span style="color: #888;">Locked PnL: </span>
+                                ${pt.arb_locked ? `<div style="margin-bottom: 6px; padding: 4px 8px; background: rgba(34, 197, 94, 0.15); border: 1px solid #22c55e; border-radius: 4px; display: inline-block;"><span style="color: #22c55e; font-weight: bold; font-size: 12px;">🔒 ARBITRAGE LOCKED</span></div>` : (pt.deficit !== undefined && pt.deficit > 0 ? `<div style="margin-bottom: 6px; font-size: 10px; color: #f59e0b;">Deficit: ${pt.deficit.toFixed(1)} shares | Max lock price: $${(pt.max_price_for_lock || 0).toFixed(3)}</div>` : '')}
+                                <span style="color: #888;">MGP (Floor): </span>
                                 <span class="${lockedPnl >= 0 ? 'profit' : 'loss'}" style="font-weight: bold;">
                                     ${lockedPnl >= 0 ? '+' : ''}$${lockedPnl.toFixed(2)}
                                 </span>
@@ -618,21 +972,112 @@ HTML_TEMPLATE = """
                             ${pt.current_mode && pt.market_status === 'open' ? `
                             <div style="margin-top: 10px; padding: 8px; background: rgba(59, 130, 246, 0.1); border-radius: 4px; border-left: 3px solid #3b82f6;">
                                 <div style="color: #60a5fa; font-weight: bold; font-size: 0.75rem; text-transform: uppercase;">
-                                    ${pt.current_mode === 'priority_fix' ? '🎯 PRIORITY FIX' : 
+                                    ${pt.current_mode === 'mgp_lock' ? '🔒 MGP LOCKING' :
+                                      pt.current_mode === 'mgp_maximize' ? '📈 MGP MAXIMIZE' :
+                                      pt.current_mode === 'accumulate' ? '💰 ACCUMULATING' :
+                                      pt.current_mode === 'priority_fix' ? '🎯 PRIORITY FIX' : 
                                       pt.current_mode === 'improve' ? '📉 IMPROVING' :
                                       pt.current_mode === 'arbitrage' ? '💰 ARBITRAGE' :
+                                      pt.current_mode === 'seeking_arb' ? '💰 SEEKING ARB' :
                                       pt.current_mode === 'hedge' ? '🔒 HEDGING' :
+                                      pt.current_mode === 'rebalancing' ? '⚖️ REBALANCING' :
                                       pt.current_mode === 'rebalance' ? '⚖️ REBALANCING' :
                                       pt.current_mode === 'optimize' ? '⚡ OPTIMIZING' :
+                                      pt.current_mode === 'improving' ? '📉 IMPROVING' :
+                                      pt.current_mode === 'exit_wait' ? '⏳ EXIT WAIT' :
                                       pt.current_mode === 'entry' ? '🎯 ENTERING' : '💤 IDLE'}
                                 </div>
                                 <div style="color: #9ca3af; font-size: 0.7rem; margin-top: 3px;">${pt.mode_reason || 'Monitoring market'}</div>
+                            </div>
+                            ` : ''}
+                            ${pt.market_status === 'open' ? `
+                            <div class="mgp-tracker">
+                                <div class="mgp-tracker-header">
+                                    <span class="mgp-tracker-title">📈 MGP Tracker</span>
+                                    <span style="font-size: 10px; color: ${pt.arb_locked ? '#22c55e' : (pt.mgp !== undefined && pt.mgp >= 0 ? '#22c55e' : '#ef4444')};">
+                                        ${pt.arb_locked ? '🔒 LOCKED' : (pt.mgp !== undefined ? '$' + pt.mgp.toFixed(2) : '--')}
+                                    </span>
+                                </div>
+                                <div class="mgp-chart-container">
+                                    <canvas id="mgp-chart-${slug.replace(/[^a-zA-Z0-9]/g, '_')}"></canvas>
+                                </div>
+                                <div class="mgp-summary">
+                                    <div class="mgp-stat">
+                                        <div class="ms-label">If UP wins</div>
+                                        <div class="ms-value" style="color: ${(pt.pnl_if_up_wins || 0) >= 0 ? '#22c55e' : '#ef4444'};">
+                                            ${(pt.pnl_if_up_wins || 0) >= 0 ? '+' : ''}$${(pt.pnl_if_up_wins || 0).toFixed(2)}
+                                        </div>
+                                    </div>
+                                    <div class="mgp-stat">
+                                        <div class="ms-label">If DOWN wins</div>
+                                        <div class="ms-value" style="color: ${(pt.pnl_if_down_wins || 0) >= 0 ? '#22c55e' : '#ef4444'};">
+                                            ${(pt.pnl_if_down_wins || 0) >= 0 ? '+' : ''}$${(pt.pnl_if_down_wins || 0).toFixed(2)}
+                                        </div>
+                                    </div>
+                                    <div class="mgp-stat">
+                                        <div class="ms-label">Deficit</div>
+                                        <div class="ms-value" style="color: ${(pt.deficit || 0) > 0 ? '#f59e0b' : '#6b7280'};">
+                                            ${(pt.deficit || 0) > 0 ? (pt.deficit || 0).toFixed(1) + ' sh' : '✓ 0'}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            ` : ''}
+                            ${pt.market_status === 'open' ? `
+                            <div class="spread-tracker">
+                                <div class="spread-tracker-header">
+                                    <span class="spread-tracker-title">📊 Spread Engine</span>
+                                    <span style="font-size: 10px; color: ${pt.spread_engine_ready ? '#22c55e' : '#f59e0b'};">
+                                        ${pt.spread_engine_ready ? '● LIVE' : '○ WARMING UP'}
+                                    </span>
+                                </div>
+                                <div class="spread-chart-container">
+                                    <canvas id="spread-chart-${slug.replace(/[^a-zA-Z0-9]/g, '_')}"></canvas>
+                                </div>
+                                <div class="spread-metrics">
+                                    <div class="spread-metric">
+                                        <div class="sm-label">Z-Score</div>
+                                        <div class="sm-value" style="color: ${Math.abs(pt.z_score || 0) > 2 ? '#f59e0b' : Math.abs(pt.z_score || 0) > 3 ? '#ef4444' : '#22c55e'};">
+                                            ${(pt.z_score || 0).toFixed(2)}
+                                        </div>
+                                    </div>
+                                    <div class="spread-metric">
+                                        <div class="sm-label">Beta (β)</div>
+                                        <div class="sm-value" style="color: #a78bfa;">${(pt.spread_beta || 1).toFixed(3)}</div>
+                                    </div>
+                                    <div class="spread-metric">
+                                        <div class="sm-label">Signal</div>
+                                        <div class="sm-value" style="color: ${(pt.spread_signal === 'SHORT_UP_LONG_DOWN' || pt.spread_signal === 'LONG_UP_SHORT_DOWN') ? '#22c55e' : pt.spread_signal === 'EXIT_ALL' ? '#f59e0b' : '#6b7280'}; font-size: 9px;">
+                                            ${pt.spread_signal === 'SHORT_UP_LONG_DOWN' ? '↓UP ↑DN' : pt.spread_signal === 'LONG_UP_SHORT_DOWN' ? '↑UP ↓DN' : pt.spread_signal === 'EXIT_ALL' ? 'EXIT' : 'NONE'}
+                                        </div>
+                                    </div>
+                                    <div class="spread-metric">
+                                        <div class="sm-label">Pos Δ%</div>
+                                        <div class="sm-value" style="color: ${(pt.spread_delta_pct || 0) > 0 ? '#f59e0b' : '#6b7280'};">
+                                            ${(pt.spread_delta_pct || 0).toFixed(0)}%
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                             ` : ''}
                         </div>
                     `;
                 }
                 marketsGrid.innerHTML = html;
+
+                // Draw spread charts after DOM update
+                for (const [slug, market] of Object.entries(data.active_markets)) {
+                    const pt = market.paper_trader;
+                    if (pt.market_status === 'open' && pt.z_history && pt.z_history.length > 1) {
+                        const canvasId = 'spread-chart-' + slug.replace(/[^a-zA-Z0-9]/g, '_');
+                        drawSpreadChart(canvasId, pt.z_history, pt.spread_history_arr, pt.bb_upper_history, pt.bb_lower_history, pt.signal_history);
+                    }
+                    // Draw MGP charts
+                    if (pt.market_status === 'open' && pt.mgp_history && pt.mgp_history.length > 1) {
+                        const mgpCanvasId = 'mgp-chart-' + slug.replace(/[^a-zA-Z0-9]/g, '_');
+                        drawMgpChart(mgpCanvasId, pt.mgp_history, pt.pnl_up_history || [], pt.pnl_down_history || [], pt.arb_locked || false);
+                    }
+                }
             }
             
             // Update history
@@ -3090,7 +3535,9 @@ class MarketTracker:
         self.last_up_bid = 0.0
         self.last_down_bid = 0.0
         self.market_budget = market_budget
-        self.paper_trader = PaperTrader(cash_ref, slug, market_budget)
+        # NEW: Use ArbitrageStrategy instead of old PaperTrader
+        self.paper_trader = ArbitrageStrategy(market_budget=market_budget, starting_balance=market_budget)
+        self.paper_trader.cash_ref = cash_ref  # Share cash reference
         self.initialized = False
         self.last_update = 0
 
@@ -3431,7 +3878,8 @@ class MultiMarketBot:
                 # DEBUG: Print prices and why no trade
                 pt = tracker.paper_trader
                 if pt.qty_up == 0 and pt.qty_down == 0:
-                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | pair=${tracker.up_price+tracker.down_price:.3f} | cheap<${pt.cheap_threshold}")
+                    spread = abs(tracker.up_price - tracker.down_price) if tracker.up_price and tracker.down_price else 0
+                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode}")
                 
                 trades = tracker.paper_trader.check_and_trade(
                     tracker.up_price, 
