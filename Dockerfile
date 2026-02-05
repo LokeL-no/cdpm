@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Kopier bot-koden
 COPY web_bot_multi.py .
+COPY arbitrage_strategy.py .
+COPY spread_engine.py .
 
 # Eksponér WebSocket-porten
 EXPOSE 8080
