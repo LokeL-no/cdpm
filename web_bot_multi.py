@@ -571,10 +571,11 @@ HTML_TEMPLATE = """
                                             } else {
                                                 const ratio = Math.max(pt.qty_up, pt.qty_down) / Math.min(pt.qty_up, pt.qty_down);
                                                 // Position delta: |A-B| / (A+B) * 100
+                                                // v11: STRICTER - 2% ideal, 5% max
                                                 const delta_pct = (Math.abs(pt.qty_up - pt.qty_down) / (pt.qty_up + pt.qty_down) * 100);
-                                                const balanceColor = delta_pct <= 5 ? '#22c55e' : delta_pct <= 15 ? '#f59e0b' : '#ef4444';
-                                                const balanceIcon = delta_pct <= 5 ? '✅' : delta_pct <= 15 ? '⚠️' : '🔴';
-                                                const balanceStatus = delta_pct <= 5 ? 'BALANCED' : delta_pct <= 15 ? 'OK' : 'MUST BALANCE';
+                                                const balanceColor = delta_pct <= 2 ? '#22c55e' : delta_pct <= 5 ? '#f59e0b' : '#ef4444';
+                                                const balanceIcon = delta_pct <= 2 ? '✅' : delta_pct <= 5 ? '⚠️' : '🔴';
+                                                const balanceStatus = delta_pct <= 2 ? 'BALANCED' : delta_pct <= 5 ? 'OK' : 'MUST BALANCE';
                                                 return `<span style="color: ${balanceColor}; font-weight: bold;">${balanceIcon} ${balanceStatus}: ${delta_pct.toFixed(1)}% (${ratio.toFixed(2)}x)</span>`;
                                             }
                                         })()}
@@ -746,9 +747,10 @@ class PaperTrader:
         # Prefer "paired" compounding once profit is locked:
         # Buying equal UP+DOWN at a favorable combined price increases locked profit
         # while keeping worst-case protected.
-        self.pair_growth_max_pair_price = 0.98   # Only compound when (up_price + down_price) <= this
-        self.pair_growth_budget_fraction = 0.50  # Use up to 50% of remaining budget per compound attempt
-        self.pair_growth_min_improvement = 0.01  # Require at least $0.01 locked-profit improvement
+        # v12: More aggressive compounding
+        self.pair_growth_max_pair_price = 0.99   # Only compound when (up_price + down_price) <= this (WAS 0.98)
+        self.pair_growth_budget_fraction = 0.70  # Use up to 70% of remaining budget per compound attempt (WAS 0.50)
+        self.pair_growth_min_improvement = 0.005 # Require at least $0.005 improvement (WAS 0.01)
         self.growth_min_locked_after_trade = 0.00  # One-sided growth must keep locked profit >= 0
         
         # === TRADING MODE TRACKING ===
@@ -810,27 +812,29 @@ class PaperTrader:
         self.prefer_better_average = True  # Prefer more qty on side with better average
         
         # === PROFIT GROWTH MODE ===
+        # v12: AGGRESSIVE profit growth - never stop trading while market is open!
         # After securing locked profit, continue buying to maximize upside
         self.enable_profit_growth = True
-        self.min_locked_for_growth = 0.01   # Min $0.01 locked profit to enable growth mode (WAS 3.0)
-        self.min_target_locked_profit = 3.0  # Target: work to secure at least $3 locked profit
-        self.growth_budget_pct = 0.60      # Use up to 60% of locked profit for growth trades (WAS 0.35)
-        self.growth_max_pair_cost = 0.98   # Stop growth if pair approaches $0.98
-        self.growth_max_pair_cost_low_profit = 0.995  # Allow higher pair cost when locked < $3
+        self.min_locked_for_growth = 0.001  # Almost any profit enables growth (WAS 0.01)
+        self.min_target_locked_profit = 1.0  # Lower target: $1 locked is good start (WAS 3.0)
+        self.growth_budget_pct = 0.70      # Use up to 70% of budget for growth trades (WAS 0.60)
+        self.growth_max_pair_cost = 0.99   # Allow growth up to 0.99 pair (WAS 0.98)
+        self.growth_max_pair_cost_low_profit = 0.998  # Be very aggressive when building profit (WAS 0.995)
         self.growth_favor_probability = True  # Favor side with higher market probability
         self.growth_favor_better_avg = True  # Favor side with better average
-        self.growth_max_single_trade = 30.0  # Allow larger trades in growth mode (WAS 20.0)
+        self.growth_max_single_trade = 40.0  # Allow larger trades in growth mode (WAS 30.0)
         
         # === GUARANTEED PROFIT PARAMETERS ===
         # NEW STRATEGY: Ensure min(qty_up, qty_down) > total_spent
         # This guarantees profit regardless of outcome!
         # Position Delta % = |UP - DOWN| / (UP + DOWN) × 100
-        self.ideal_balance_delta_pct = 5.0   # IDEAL: Keep position delta ≤ 5%
-        self.max_flex_delta_pct = 15.0       # MAX FLEX: Allow up to 15% temporarily
-        self.critical_ratio = 2.00           # CRITICAL: Stop buying larger side at 2x imbalance
-        self.emergency_ratio = 2.50          # EMERGENCY: Absolute hard stop at 2.5x
-        self.emergency_hedge_ratio = 3.00    # Force emergency hedge even at pair 1.05 when ratio > 3x
-        self.max_qty_ratio = 1.30            # Allow 30% strategic imbalance for better averages
+        # v11: ULTRA STRICT BALANCE - Losses are from imbalance!
+        self.ideal_balance_delta_pct = 2.0   # IDEAL: Keep position delta ≤ 2% (WAS 5%)
+        self.max_flex_delta_pct = 5.0        # MAX FLEX: Allow up to 5% temporarily (WAS 15%)
+        self.critical_ratio = 1.20           # CRITICAL: Stop buying larger side at 1.2x imbalance (WAS 2.0)
+        self.emergency_ratio = 1.35          # EMERGENCY: Absolute hard stop at 1.35x (WAS 2.5)
+        self.emergency_hedge_ratio = 1.50    # Force emergency hedge even at pair 1.05 when ratio > 1.5x (WAS 3.0)
+        self.max_qty_ratio = 1.10            # Allow only 10% strategic imbalance (WAS 30%)
         
         # === FEE AWARENESS ===
         # Polymarket uses dynamic fees: highest at $0.50 (1.56%), lowest at extremes
@@ -1708,10 +1712,11 @@ class PaperTrader:
         time_since_first = time.time() - self.first_trade_time if self.first_trade_time > 0 else 0
         strict_balance_mode = time_since_first > self.balance_enforcement_delay
         
-        # CRITICAL: HARD STOP - Never improve if we're already 2x+ larger than other side
+        # CRITICAL: HARD STOP - Never improve if we're already 1.2x+ larger than other side
+        # v11: Much stricter - balance is EVERYTHING!
         if other_qty > 0:
             current_ratio = my_qty / other_qty
-            if current_ratio > 2.0:  # Hard stop at 2x imbalance
+            if current_ratio > 1.15:  # Hard stop at 1.15x imbalance (WAS 2.0x)
                 return False, 0, f"🚨 HARD STOP: ratio {current_ratio:.2f}x - MUST balance {other_side} first!"
             
             # CRITICAL: DELTA PROTECTION - Stricter after grace period
@@ -2079,33 +2084,44 @@ class PaperTrader:
         TARGET_PAIR_COST = 0.93
         
         # === SUCCESS CHECK ===
+        # v12: NEVER stop trading just because we have profit!
+        # Always look for ways to GROW profit until market closes
         profit_growth_mode = guaranteed_profit > 0 and current_pair_cost < TARGET_PAIR_COST
-        if profit_growth_mode and not self.allow_profit_growth:
-            return False, 0, f"✅ DONE! profit=${guaranteed_profit:.2f}, pair=${current_pair_cost:.3f}"
+        # REMOVED: No longer stop when profit is locked - keep growing!
+        # if profit_growth_mode and not self.allow_profit_growth:
+        #     return False, 0, f"✅ DONE! profit=${guaranteed_profit:.2f}, pair=${current_pair_cost:.3f}"
 
         def profit_growth_allows(new_locked: float, new_pair_cost: float) -> bool:
+            """v12: Much more permissive - allow trades that don't HURT us significantly"""
             if not profit_growth_mode:
                 return True
-            # Allow if pair cost improves OR locked profit increases
+            # Allow if pair cost improves
             if new_pair_cost < current_pair_cost:
                 return True
+            # Allow if locked profit increases
             if new_locked > guaranteed_profit:
+                return True
+            # v12: Also allow if we maintain at least 90% of locked profit
+            # and pair cost doesn't get too bad (< 0.99)
+            profit_preserved = new_locked >= guaranteed_profit * 0.90
+            pair_still_safe = new_pair_cost < 0.99
+            if profit_preserved and pair_still_safe:
                 return True
             return False
         
         # === NEED TO IMPROVE ===
         # Strategy: Buy whichever side helps reach the goal
         
-        # RULE 0: EMERGENCY STOP - Never allow ratio > 2.5x
+        # RULE 0: EMERGENCY STOP - Never allow ratio > 1.35x (v11: was 2.5x)
         if ratio > self.emergency_ratio:
             return False, 0, f"🚨 EMERGENCY STOP: Ratio {ratio:.2f}x > {self.emergency_ratio}x - MUST buy {other_side} first!"
         
-        # RULE 0.5: CRITICAL - Don't buy larger side when ratio > 2.0x
+        # RULE 0.5: CRITICAL - Don't buy larger side when ratio > 1.2x (v11: was 2.0x)
         if ratio > self.critical_ratio and my_qty > other_qty:
             return False, 0, f"🛑 CRITICAL: Ratio {ratio:.2f}x - cannot buy {side}, must balance with {other_side} first"
         
-        # RULE 1: Don't exceed ratio of 1.3 under normal conditions
-        if ratio > 1.3 and my_qty > other_qty:
+        # RULE 1: Don't exceed ratio of 1.10 under normal conditions (v11: was 1.3)
+        if ratio > 1.10 and my_qty > other_qty:
             return False, 0, f"⛔ Ratio {ratio:.2f}x - need to buy {other_side}"
         
         # RULE 1.5: PRIORITIZE balance when position delta > 5%
@@ -2131,9 +2147,10 @@ class PaperTrader:
                         return True, qty, f"⚖️ BALANCE (5% rule): delta {current_delta_pct:.1f}%→{new_delta_pct:.1f}%, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
         # RULE 2: If we're the lagging side, buy to catch up (increases min_qty!)
-        if ratio < 0.95:
+        # v11: Trigger rebalance earlier at 0.98 ratio (WAS 0.95)
+        if ratio < 0.98:
             qty_to_balance = other_qty - my_qty
-            max_spend = min(self.cash * 0.6, qty_to_balance * price, remaining_budget)
+            max_spend = min(self.cash * 0.7, qty_to_balance * price, remaining_budget)  # 70% of cash for balance
             qty = max_spend / price
             
             if qty * price >= self.min_trade_size:
@@ -2161,7 +2178,8 @@ class PaperTrader:
                     return True, qty, f"📉 REDUCE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f}, locked ${guaranteed_profit:.2f}→${new_locked:.2f}"
         
         # RULE 4: If pair_cost < TARGET, buy cheap to grow position
-        if price <= self.cheap_threshold and ratio <= 1.15:
+        # v11: Only allow growth if almost balanced (ratio <= 1.05, was 1.15)
+        if price <= self.cheap_threshold and ratio <= 1.05:
             max_spend = min(self.cash * 0.3, self.max_single_trade, remaining_budget)
             qty = max_spend / price
             
@@ -2228,11 +2246,11 @@ class PaperTrader:
         trades = []
         
         # Calculate growth budget - use available budget
-        # We process available budget instead of limiting to locked profit %
+        # v12: More aggressive - use 70% of remaining budget
         growth_budget = min(
-            remaining_budget * 0.50,  # Use up to 50% of remaining budget per trade
+            remaining_budget * 0.70,  # Use up to 70% of remaining budget per trade (WAS 50%)
             self.growth_max_single_trade,
-            self.affordable_cash(0.50) # Ensure we have actual cash
+            self.affordable_cash(0.70) # Ensure we have actual cash
         )
         
         if growth_budget < self.min_trade_size:
@@ -2274,16 +2292,17 @@ class PaperTrader:
             down_score += discount * 30
         
         # Choose side to grow
-        if up_score > down_score and up_score > 5:
+        # v12: Lower score requirement from 5 to 2 - be more willing to grow
+        if up_score > down_score and up_score > 2:
             growth_side = 'UP'
             growth_price = up_price
             opposing_price = down_price
-            reason = f"Growing UP: prob={prob_up:.0%}, avg_advantage=${avg_advantage_up:.3f}, score={up_score:.1f}"
-        elif down_score > 5:
+            reason = f"Growing UP: prob={prob_up:.0%}, avg_adv=${avg_advantage_up:.3f}, score={up_score:.1f}"
+        elif down_score > 2:
             growth_side = 'DOWN'
             growth_price = down_price
             opposing_price = up_price
-            reason = f"Growing DOWN: prob={prob_down:.0%}, avg_advantage=${avg_advantage_down:.3f}, score={down_score:.1f}"
+            reason = f"Growing DOWN: prob={prob_down:.0%}, avg_adv=${avg_advantage_down:.3f}, score={down_score:.1f}"
         else:
             return trades  # No clear advantage
         
@@ -2680,25 +2699,30 @@ class PaperTrader:
                     trades_made.extend(growth_trades)
                     return trades_made
             
-            # Don't return - keep looking for opportunities to improve further
+            # v12: Even with profit locked, keep looking for favorable opportunities!
+            # If price drops significantly below our average, we can grow profit further
+            print(f"📈 [GROW SCAN] Searching for growth opportunities (pair=${pair_cost:.3f}, locked=${locked:.2f})")
         
         # ⚠️ PROFIT NOT LOCKED - MUST IMPROVE!
         if remaining_budget < self.min_trade_size:
             print(f"⚠️ [NO BUDGET] locked=${locked:.2f} but only ${remaining_budget:.2f} budget left!")
             return trades_made
         
-        # === DYNAMIC WORST-SIDE PRIORITIZATION (when profit NOT locked) ===
+        # === DYNAMIC WORST-SIDE PRIORITIZATION ===
+        # v12: Always run this, even with profit locked - we want to GROW profit!
+        worst_side, severity, recommended_spend, priority_reason = self.evaluate_worst_positioned_side(up_price, down_price)
+        
+        # Only log when not profit-locked (reduce noise)
         if not profit_is_locked:
-            worst_side, severity, recommended_spend, priority_reason = self.evaluate_worst_positioned_side(up_price, down_price)
-            
             print(f"🔍 [PRIORITY CHECK] worst={worst_side}, severity={severity:.1f}, spend=${recommended_spend:.2f}, reason={priority_reason}")
-            
-            # Reduce spending if in conservative mode
-            if in_conservative_mode and recommended_spend > 0:
-                recommended_spend = min(recommended_spend, self.max_single_trade * 0.5)
+        
+        # Reduce spending if in conservative mode
+        if in_conservative_mode and recommended_spend > 0:
+            recommended_spend = min(recommended_spend, self.max_single_trade * 0.5)
+            if not profit_is_locked:
                 print(f"   Conservative mode: reduced spend to ${recommended_spend:.2f}")
-            
-            if worst_side and severity > 2.0 and recommended_spend >= self.min_trade_size:
+        
+        if worst_side and severity > 2.0 and recommended_spend >= self.min_trade_size:
                 worst_price = up_price if worst_side == 'UP' else down_price
                 opp_price = down_price if worst_side == 'UP' else up_price
                 worst_avg = self.avg_up if worst_side == 'UP' else self.avg_down

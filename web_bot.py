@@ -1367,11 +1367,12 @@ class PaperTrader:
         
         # === BALANCE IS KING - THE KEY TO PROFIT ===
         # Perfect balance = profit guarantee with pair_cost < $1.00
-        self.max_qty_ratio = 1.15       # Strict: max 15% imbalance
-        self.emergency_ratio = 1.30     # Emergency max when recovering
-        self.recovery_ratio = 1.50      # Max ratio when fixing pair_cost
+        # v11: ULTRA STRICT BALANCE - Losses come from imbalance!
+        self.max_qty_ratio = 1.08       # STRICT: max 8% imbalance (WAS 15%)
+        self.emergency_ratio = 1.15     # Emergency max when recovering (WAS 1.30)
+        self.recovery_ratio = 1.25      # Max ratio when fixing pair_cost (WAS 1.50)
         self.target_qty_ratio = 1.0     # Perfect balance
-        self.rebalance_trigger = 1.08   # Start rebalancing at 8% imbalance
+        self.rebalance_trigger = 1.03   # Start rebalancing at 3% imbalance (WAS 8%)
         self.max_position_pct = 0.35    # Max 35% of balance per market
         
     @property
@@ -1628,15 +1629,16 @@ class PaperTrader:
                         return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
         # === REBALANCING: Buy lagging side ===
-        if ratio < 0.92:  # We're behind - catch up
+        # v11: Trigger earlier at 0.97 ratio (WAS 0.92)
+        if ratio < 0.97:  # We're behind - catch up
             price_threshold = self.max_balance_price if recovery_mode else self.force_balance_threshold
             if price <= price_threshold:
                 # DYNAMIC SIZING: Calculate exact quantity needed to reach 1:1 balance
                 needed_qty = other_qty - my_qty  # Exact difference to balance
                 needed_cost = needed_qty * price
                 
-                # Limit by available budget
-                spend_pct = 0.10 if recovery_mode else 0.05
+                # Limit by available budget - MORE aggressive for balance!
+                spend_pct = 0.15 if recovery_mode else 0.10  # Increased from 0.10/0.05
                 max_affordable = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
                 
                 if needed_cost <= max_affordable:
@@ -1665,7 +1667,8 @@ class PaperTrader:
                         return True, qty, f"{prefix} REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
         
         # === CHEAP ACCUMULATION: Very cheap prices ===
-        if price < self.very_cheap_threshold and ratio < 1.1:
+        # v11: Only accumulate cheap when very balanced (ratio < 1.05, WAS 1.1)
+        if price < self.very_cheap_threshold and ratio < 1.05:
             spend_pct = 0.08 if recovery_mode else 0.04
             max_spend = min(self.cash * spend_pct, self.max_single_trade, remaining_budget)
             qty = min(max_spend / price, max_qty_allowed)
