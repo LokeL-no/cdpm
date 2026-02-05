@@ -774,19 +774,19 @@ class PaperTrader:
         # Key insight: Buying more at lower price LOWERS the average!
         # Example: avg_UP=$0.46, buy more @$0.38 → new avg ~$0.42
         # Now DOWN only needs to be <$0.58 instead of <$0.54!
-        self.improvement_threshold = 0.001   # Buy more if price is 0.1 cents below average (VERY LOW!)
-        self.min_improvement_pct = 0.005     # Or 0.5% below average (VERY LOW!)
+        self.improvement_threshold = 0.005   # Buy more if price is 0.5 cents below average (was 0.001)
+        self.min_improvement_pct = 0.01      # Or 1% below average (was 0.005)
         self.force_improve_pct = 0.05        # Force average-down if price drops 5%+ vs avg
         self.max_imbalance_for_improvement = 3.0  # Max qty ratio during improvement phase
-        self.improvement_trade_pct = 0.005    # Use only 0.5% of budget per improvement (was 1%)
+        self.improvement_trade_pct = 0.01     # Use 1% of budget per improvement (was 0.005)
         
         # Position sizing - scaled to bankroll
-        self.min_trade_size = 0.10       # Polymarket minimum (~$0.10)
-        self.max_single_trade = 15.0     # Cap at $15 per trade (was $25)
-        self.cooldown_seconds = 3        # Slow down: 3 seconds between trades (was 1)
+        self.min_trade_size = 1.00       # Larger min trade to reduce fees (was $0.10)
+        self.max_single_trade = 25.0     # Cap at $25 per trade (was $15)
+        self.cooldown_seconds = 8        # Slow down: 8 seconds between trades (was 3) - fewer but bigger trades
         self.last_trade_time = 0
         self.first_trade_time = 0
-        self.initial_trade_usd = 3.0     # Start with just $3 (was $5)
+        self.initial_trade_usd = 5.0     # Start with $5 (was $3) - larger initial trades
         self.max_position_pct = 0.85     # Use max 85% of budget (keep 15% reserve)
         self.force_balance_after_seconds = 120
         
@@ -802,9 +802,10 @@ class PaperTrader:
         
         # === SPREAD-AWARE TRADING ===
         # Key insight: High spread = good opportunity to buy cheap side
+        # BUT: Don't over-favor cheap side - we need balance on BOTH sides!
         self.high_spread_threshold = 0.35  # Was 0.25, now 0.35 (harder to trigger)
         self.medium_spread_threshold = 0.25  # Was 0.15, now 0.25
-        self.spread_multiplier = 1.2  # Was 2.0, now only 1.2x boost (much less aggressive)
+        self.spread_multiplier = 1.1  # Was 1.2, now only 1.1x boost (even less aggressive)
         
         # === STRATEGIC IMBALANCE (Asymmetric PnL) ===
         # Don't always aim for perfect 1:1 - accept imbalance if it gives better averages
@@ -859,7 +860,8 @@ class PaperTrader:
         # CRITICAL: Always keep enough cash to hedge entire position to break-even
         # Formula: max_spend = budget * min_expected_avg_price
         # With avg floor ~$0.15: max_spend = $200 * 0.15 = $30
-        self.max_spend_per_side = 35.0        # Hard limit per side ($35 of $200)
+        # INCREASED: Was $35, now $50 to allow better positioning
+        self.max_spend_per_side = 50.0        # Hard limit per side ($50 of $200)
         self.breakeven_hedge_price = 0.90     # Worst case hedge price assumption
         self.enable_breakeven_check = True    # Enable break-even reserve check
         
@@ -877,13 +879,13 @@ class PaperTrader:
         
         # === ACCELERATED LADDER ===
         # Buy more when price is low to drag down average faster
-        # But with lower amounts to stay within break-even limits
+        # Larger amounts to minimize number of trades (reduce fees)
         self.ladder_tiers = [
             # (price_threshold, spend_amount)
-            (0.10, 4.0),    # Below $0.10: spend $4 per rung (WAS $5)
-            (0.20, 3.0),    # $0.10 - $0.20: spend $3 per rung (WAS $4)
-            (0.30, 2.5),    # $0.20 - $0.30: spend $2.5 per rung (WAS $3)
-            (1.00, 1.5),    # Above $0.30: spend $1.5 per rung (WAS $2)
+            (0.10, 6.0),    # Below $0.10: spend $6 per rung (was $4) - fewer trades
+            (0.20, 4.5),    # $0.10 - $0.20: spend $4.5 per rung (was $3)
+            (0.30, 3.0),    # $0.20 - $0.30: spend $3 per rung (was $2.5)
+            (1.00, 2.0),    # Above $0.30: spend $2 per rung (was $1.5)
         ]
 
         # === IMPROVEMENT THROTTLE ===
@@ -1520,13 +1522,14 @@ class PaperTrader:
             if down_is_lagging:
                 down_score += abs(unrealized) * 2
         
-        # === SPREAD BONUS: High spread = great opportunity ===
-        # The cheaper side in high-spread situations is VERY valuable
-        # BUT: If pair cost is already good (<0.95), dampen this heavily
+        # === SPREAD BONUS: High spread = opportunity BUT NOT PRIMARY FOCUS ===
+        # The cheaper side in high-spread situations is valuable
+        # BUT: If pair cost is already good (<0.95), HEAVILY dampen this
+        # CRITICAL: We need BOTH sides positioned well, not just the cheap side!
         current_pair = self.pair_cost
-        spread_score_multiplier = 150
+        spread_score_multiplier = 80  # Reduced from 150
         if current_pair < 0.95:
-            spread_score_multiplier = 30  # Reduce from 150 to 30 when pair is good
+            spread_score_multiplier = 5  # Reduce from 30 to 5 when pair is good - almost ignore spread!
         
         if high_spread:
             if up_price < down_price:
@@ -1534,9 +1537,9 @@ class PaperTrader:
             else:
                 down_score += spread_pct * spread_score_multiplier
         elif medium_spread:
-            medium_spread_multiplier = 80
+            medium_spread_multiplier = 40  # Reduced from 80
             if current_pair < 0.95:
-                medium_spread_multiplier = 20  # Dampen medium spread too
+                medium_spread_multiplier = 3  # Reduce from 20 to 3 when pair is good
             if up_price < down_price:
                 up_score += spread_pct * medium_spread_multiplier
             else:
@@ -1549,15 +1552,17 @@ class PaperTrader:
             down_score += down_discount_pct * 100
         
         # === WORST CASE OPTIMIZATION (when pair is good) ===
-        # If pair < 0.95 and worst case is negative, heavily prioritize fixing it
+        # If pair < 0.95 and worst case is negative, MASSIVELY prioritize fixing it
+        # This is CRITICAL - if we lose on one side, fix that side!
         if current_pair < 0.95 and worst_case_pnl < 0:
             # Which side would improve worst case if we bought it?
             # If UP wins gives worst case, buy DOWN. If DOWN wins gives worst case, buy UP.
             if pnl_if_up < pnl_if_down:  # UP outcome is worse
                 # Buying DOWN improves UP outcome (reduces avg_down, increases max acceptable up_price)
-                down_score += abs(worst_case_pnl) * 3  # Strong bonus
+                # INCREASED: Was 3, now 10 - make this a TOP priority!
+                down_score += abs(worst_case_pnl) * 10  # Massive bonus to fix worst case
             else:  # DOWN outcome is worse
-                up_score += abs(worst_case_pnl) * 3
+                up_score += abs(worst_case_pnl) * 10  # Massive bonus to fix worst case
         
         # High avg = harder to hedge = more urgent to fix
         if self.avg_up > 0.55:
@@ -2524,8 +2529,11 @@ class PaperTrader:
             
             target_qty = self.qty_up
             desired_spend = target_qty * down_price
-            max_spend = self.capped_spend(desired_spend, fraction=0.6)  # Was 0.8, now 0.6
-            max_spend = min(max_spend, 20.0)  # Cap hedge at $20 (was $30)
+            # CRITICAL FIX: Increase hedge budget to ensure proper balancing!
+            # Was fraction=0.6, now 0.85 to allow buying enough of expensive side
+            max_spend = self.capped_spend(desired_spend, fraction=0.85)
+            # CRITICAL FIX: Increase hedge cap from $20 to $40 for better balance
+            max_spend = min(max_spend, 40.0)  # Cap hedge at $40 (was $20)
             qty = max_spend / down_price if down_price > 0 else 0.0
             
             # 🛡️ DELTA PROTECTION: Limit hedge qty to avoid excessive imbalance
@@ -2639,8 +2647,11 @@ class PaperTrader:
             
             target_qty = self.qty_down
             desired_spend = target_qty * up_price
-            max_spend = self.capped_spend(desired_spend, fraction=0.6)  # Was 0.8, now 0.6
-            max_spend = min(max_spend, 20.0)  # Cap hedge at $20 (was $30)
+            # CRITICAL FIX: Increase hedge budget to ensure proper balancing!
+            # Was fraction=0.6, now 0.85 to allow buying enough of expensive side
+            max_spend = self.capped_spend(desired_spend, fraction=0.85)
+            # CRITICAL FIX: Increase hedge cap from $20 to $40 for better balance
+            max_spend = min(max_spend, 40.0)  # Cap hedge at $40 (was $20)
             qty = max_spend / up_price if up_price > 0 else 0.0
             
             # 🛡️ DELTA PROTECTION: Limit hedge qty to avoid excessive imbalance
@@ -2808,9 +2819,10 @@ class PaperTrader:
             target_catch_up = leading_qty * 0.8 - lagging_qty
             if target_catch_up > 0:
                 cost_to_catch_up = target_catch_up * lagging_price
-                max_spend = self.capped_spend(cost_to_catch_up, fraction=0.15)  # Was 0.20, now 0.15
-                # Cap at $30 for catch-ups (was $40)
-                max_spend = min(max_spend, 30.0)
+                # INCREASED: Was 0.15, now 0.25 - allow larger catch-up trades!
+                max_spend = self.capped_spend(cost_to_catch_up, fraction=0.25)
+                # INCREASED: Cap at $50 for catch-ups (was $30) - allows better hedging!
+                max_spend = min(max_spend, 50.0)
                 qty_to_buy = max_spend / lagging_price if lagging_price > 0 else 0.0
                 
                 if qty_to_buy >= 1.0 and max_spend >= self.min_trade_size:
