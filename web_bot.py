@@ -1148,19 +1148,6 @@ HTML_TEMPLATE = """
             const statusEl = document.getElementById('market-status');
             statusEl.textContent = pt.market_status.toUpperCase();
             statusEl.className = 'market-status ' + pt.market_status;
-
-            // Update sell mode badge
-            const sellOn = !!pt.sell_mode;
-            const sellModeEl = document.getElementById('sell-mode-badge');
-            if (sellModeEl) {
-                sellModeEl.textContent = sellOn ? 'SELL MODE: ON' : 'SELL MODE: OFF';
-                sellModeEl.className = 'sell-mode-badge ' + (sellOn ? 'on' : 'off');
-            }
-
-            const sellAlertEl = document.getElementById('sell-mode-alert');
-            if (sellAlertEl) {
-                sellAlertEl.className = sellOn ? 'sell-mode-alert active' : 'sell-mode-alert';
-            }
             
             // Update stats
             document.getElementById('cash-remaining').textContent = '$' + pt.cash.toFixed(2);
@@ -1354,49 +1341,38 @@ class PaperTrader:
         self.final_pnl = None
         self.payout = 0.0
         
-        # === GABAGOOL STRATEGY v6: GUARANTEED PROFIT ===
-        # THE ONLY WAY TO GUARANTEE PROFIT: pair_cost < $1.00 with balanced positions
-        # Formula: avg_UP + avg_DOWN < $1.00 means we ALWAYS profit at settlement
-        # REALITY: Polymarket spread is often ~1.01, so we accept slight risk
+        # === GABAGOOL STRATEGY v8: PURE HEDGE - NO SELLING ===
+        # The ONLY path to profit: pair_cost < $1.00 with balanced positions
+        # Formula: avg_UP + avg_DOWN < $1.00 = GUARANTEED profit at settlement
+        # v8: NO SELL LOGIC - pure hedging like gabagool22.com
         
-        self.target_pair_cost = 0.96    # Target pair cost for good profit margin
-        self.max_pair_cost = 0.995      # NEVER exceed $1.00 - this is the profit threshold!
-        self.cheap_threshold = 0.48     # "Cheap" price to start buying
-        self.force_balance_threshold = 0.80  # Buy other side at this price if pair_cost is OK
-        self.max_balance_price = 0.88   # Absolute max to pay for balancing (emergency) - tighter limit
-        self.very_cheap_threshold = 0.40 # Super cheap - accumulate more aggressively
+        self.target_pair_cost = 0.94    # Target pair cost (6% profit margin)
+        self.max_pair_cost = 0.97       # HARD LIMIT - at least 3% margin required!
+        self.cheap_threshold = 0.46     # First trade must be cheap
+        self.force_balance_threshold = 0.52  # Balance at reasonable prices
+        self.max_balance_price = 0.54   # Absolute max for emergency balance
+        self.very_cheap_threshold = 0.42 # Super cheap - accumulate aggressively
         self.min_trade_size = 3.0       # Minimum trade size
-        self.max_single_trade = 12.0    # Max single trade
-        self.cooldown_seconds = 4       # Seconds between trades
+        self.max_single_trade = 15.0    # Max single trade
+        self.cooldown_seconds = 3       # Faster cooldown for better fills
         self.last_trade_time = 0
         self.first_trade_time = 0       # When we made our first trade
-        self.force_balance_after_seconds = 60  # Force balance after 60 seconds!
-        self.initial_trade_usd = 35.0   # Initial trade size ($30-40)
-        self.max_loss_per_market = 50.0 # Max loss per market
-        self.sell_mode = False
-        self.sell_mode_trigger_seconds = 300  # 5 minutes
-        self.sell_mode_min_profit = 1.0
+        self.initial_trade_usd = 30.0   # Initial trade size
         self.market_start_time = None
-        
-        # === VALUE-BASED PROFIT TAKING ===
-        # Sell when position value exceeds total cost by this amount
-        self.value_profit_threshold = 2.00  # Sell when value > cost + $2.00 (absolute)
-        self.min_profit_pct = 0.03  # Or when profit > 3% of cost AND > $1.00 minimum
         
         # Track current position values (updated each tick)
         self.current_up_value = 0.0
         self.current_down_value = 0.0
         self.current_total_value = 0.0
         
-        # === BALANCE IS KING ===
-        # Without balance, there is NO guaranteed profit
-        # BUT we allow temporary imbalance to achieve pair_cost < $1.00
-        self.max_qty_ratio = 1.35       # Normal max imbalance (35%)
-        self.emergency_ratio = 2.0      # Allow HIGH imbalance when fixing pair_cost > $1.00
-        self.recovery_ratio = 2.5       # Max ratio when actively recovering (EXTREME)
+        # === BALANCE IS KING - THE KEY TO PROFIT ===
+        # Perfect balance = profit guarantee with pair_cost < $1.00
+        self.max_qty_ratio = 1.15       # Strict: max 15% imbalance
+        self.emergency_ratio = 1.30     # Emergency max when recovering
+        self.recovery_ratio = 1.50      # Max ratio when fixing pair_cost
         self.target_qty_ratio = 1.0     # Perfect balance
-        self.rebalance_trigger = 1.15   # Start rebalancing when ratio exceeds this
-        self.max_position_pct = 0.50    # Max 50% of balance per market (more aggressive)
+        self.rebalance_trigger = 1.08   # Start rebalancing at 8% imbalance
+        self.max_position_pct = 0.35    # Max 35% of balance per market
         
     @property
     def avg_up(self) -> float:
@@ -1424,55 +1400,16 @@ class PaperTrader:
         else:
             self.market_start_time = None
 
-    def update_sell_mode(self, now_ts: float, market_elapsed: Optional[float] = None):
-        if self.sell_mode:
-            return
-        elapsed = market_elapsed
-        if elapsed is None and self.market_start_time:
-            elapsed = now_ts - self.market_start_time
-        if elapsed is None:
-            return
-        # Only trigger sell mode if we have positions but no locked profit
-        has_positions = self.qty_up > 0 or self.qty_down > 0
-        if has_positions and elapsed >= self.sell_mode_trigger_seconds and self.locked_profit <= 0:
-            self.sell_mode = True
-            print("🚨 SELL MODE ACTIVE (no locked profit after 5m)")
-
     def unrealized_pnl(self, up_price: float, down_price: float) -> float:
         total_cost = self.cost_up + self.cost_down
         current_value = (self.qty_up * up_price) + (self.qty_down * down_price)
         return current_value - total_cost
     
     def update_position_values(self, up_bid: float, down_bid: float):
-        """Update current position values based on bid prices (what we could sell for)"""
+        """Update current position values based on bid prices"""
         self.current_up_value = self.qty_up * up_bid if up_bid > 0 else 0.0
         self.current_down_value = self.qty_down * down_bid if down_bid > 0 else 0.0
         self.current_total_value = self.current_up_value + self.current_down_value
-    
-    def should_take_profit(self) -> tuple:
-        """Check if we should sell positions to lock in profit based on current value.
-        
-        Returns (should_sell, reason)
-        """
-        if self.qty_up == 0 and self.qty_down == 0:
-            return False, "No positions"
-        
-        total_cost = self.cost_up + self.cost_down
-        if total_cost == 0:
-            return False, "No cost"
-        
-        profit = self.current_total_value - total_cost
-        profit_pct = profit / total_cost if total_cost > 0 else 0
-        
-        # Check absolute profit threshold ($1.50 or more)
-        if profit >= self.value_profit_threshold:
-            return True, f"Value profit: ${profit:.2f} (${self.current_total_value:.2f} > ${total_cost:.2f})"
-        
-        # Check percentage profit threshold (3% or more AND at least $1.00)
-        if profit_pct >= self.min_profit_pct and profit >= 1.00:
-            return True, f"Pct profit: {profit_pct*100:.1f}% (${profit:.2f})"
-        
-        return False, f"Profit ${profit:.2f} below threshold (need ${self.value_profit_threshold:.2f} or {self.min_profit_pct*100:.0f}%)"
 
     def improves_pair_cost(self, side: str, price: float, qty: float) -> bool:
         if self.qty_up == 0 or self.qty_down == 0:
@@ -1493,106 +1430,6 @@ class PaperTrader:
             return 0.0
         total_cost = new_cost_up + new_cost_down
         return min(new_qty_up, new_qty_down) - total_cost
-
-    def sell_mode_allows_buy(self, side: str, price: float, qty: float) -> tuple:
-        """Check if a buy is allowed in sell mode.
-        
-        In sell mode, we still allow trades that:
-        1. Lock in positive profit (locked_profit > 0 after trade)
-        2. Improve the pair cost (even if profit not yet locked)
-        3. Improve locked profit compared to current locked profit
-        
-        This allows the bot to keep improving positions during price swings.
-        """
-        if not self.sell_mode:
-            return True, ""
-        
-        locked_after = self.locked_profit_after_buy(side, price, qty)
-        
-        # If this trade results in positive locked profit, always allow
-        if locked_after > 0:
-            return True, f"Sell mode: locks ${locked_after:.2f} profit"
-        
-        # If we already have locked profit and this improves it, allow
-        if self.locked_profit > 0 and locked_after > self.locked_profit:
-            return True, f"Sell mode: improves locked profit ${self.locked_profit:.2f}→${locked_after:.2f}"
-        
-        # If this improves pair cost AND we have balanced positions, allow
-        # (this can help swing towards profit during price movements)
-        if self.qty_up > 0 and self.qty_down > 0 and self.improves_pair_cost(side, price, qty):
-            _, new_pair_cost = self.simulate_buy(side, price, qty)
-            if new_pair_cost < self.pair_cost - 0.005:  # At least 0.5 cent improvement
-                return True, f"Sell mode: improves pair ${self.pair_cost:.3f}→${new_pair_cost:.3f}"
-        
-        return False, "Sell mode: trade doesn't improve position"
-
-    def execute_sell_all(self, up_price: float, down_price: float, timestamp: str, reason: str) -> bool:
-        """Sell all positions and calculate final PnL.
-        
-        This also records the final PnL so it can be saved to history
-        even when selling before market resolution.
-        """
-        import time as time_module
-        proceeds = 0.0
-        sold_any = False
-        
-        # Store original quantities and costs for PnL calculation
-        original_qty_up = self.qty_up
-        original_qty_down = self.qty_down
-        original_cost_up = self.cost_up
-        original_cost_down = self.cost_down
-        total_cost = original_cost_up + original_cost_down
-
-        if self.qty_up > 0 and up_price > 0:
-            proceeds += self.qty_up * up_price
-            self.trade_log.append({
-                'time': timestamp,
-                'side': 'SELL',
-                'token': 'UP',
-                'price': up_price,
-                'qty': self.qty_up,
-                'cost': -(self.qty_up * up_price),
-                'note': reason
-            })
-            self.qty_up = 0.0
-            self.cost_up = 0.0
-            sold_any = True
-
-        if self.qty_down > 0 and down_price > 0:
-            proceeds += self.qty_down * down_price
-            self.trade_log.append({
-                'time': timestamp,
-                'side': 'SELL',
-                'token': 'DOWN',
-                'price': down_price,
-                'qty': self.qty_down,
-                'cost': -(self.qty_down * down_price),
-                'note': reason
-            })
-            self.qty_down = 0.0
-            self.cost_down = 0.0
-            sold_any = True
-
-        if not sold_any:
-            return False
-
-        self.cash += proceeds
-        self.trade_count += 1
-        self.last_trade_time = time_module.time()
-        
-        # Calculate and store final PnL from the sale
-        self.final_pnl = proceeds - total_cost
-        self.payout = proceeds
-        self.resolution_outcome = f"{reason} (sold)"
-        # Note: Keep qty values for history, restore them temporarily for the pnl entry
-        self._sold_qty_up = original_qty_up
-        self._sold_qty_down = original_qty_down
-        self._sold_cost = total_cost
-
-        if len(self.trade_log) > 20:
-            self.trade_log = self.trade_log[-20:]
-
-        return True
     
     def simulate_buy(self, side: str, price: float, qty: float) -> tuple:
         """Simulate what happens if we buy, returns (new_avg, new_pair_cost)"""
@@ -1647,9 +1484,6 @@ class PaperTrader:
         other_cost = self.cost_down if side == 'UP' else self.cost_up
         other_avg = other_cost / other_qty if other_qty > 0 else 0
         other_side = 'DOWN' if side == 'UP' else 'UP'
-
-        if self.sell_mode and my_qty == 0 and other_qty == 0:
-            return False, 0, "Sell mode: waiting for lockable profit"
         
         # === POSITION SIZE LIMIT ===
         total_spent = self.cost_up + self.cost_down
@@ -1673,34 +1507,34 @@ class PaperTrader:
             max_spend = min(self.initial_trade_usd, self.max_single_trade, remaining_budget, self.cash)
             qty = max_spend / price
             self.first_trade_time = now
-            allowed, reason = self.sell_mode_allows_buy(side, price, qty)
-            if not allowed:
-                return False, 0, reason
             return True, qty, f"🎯 First trade (pair potential: ${potential_pair_cost:.2f})"
         
-        # === CRITICAL: MUST BALANCE TO LOCK PROFIT ===
+        # === CRITICAL: BALANCE ONLY IF PROFITABLE ===
+        # v7: STRICT pair_cost check - NEVER balance if it would hurt profit
         if my_qty == 0 and other_qty > 0:
             time_unhedged = now - self.first_trade_time if self.first_trade_time > 0 else 0
             
             # Calculate what pair_cost would be if we buy at current price
             potential_pair_cost = other_avg + price
             
-            # Determine price threshold based on urgency and pair_cost
-            if time_unhedged > self.force_balance_after_seconds:
-                # Force balance - accept higher prices
-                if potential_pair_cost < self.max_pair_cost:
-                    price_threshold = self.max_balance_price
-                    reason = f"🚨 FORCE BALANCE ({time_unhedged:.0f}s unhedged)"
-                else:
-                    return False, 0, f"🚨 Pair cost ${potential_pair_cost:.2f} too high even for emergency"
-            elif potential_pair_cost < self.target_pair_cost:
-                # Great opportunity - pair_cost would be good
+            # v7: HARD CHECK - NEVER buy if pair_cost would exceed max_pair_cost
+            # This is the KEY fix - no exceptions, no "emergency" overpaying!
+            if potential_pair_cost > self.max_pair_cost:
+                # Don't balance - would destroy profit margin
+                return False, 0, f"❌ SKIP: pair ${potential_pair_cost:.2f} > max ${self.max_pair_cost} - waiting for better price"
+            
+            # Determine price threshold based on pair_cost quality
+            if potential_pair_cost < self.target_pair_cost:
+                # Excellent opportunity - pair_cost would give good margin
                 price_threshold = self.force_balance_threshold
                 reason = f"✅ GOOD PAIR COST (${potential_pair_cost:.2f})"
+            elif potential_pair_cost < self.max_pair_cost:
+                # Acceptable but not great - be more selective on price
+                price_threshold = min(price + 0.02, self.max_balance_price)  # Only slightly above current
+                reason = f"⚠️ OK PAIR COST (${potential_pair_cost:.2f}) - cautious balance"
             else:
-                # Wait for better price
-                price_threshold = self.cheap_threshold
-                reason = "⏳ Waiting for better price"
+                # This shouldn't happen due to check above, but safety net
+                return False, 0, f"⏳ Waiting: pair ${potential_pair_cost:.2f} too high"
             
             if price > price_threshold:
                 return False, 0, f"Need {side} < ${price_threshold:.2f} (pair would be ${potential_pair_cost:.2f})"
@@ -1724,9 +1558,6 @@ class PaperTrader:
             if qty * price < self.min_trade_size:
                 qty = self.min_trade_size / price
             
-            allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-            if not allowed:
-                return False, 0, reason_block
             return True, qty, reason
         
         # === BOTH SIDES HAVE POSITIONS - OPTIMIZE PAIR COST ===
@@ -1774,15 +1605,9 @@ class PaperTrader:
                     
                     if new_pair_cost < 1.0:
                         # SUCCESS! This gets us under $1.00
-                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                        if not allowed:
-                            return False, 0, reason_block
                         return True, qty, f"🎯 RECOVERY SUCCESS: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (UNDER $1.00!)"
                     
                     if improvement >= 0.002:  # Even tiny improvements count in recovery
-                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                        if not allowed:
-                            return False, 0, reason_block
                         return True, qty, f"🚨 RECOVERY: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
         # === NORMAL MODE: COST AVERAGING ===
@@ -1800,9 +1625,6 @@ class PaperTrader:
                     
                     # Normal case: require both pair cost and locked profit improvement
                     if self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty):
-                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                        if not allowed:
-                            return False, 0, reason_block
                         return True, qty, f"📉 IMPROVE: pair ${current_pair_cost:.3f}→${new_pair_cost:.3f} (-${improvement:.3f})"
         
         # === REBALANCING: Buy lagging side ===
@@ -1839,9 +1661,6 @@ class PaperTrader:
                                    (pair_cost_ok and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty))
                     
                     if should_trade:
-                        allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                        if not allowed:
-                            return False, 0, reason_block
                         prefix = "🚨" if recovery_mode else "⚖️"
                         return True, qty, f"{prefix} REBALANCE: ratio {ratio:.2f}→{(my_qty+qty)/other_qty:.2f}"
         
@@ -1859,9 +1678,6 @@ class PaperTrader:
                                (new_pair_cost <= self.max_pair_cost and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty))
                 
                 if should_trade:
-                    allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                    if not allowed:
-                        return False, 0, reason_block
                     prefix = "🚨" if recovery_mode else "🔥"
                     return True, qty, f"{prefix} CHEAP @ ${price:.3f}"
         
@@ -1873,9 +1689,6 @@ class PaperTrader:
             if qty * price >= self.min_trade_size:
                 new_avg, new_pair_cost = self.simulate_buy(side, price, qty)
                 if new_pair_cost <= self.max_pair_cost and self.improves_pair_cost(side, price, qty) and self.improves_locked_profit(side, price, qty):
-                    allowed, reason_block = self.sell_mode_allows_buy(side, price, qty)
-                    if not allowed:
-                        return False, 0, reason_block
                     return True, qty, f"OK (${price:.3f})"
         
         return False, 0, f"{side} ${price:.3f}: no opportunity"
@@ -1917,53 +1730,30 @@ class PaperTrader:
     
     def check_and_trade(self, up_price: float, down_price: float, timestamp: str, up_bid: Optional[float] = None, down_bid: Optional[float] = None, market_elapsed: Optional[float] = None):
         """
-        GABAGOOL v6: GUARANTEED PROFIT STRATEGY
+        GABAGOOL v8: PURE HEDGE STRATEGY - NO SELLING
         
         Priority:
-        0. VALUE-BASED PROFIT TAKING: Sell if position value > total cost
         1. BALANCE FIRST: If one side has no position, buy it to lock profit
         2. COST AVERAGE: If price < our avg, buy to improve pair_cost
         3. REBALANCE: Keep qty ratio near 1.0
         4. ACCUMULATE: Buy very cheap prices
+        
+        NEVER sell - only hedge and hold until resolution!
         """
         import time as time_module
         trades_made = []
         now_ts = time_module.time()
-        self.update_sell_mode(now_ts, market_elapsed)
-        sell_up_price = up_bid if up_bid and up_bid > 0 else up_price
-        sell_down_price = down_bid if down_bid and down_bid > 0 else down_price
         
         # Update position values for tracking
-        self.update_position_values(sell_up_price, sell_down_price)
-        
-        unrealized = self.unrealized_pnl(sell_up_price, sell_down_price)
-
-        # === PRIORITY 0: MAX LOSS PROTECTION ===
-        if unrealized <= -self.max_loss_per_market and (self.qty_up > 0 or self.qty_down > 0):
-            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Max loss"):
-                self.market_status = 'sold'
-            return trades_made
-        
-        # === PRIORITY 0.5: VALUE-BASED PROFIT TAKING ===
-        # If current position value exceeds total cost, sell to lock profit!
-        should_sell, sell_reason = self.should_take_profit()
-        if should_sell:
-            print(f"💰 PROFIT TAKING: {sell_reason}")
-            if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, sell_reason):
-                self.market_status = 'sold'
-            return trades_made
-
-        if self.sell_mode:
-            # In sell mode with positive unrealized profit, sell to lock it in
-            if unrealized >= self.sell_mode_min_profit:
-                if self.execute_sell_all(sell_up_price, sell_down_price, timestamp, "Sell mode profit"):
-                    self.market_status = 'sold'
-                return trades_made
-            # NOTE: Don't return here! Continue to check for opportunities to improve position
+        self.update_position_values(up_bid if up_bid and up_bid > 0 else up_price, 
+                                   down_bid if down_bid and down_bid > 0 else down_price)
         
         # === PRIORITY 1: BALANCE - Lock in guaranteed profit ===
         # If we have position on one side but not other, we MUST balance
         if (self.qty_up > 0 and self.qty_down == 0):
+            time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
+            potential_pair = self.avg_up + down_price
+            
             # Need to buy DOWN to lock profit
             should, qty, reason = self.should_buy('DOWN', down_price, up_price, is_rebalance=True)
             if should:
@@ -1972,13 +1762,14 @@ class PaperTrader:
                     print(f"🔒 LOCK PROFIT: {reason}")
                     return trades_made
             else:
-                # Report why we can't balance
-                time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
-                potential_pair = self.avg_up + down_price
+                # v8: PATIENCE - wait for good price, don't abandon!
                 print(f"⏳ Waiting for DOWN: ${down_price:.3f} (pair would be ${potential_pair:.2f}) [{time_unhedged:.0f}s]")
                 return trades_made
         
         if (self.qty_down > 0 and self.qty_up == 0):
+            time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
+            potential_pair = self.avg_down + up_price
+            
             # Need to buy UP to lock profit
             should, qty, reason = self.should_buy('UP', up_price, down_price, is_rebalance=True)
             if should:
@@ -1987,8 +1778,7 @@ class PaperTrader:
                     print(f"🔒 LOCK PROFIT: {reason}")
                     return trades_made
             else:
-                time_unhedged = time_module.time() - self.first_trade_time if self.first_trade_time > 0 else 0
-                potential_pair = self.avg_down + up_price
+                # v8: PATIENCE - wait for good price, don't abandon!
                 print(f"⏳ Waiting for UP: ${up_price:.3f} (pair would be ${potential_pair:.2f}) [{time_unhedged:.0f}s]")
                 return trades_made
         
@@ -2090,9 +1880,8 @@ class PaperTrader:
     
     def get_state(self) -> dict:
         """Return current state for broadcasting"""
-        # Use stored sold quantities if available for display consistency
-        qty_up = getattr(self, '_sold_qty_up', self.qty_up) if self.market_status == 'sold' else self.qty_up
-        qty_down = getattr(self, '_sold_qty_down', self.qty_down) if self.market_status == 'sold' else self.qty_down
+        qty_up = self.qty_up
+        qty_down = self.qty_down
         
         total_cost = self.cost_up + self.cost_down
         
@@ -2112,7 +1901,6 @@ class PaperTrader:
             'resolution_outcome': self.resolution_outcome,
             'final_pnl': self.final_pnl,
             'payout': self.payout,
-            'sell_mode': self.sell_mode,
             # Position value tracking
             'current_up_value': self.current_up_value,
             'current_down_value': self.current_down_value,
@@ -2261,17 +2049,8 @@ class PolymarketWebBot:
         # Check if we have any positions
         pt = self.paper_trader
         
-        # Check if positions were already sold (market_status == 'sold')
-        if pt.market_status == 'sold' and pt.final_pnl is not None:
-            self.save_market_pnl()
-            return
-        
         if pt.qty_up == 0 and pt.qty_down == 0:
-            # Check if we have stored sold quantities (from execute_sell_all)
-            if hasattr(pt, '_sold_qty_up') and (pt._sold_qty_up > 0 or getattr(pt, '_sold_qty_down', 0) > 0):
-                self.save_market_pnl()
-            else:
-                print(f"📭 Market {self.event_slug} closed with no positions")
+            print(f"📭 Market {self.event_slug} closed with no positions")
             return
         
         # Try to fetch final resolution from API
@@ -2338,21 +2117,16 @@ class PolymarketWebBot:
         
         pt = self.paper_trader
         
-        # Use stored sold quantities if available (from execute_sell_all)
-        qty_up = getattr(pt, '_sold_qty_up', pt.qty_up)
-        qty_down = getattr(pt, '_sold_qty_down', pt.qty_down)
-        cost = getattr(pt, '_sold_cost', pt.cost_up + pt.cost_down)
-        
         pnl_entry = {
             'slug': self.event_slug,
             'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
             'outcome': pt.resolution_outcome or 'Unknown',
             'pnl': pt.final_pnl,
             'payout': pt.payout,
-            'cost': cost,
-            'qty_up': qty_up,
-            'qty_down': qty_down,
-            'status': 'sold' if 'sold' in str(pt.resolution_outcome) else 'resolved'
+            'cost': pt.cost_up + pt.cost_down,
+            'qty_up': pt.qty_up,
+            'qty_down': pt.qty_down,
+            'status': 'resolved'
         }
         
         self.pnl_history.append(pnl_entry)
@@ -2751,10 +2525,6 @@ async def websocket_handler(request):
                     elif command == 'reset_bot':
                         for b in target_bots:
                             b.reset_bot()
-                    elif command == 'toggle_sell_mode':
-                        for b in target_bots:
-                            b.paper_trader.sell_mode = not b.paper_trader.sell_mode
-                            print(f"🎯 {b.asset.upper()} Sell Mode: {'ON' if b.paper_trader.sell_mode else 'OFF'}")
                 except json.JSONDecodeError:
                     pass
             elif msg.type == aiohttp.WSMsgType.ERROR:
