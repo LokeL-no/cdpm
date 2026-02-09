@@ -3989,20 +3989,20 @@ class MultiMarketBot:
                 )
                 
                 if trades:
-                    for side, price, qty in trades:
+                    for side, actual_price, actual_qty in trades:
                         pt = tracker.paper_trader
                         urgency_msg = f" [⚠️ {time_to_close:.0f}s left!]" if time_to_close and time_to_close < 300 else ""
-                        print(f"📈 [{tracker.asset.upper()}] BUY {qty:.1f} {side} @ ${price:.3f} | Pair: ${pt.pair_cost:.3f}{urgency_msg}")
+                        print(f"📈 [{tracker.asset.upper()}] BUY {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f}{urgency_msg}")
                         
-                        # Add to trade log
+                        # Add to trade log (actual fill data from execution simulator)
                         self.trade_log.append({
                             'time': timestamp,
                             'asset': tracker.asset.upper(),
                             'market': tracker.slug,
                             'side': side,
-                            'price': price,
-                            'qty': qty,
-                            'cost': price * qty,
+                            'price': actual_price,
+                            'qty': actual_qty,
+                            'cost': actual_price * actual_qty,
                             'pair_cost': pt.pair_cost
                         })
                         
@@ -4236,7 +4236,8 @@ class MultiMarketBot:
                         'total_locked_profit': total_locked_profit,
                         'active_markets': active_data,
                         'history': self.history,
-                        'trade_log': self.trade_log,
+                        # Only show trades from currently active (non-resolved) markets
+                        'trade_log': [t for t in self.trade_log if t.get('market') in newest_slugs],
                         'paused': self.paused,
                         'asset_wdl': asset_wdl,
                         'supported_assets': SUPPORTED_ASSETS,

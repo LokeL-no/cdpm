@@ -622,7 +622,8 @@ class ArbitrageStrategy:
     # ═══════════════════════════════════════════════════════════════
 
     def execute_buy(self, side: str, price: float, qty: float,
-                    timestamp: str = None) -> bool:
+                    timestamp: str = None) -> Tuple[bool, float, float]:
+        """Returns (success, actual_fill_price, actual_fill_qty)"""
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
@@ -639,7 +640,7 @@ class ArbitrageStrategy:
 
         if not fill.filled:
             print(f"❌ [{side}] ORDER REJECTED: {fill.reason}")
-            return False
+            return False, 0.0, 0.0
 
         # Use actual fill price and qty from simulator
         actual_price = fill.fill_price
@@ -647,7 +648,7 @@ class ArbitrageStrategy:
         actual_cost = fill.total_cost
 
         if actual_cost > self.cash:
-            return False
+            return False, 0.0, 0.0
 
         # Log slippage if it occurred
         if fill.slippage > 0.00001:
@@ -687,7 +688,7 @@ class ArbitrageStrategy:
         })
         if len(self.trade_log) > 50:
             self.trade_log = self.trade_log[-50:]
-        return True
+        return True, actual_price, actual_qty
 
     # ═══════════════════════════════════════════════════════════════
     #  MAIN TRADING LOOP
@@ -769,10 +770,12 @@ class ArbitrageStrategy:
                     new_total = self.cost_up + up_price * qty + self.cost_down + down_cost
                     new_mgp_full = min(self.qty_up + qty, new_qty_down) - new_total * FEE_MULT
                     if new_mgp_full > mgp:
-                        if self.execute_buy('UP', up_price, qty, timestamp):
-                            trades_made.append(('UP', up_price, qty))
-                        if self.execute_buy('DOWN', down_price, qty, timestamp):
-                            trades_made.append(('DOWN', down_price, qty))
+                        ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                        if ok_u:
+                            trades_made.append(('UP', ap_u, aq_u))
+                        ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
+                        if ok_d:
+                            trades_made.append(('DOWN', ap_d, aq_d))
                         print(f"📈 LOCKED COMPOUND: {qty:.1f} shares | MGP ${mgp:.2f}→${new_mgp_full:.2f}")
 
             self.current_mode = 'arbitrage_locked'
@@ -804,10 +807,12 @@ class ArbitrageStrategy:
                 total_cost = qty * cost_per_share
 
                 if total_cost >= self.min_trade_size and total_cost <= self.cash:
-                    if self.execute_buy('UP', up_price, qty, timestamp):
-                        trades_made.append(('UP', up_price, qty))
-                    if self.execute_buy('DOWN', down_price, qty, timestamp):
-                        trades_made.append(('DOWN', down_price, qty))
+                    ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                    if ok_u:
+                        trades_made.append(('UP', ap_u, aq_u))
+                    ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
+                    if ok_d:
+                        trades_made.append(('DOWN', ap_d, aq_d))
                     self.current_mode = 'paired_entry'
                     self.mode_reason = f'Paired entry @ combined ${combined_price:.3f}'
                     print(f"🎯 PAIRED ENTRY: {qty:.1f} shares each | combined ${combined_price:.3f}")
@@ -835,10 +840,12 @@ class ArbitrageStrategy:
                         new_total_cost = total_invested + total_cost
                         new_mgp = min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
                         if new_mgp > mgp:
-                            if self.execute_buy('UP', up_price, qty, timestamp):
-                                trades_made.append(('UP', up_price, qty))
-                            if self.execute_buy('DOWN', down_price, qty, timestamp):
-                                trades_made.append(('DOWN', down_price, qty))
+                            ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                            if ok_u:
+                                trades_made.append(('UP', ap_u, aq_u))
+                            ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
+                            if ok_d:
+                                trades_made.append(('DOWN', ap_d, aq_d))
                             self.current_mode = 'paired_growth'
                             self.mode_reason = f'📈 Growing @ combined ${combined_price:.3f} (avg ${avg_pair_cost:.3f}) | MGP ${mgp:.2f}→${new_mgp:.2f}'
                             print(f"📈 PAIRED GROWTH: {qty:.1f} shares | combined ${combined_price:.3f} < avg ${avg_pair_cost:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}")
@@ -868,8 +875,9 @@ class ArbitrageStrategy:
         other_1 = down_price if first_side == 'UP' else up_price
         ok, qty, reason = self.should_buy(first_side, price_1, other_1, se_info, time_to_close=time_to_close)
         if ok and qty > 0:
-            if self.execute_buy(first_side, price_1, qty, timestamp):
-                trades_made.append((first_side, price_1, qty))
+            ok_f, ap_f, aq_f = self.execute_buy(first_side, price_1, qty, timestamp)
+            if ok_f:
+                trades_made.append((first_side, ap_f, aq_f))
                 print(f"✅ {reason}")
 
         # Try other side (only if first didn't trade)
@@ -879,8 +887,9 @@ class ArbitrageStrategy:
             other_2 = down_price if second_side == 'UP' else up_price
             ok2, qty2, reason2 = self.should_buy(second_side, price_2, other_2, se_info, time_to_close=time_to_close)
             if ok2 and qty2 > 0:
-                if self.execute_buy(second_side, price_2, qty2, timestamp):
-                    trades_made.append((second_side, price_2, qty2))
+                ok_s, ap_s, aq_s = self.execute_buy(second_side, price_2, qty2, timestamp)
+                if ok_s:
+                    trades_made.append((second_side, ap_s, aq_s))
                     print(f"✅ {reason2}")
 
         # Track prices for reactive logic
