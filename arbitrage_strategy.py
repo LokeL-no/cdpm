@@ -76,8 +76,8 @@ class ArbitrageStrategy:
 
         # ── Trading parameters ──
         self.min_trade_size = 1.0        # Polymarket minimum ~$1
-        self.max_single_trade = 8.0      # Small trades to stay on top-of-book
-        self.max_shares_per_order = 80   # Max shares per fill — well within typical book depth
+        self.max_single_trade = 5.0      # Smaller trades for $100 budget
+        self.max_shares_per_order = 50   # Fits typical book depth at this budget
         self.api_rate_limit = 0.5        # 0.5s — only to avoid API throttle, NOT a trading cooldown
         self.last_trade_time = 0
 
@@ -105,9 +105,9 @@ class ArbitrageStrategy:
         self.mgp_budget_fraction = 0.20  # Budget fraction for MGP lock trades
 
         # ── Risk management ──
-        self.max_position_pct = 0.35     # Limit exposure per market
-        self.min_reserve_cash = 20.0
-        self.max_loss_per_market = 20.0  # Tighter stop-loss
+        self.max_position_pct = 0.80     # Use up to 80% of $100 budget ($80)
+        self.min_reserve_cash = 5.0      # Keep $5 reserve
+        self.max_loss_per_market = 10.0  # Max $10 loss per market
 
         # ── Pair cost limits ──
         # pair_cost = avg_up + avg_down; must stay < $1.00 for profit
