@@ -76,9 +76,9 @@ class ArbitrageStrategy:
 
         # ── Trading parameters ──
         self.min_trade_size = 1.0        # Polymarket minimum ~$1
-        self.max_single_trade = 10.0     # Reduced from $15 to minimize slippage
-        self.max_shares_per_order = 100  # Max shares per single fill — stay on top-of-book
-        self.cooldown_seconds = 10       # 10s between trades — more frequent smaller trades
+        self.max_single_trade = 8.0      # Small trades to stay on top-of-book
+        self.max_shares_per_order = 80   # Max shares per fill — well within typical book depth
+        self.api_rate_limit = 0.5        # 0.5s — only to avoid API throttle, NOT a trading cooldown
         self.last_trade_time = 0
 
         # ── Delta Neutral parameters ──
@@ -98,11 +98,11 @@ class ArbitrageStrategy:
         # We profit when combined < $1.00 minus fees (~1.5%).
         # So max_combined = $0.985 gives ~1.5 cent profit per matched share.
         self.max_combined_entry = 0.985  # Realistic: UP+DOWN < this for paired entry
-        self.min_time_to_enter = 420     # Need 7 min (420s) left for new entries
+        self.min_time_to_enter = 300     # Need 5 min (300s) left for new entries
 
         # ── MGP-specific limits ──
         self.mgp_max_price = 0.55        # Max price when MGP-balancing
-        self.mgp_budget_fraction = 0.15  # Budget fraction for MGP lock trades
+        self.mgp_budget_fraction = 0.10  # Budget fraction for MGP lock trades
 
         # ── Risk management ──
         self.max_position_pct = 0.35     # Limit exposure per market
@@ -120,11 +120,10 @@ class ArbitrageStrategy:
         self._last_accumulate_time = 0
 
         # ── Profit lock threshold ──
-        self.profit_lock_threshold = 0.50   # MGP must exceed this to lock
-        self.min_invested_to_lock = 0.10   # Must have spent 10% of budget before locking
+        self.profit_lock_threshold = 0.20   # Lower threshold — lock profit earlier
+        self.min_invested_to_lock = 0.05   # Only need 5% invested to start compounding
 
-        # ── Hedge bypass cooldown ──
-        self.hedge_cooldown_seconds = 3   # Hedge allowed faster than normal trades
+        # (Hedge uses same api_rate_limit — no separate cooldown needed)
 
         # ── State ──
         self.market_status = 'open'
@@ -422,11 +421,10 @@ class ArbitrageStrategy:
         other_cost = self.cost_down if side == 'UP' else self.cost_up
 
         now = time.time()
-        # Normal cooldown — but Phase 2 (hedge) has its own shorter cooldown
+        # Minimal API rate-limit guard — NOT a trading cooldown
+        if now - self.last_trade_time < self.api_rate_limit:
+            return False, 0, "API rate limit (0.5s)"
         is_hedge_candidate = (my_qty == 0 and other_qty > 0)
-        if not is_hedge_candidate:
-            if now - self.last_trade_time < self.cooldown_seconds and delta <= self.critical_delta_pct:
-                return False, 0, "Cooldown active"
 
         total_cost = self.cost_up + self.cost_down
         budget_limit = self.starting_balance * self.max_position_pct
@@ -511,12 +509,9 @@ class ArbitrageStrategy:
         # ──────────────────────────────────────────────────────────
         #  PHASE 2 – HEDGE / MGP LOCK
         #  Buy the other side to create a hedged position.
-        #  Hedge is EXEMPT from normal cooldown (uses hedge_cooldown).
+        #  Hedge — same API rate limit, no extra delay.
         # ──────────────────────────────────────────────────────────
         if my_qty == 0 and other_qty > 0:
-            # Override cooldown for hedge — we must hedge quickly
-            if now - self.last_trade_time < self.hedge_cooldown_seconds:
-                return False, 0, "Hedge cooldown active"
 
             # This side has no position — we need to hedge
             other_avg = other_cost / other_qty if other_qty > 0 else 0
@@ -760,14 +755,14 @@ class ArbitrageStrategy:
             and invested_pct >= self.min_invested_to_lock
         )
         if position_is_locked:
-            # Still allow paired compounding if combined price is good
+            # Compound aggressively but in small bites every tick
             if combined_price <= self.max_combined_entry:
-                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
+                budget = min(self.market_budget * 0.03, self.cash * 0.03, remaining_budget * 0.08, self.max_single_trade)
                 cost_per_share = combined_price
                 qty = budget / cost_per_share if cost_per_share > 0 else 0
                 total_cost = qty * cost_per_share
-                # Only compound if it actually improves MGP
-                if qty > 0.5 and total_cost >= self.min_trade_size and total_cost <= self.cash:
+                # Compound even small amounts — every bit of locked profit helps
+                if qty > 0.3 and total_cost >= self.min_trade_size and total_cost <= self.cash:
                     # Simulate buying DOWN too
                     down_cost = down_price * qty
                     new_qty_down = self.qty_down + qty
@@ -801,8 +796,8 @@ class ArbitrageStrategy:
 
             if combined_price <= self.max_combined_entry:
                 # Paired entry: buy equal SHARE quantities of both sides
-                # Smaller sizes to minimize slippage on initial fills
-                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
+                # Small initial position — will compound quickly after
+                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
                 # Equal shares so that min(qty_up, qty_down) is maximized
                 cost_per_share = up_price + down_price
                 qty = budget / cost_per_share
@@ -828,8 +823,8 @@ class ArbitrageStrategy:
             # Only compound at combined price cheaper than our current avg pair cost
             if combined_price < avg_pair_cost and combined_price <= self.max_combined_entry:
                 now = time.time()
-                if now - self.last_trade_time >= self.cooldown_seconds:
-                    budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
+                if now - self.last_trade_time >= self.api_rate_limit:
+                    budget = min(self.market_budget * 0.03, self.cash * 0.03, remaining_budget * 0.08, self.max_single_trade)
                     cost_per_share = combined_price
                     qty = budget / cost_per_share if cost_per_share > 0 else 0
                     total_cost = qty * cost_per_share
