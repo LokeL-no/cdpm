@@ -787,7 +787,7 @@ class ArbitrageStrategy:
 
         # ════════════════════════════════════════════════════════
         #  PAIRED ENTRY — Buy both sides simultaneously
-        #  This is the BEST way to enter: guarantees pair_cost.
+        #  ALWAYS enter — work to secure profit from inside.
         # ════════════════════════════════════════════════════════
         if self.qty_up == 0 and self.qty_down == 0:
             # Time filter: don't start new positions too late
@@ -796,25 +796,26 @@ class ArbitrageStrategy:
                 self.mode_reason = f'Only {time_to_close:.0f}s left — skipping market'
                 return trades_made
 
-            if combined_price <= self.max_combined_entry:
-                # Always enter — work to secure profit from inside
-                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
-                # Equal shares so that min(qty_up, qty_down) is maximized
-                cost_per_share = up_price + down_price
-                qty = budget / cost_per_share
-                total_cost = qty * cost_per_share
+            # Always enter — even if combined > $0.995, we work to improve from inside
+            budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
+            cost_per_share = up_price + down_price
+            qty = budget / cost_per_share if cost_per_share > 0 else 0
+            total_cost = qty * cost_per_share
 
-                if total_cost >= self.min_trade_size and total_cost <= self.cash:
-                    ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
-                    if ok_u:
-                        trades_made.append(('UP', ap_u, aq_u))
-                    ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
-                    if ok_d:
-                        trades_made.append(('DOWN', ap_d, aq_d))
-                    self.current_mode = 'paired_entry'
-                    self.mode_reason = f'Paired entry @ combined ${combined_price:.3f}'
-                    print(f"🎯 PAIRED ENTRY: {qty:.1f} shares each | combined ${combined_price:.3f}")
-                    return trades_made
+            if total_cost >= self.min_trade_size and total_cost <= self.cash:
+                print(f"🎯 ENTERING: budget=${budget:.2f} qty={qty:.1f} combined=${combined_price:.3f} cash=${self.cash:.2f}")
+                ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                if ok_u:
+                    trades_made.append(('UP', ap_u, aq_u))
+                ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
+                if ok_d:
+                    trades_made.append(('DOWN', ap_d, aq_d))
+                self.current_mode = 'paired_entry'
+                self.mode_reason = f'Paired entry @ combined ${combined_price:.3f}'
+                print(f"🎯 PAIRED ENTRY: {qty:.1f} shares each | combined ${combined_price:.3f}")
+            else:
+                print(f"⚠️ ENTRY BLOCKED: budget=${budget:.2f} total_cost=${total_cost:.2f} cash=${self.cash:.2f} min_trade=${self.min_trade_size}")
+            return trades_made
 
         # ════════════════════════════════════════════════════════
         #  PAIRED GROWTH — Compound position with paired buys
