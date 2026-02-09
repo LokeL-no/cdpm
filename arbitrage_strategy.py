@@ -570,30 +570,31 @@ class ArbitrageStrategy:
         # ──────────────────────────────────────────────────────────
         #  PHASE 2b – MGP LOCK  (both sides exist, but MGP < 0)
         #  Buy smaller side to move toward positive MGP.
-        #  AGGRESSIVE: No deficit gate, scale budget by MGP negativity.
+        #  AGGRESSIVE: When MGP < 0, ignore existing pair_cost (sunk cost)
+        #  and focus ONLY on whether the NEW trade improves MGP.
         # ──────────────────────────────────────────────────────────
         if not self.both_scenarios_positive() and has_both_sides:
             smaller = self.smaller_side()
             if side != smaller:
                 return False, 0, f"MGP Lock: need {smaller}, not {side}"
 
-            p_max = self.max_price_for_positive_mgp()
+            # When MGP is negative, be VERY aggressive - buy at any price that improves MGP
+            # Price threshold: buying smaller side improves MGP when price < 1/FEE_MULT ≈ 0.985
+            max_recovery_price = 0.985 / FEE_MULT  # ≈ $0.970
+            
+            # Allow higher prices for MGP recovery when desperate
+            if current_mgp < -5.0:  # Very negative MGP - desperate
+                max_recovery_price = 0.97
+            elif current_mgp < -2.0:  # Moderately negative
+                max_recovery_price = 0.96
+            else:  # Slightly negative
+                max_recovery_price = min(0.95, self.max_price_for_positive_mgp())
 
-            if price > min(p_max, self.mgp_max_price):
-                return False, 0, f"MGP Lock: ${price:.3f} > p_max ${p_max:.3f}"
+            if price > max_recovery_price:
+                return False, 0, f"MGP Lock: ${price:.3f} > recovery max ${max_recovery_price:.3f}"
 
-            # Don't push pair_cost above threshold
-            my_avg = my_cost / my_qty if my_qty > 0 else price
-            other_avg = other_cost / other_qty if other_qty > 0 else 0
-            target_qty = max(self.deficit(), 1.0)  # At least 1 share even if balanced
-            if my_qty > 0:
-                est_new_avg = (my_cost + price * target_qty) / (my_qty + target_qty)
-            else:
-                est_new_avg = price
-            est_pair = est_new_avg + other_avg if side == 'UP' else other_avg + est_new_avg
-            if est_pair > self.max_pair_cost:
-                return False, 0, f"MGP Lock would push pair to ${est_pair:.3f}"
-
+            # Target qty: at least close the deficit, or 1 share minimum
+            target_qty = max(self.deficit(), 1.0)
             full_cost = target_qty * price
 
             # Check if buying full deficit would lock profit
@@ -683,14 +684,14 @@ class ArbitrageStrategy:
                 )
 
                 # Also buy if price is below our average (any discount helps)
-                price_below_avg = price < my_avg * 0.97  # 3% discount (was 5%)
+                price_below_avg = price < my_avg * 0.97  # 3% discount
 
-                # WHEN MGP < 0: buy smaller side at ANY price < 0.985
-                # Every share of smaller side at p < 0.985 improves MGP
+                # WHEN MGP < 0: buy smaller side at ANY price that improves MGP
+                # Every share of smaller side generally improves MGP when p < ~0.97
                 mgp_negative_buy = (
                     current_mgp < 0
                     and is_smaller
-                    and price < 0.985 / FEE_MULT  # price where benefit > 0
+                    and price < 0.97  # Reasonable price for recovery trades
                 )
 
                 if z_side_is_cheap or price_below_avg or mgp_negative_buy:
