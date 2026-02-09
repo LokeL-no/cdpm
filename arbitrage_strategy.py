@@ -76,8 +76,9 @@ class ArbitrageStrategy:
 
         # ── Trading parameters ──
         self.min_trade_size = 1.0        # Polymarket minimum ~$1
-        self.max_single_trade = 15.0     # Smaller trades = less risk
-        self.cooldown_seconds = 15       # 15s between trades — reduce overtrading
+        self.max_single_trade = 10.0     # Reduced from $15 to minimize slippage
+        self.max_shares_per_order = 100  # Max shares per single fill — stay on top-of-book
+        self.cooldown_seconds = 10       # 10s between trades — more frequent smaller trades
         self.last_trade_time = 0
 
         # ── Delta Neutral parameters ──
@@ -152,6 +153,7 @@ class ArbitrageStrategy:
         # ── Execution Simulator (realistic fills) ──
         self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
         self._pending_orderbooks: Dict[str, dict] = {'UP': {}, 'DOWN': {}}
+        self._book_depth_cap: Dict[str, float] = {'UP': 100.0, 'DOWN': 100.0}
 
     # ═══════════════════════════════════════════════════════════════
     #  PROPERTIES
@@ -491,11 +493,11 @@ class ArbitrageStrategy:
 
             # Smaller initial position — less risk
             if price <= self.ideal_entry_price:
-                spend = min(12.0, remaining_budget * 0.06)
-            elif price <= self.preferred_entry_price:
                 spend = min(8.0, remaining_budget * 0.04)
+            elif price <= self.preferred_entry_price:
+                spend = min(6.0, remaining_budget * 0.03)
             else:
-                spend = min(5.0, remaining_budget * 0.03)
+                spend = min(4.0, remaining_budget * 0.02)
 
             if spend < self.min_trade_size:
                 return False, 0, "Insufficient budget"
@@ -522,10 +524,10 @@ class ArbitrageStrategy:
             if potential_pair > self.max_pair_cost:
                 return False, 0, f"Hedge pair ${potential_pair:.3f} > max ${self.max_pair_cost}"
 
-            # Match the other side's quantity for perfect balance
+            # Match the other side's quantity — but in smaller bites to avoid slippage
             target_qty = other_qty
             cost_needed = target_qty * price
-            max_spend = min(cost_needed, remaining_budget * 0.50, self.cash * 0.30)
+            max_spend = min(cost_needed, remaining_budget * 0.25, self.cash * 0.15, self.max_single_trade)
             qty = max_spend / price if price > 0 else 0
 
             if qty * price < self.min_trade_size:
@@ -628,6 +630,13 @@ class ArbitrageStrategy:
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
+        # ── Cap qty to order book depth to minimize slippage ──
+        depth_cap = self._book_depth_cap.get(side, self.max_shares_per_order)
+        original_qty = qty
+        qty = min(qty, self.max_shares_per_order, depth_cap)
+        if qty < original_qty:
+            print(f"📏 [{side}] Size capped: {original_qty:.1f} → {qty:.1f} shares (book depth cap {depth_cap:.0f}, max {self.max_shares_per_order})")
+
         # ── Simulate realistic fill against order book ──
         orderbook = self._pending_orderbooks.get(side, {})
         fill = self.exec_sim.simulate_fill(side, price, qty, orderbook)
@@ -704,6 +713,26 @@ class ArbitrageStrategy:
         self._pending_orderbooks['UP'] = up_orderbook or {}
         self._pending_orderbooks['DOWN'] = down_orderbook or {}
 
+        # Dynamically cap order sizes based on order book depth
+        for ob_side, ob in [('UP', up_orderbook), ('DOWN', down_orderbook)]:
+            if ob and ob.get('asks'):
+                best_ask_size = 0
+                try:
+                    asks_sorted = sorted(ob['asks'], key=lambda a: float(a.get('price', 99)))
+                    # Use liquidity within 1% of best ask as safe fill zone
+                    best_price = float(asks_sorted[0].get('price', 0))
+                    for a in asks_sorted:
+                        p = float(a.get('price', 0))
+                        if p <= best_price * 1.01:  # within 1% of best
+                            best_ask_size += float(a.get('size', 0))
+                except (ValueError, IndexError):
+                    pass
+                if best_ask_size > 0:
+                    # Cap at 50% of near-touch liquidity to avoid walking the book
+                    self._book_depth_cap[ob_side] = best_ask_size * 0.50
+                else:
+                    self._book_depth_cap[ob_side] = self.max_shares_per_order
+
         # 1. Feed SpreadEngine
         se_info = self._feed_spread_engine(up_price, down_price)
 
@@ -732,7 +761,7 @@ class ArbitrageStrategy:
         if position_is_locked:
             # Still allow paired compounding if combined price is good
             if combined_price <= self.max_combined_entry:
-                budget = min(self.market_budget * 0.10, self.cash * 0.10, remaining_budget * 0.20)
+                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
                 cost_per_share = combined_price
                 qty = budget / cost_per_share if cost_per_share > 0 else 0
                 total_cost = qty * cost_per_share
@@ -771,7 +800,8 @@ class ArbitrageStrategy:
 
             if combined_price <= self.max_combined_entry:
                 # Paired entry: buy equal SHARE quantities of both sides
-                budget = min(self.market_budget * 0.20, self.cash * 0.20, remaining_budget * 0.40)
+                # Smaller sizes to minimize slippage on initial fills
+                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
                 # Equal shares so that min(qty_up, qty_down) is maximized
                 cost_per_share = up_price + down_price
                 qty = budget / cost_per_share
@@ -798,7 +828,7 @@ class ArbitrageStrategy:
             if combined_price < avg_pair_cost and combined_price <= self.max_combined_entry:
                 now = time.time()
                 if now - self.last_trade_time >= self.cooldown_seconds:
-                    budget = min(self.market_budget * 0.10, self.cash * 0.10, remaining_budget * 0.25)
+                    budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
                     cost_per_share = combined_price
                     qty = budget / cost_per_share if cost_per_share > 0 else 0
                     total_cost = qty * cost_per_share
