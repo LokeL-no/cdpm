@@ -52,7 +52,7 @@ FEE_MULT = 1.0 + FEE_RATE   # 1.015
 class ArbitrageStrategy:
     """MGP-Optimised Delta Neutral Arbitrage for Polymarket binary markets."""
 
-    def __init__(self, market_budget: float, starting_balance: float):
+    def __init__(self, market_budget: float, starting_balance: float, exec_sim: ExecutionSimulator = None):
         self.market_budget = market_budget
         self.starting_balance = starting_balance
         self.cash_ref = {'balance': starting_balance}
@@ -151,7 +151,8 @@ class ArbitrageStrategy:
         self.pnl_down_history: deque = deque(maxlen=120)
 
         # ── Execution Simulator (realistic fills) ──
-        self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
+        # Use shared instance if provided, so stats persist across markets
+        self.exec_sim = exec_sim or ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
         self._pending_orderbooks: Dict[str, dict] = {'UP': {}, 'DOWN': {}}
         self._book_depth_cap: Dict[str, float] = {'UP': 100.0, 'DOWN': 100.0}
 

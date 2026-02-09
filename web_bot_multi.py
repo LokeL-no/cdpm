@@ -17,6 +17,7 @@ import os
 
 # Import new arbitrage strategy
 from arbitrage_strategy import ArbitrageStrategy
+from execution_simulator import ExecutionSimulator
 
 # Supported assets
 SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
@@ -3616,7 +3617,7 @@ class PaperTrader:
 class MarketTracker:
     """Tracks a single market"""
     
-    def __init__(self, slug: str, asset: str, cash_ref: dict, market_budget: float):
+    def __init__(self, slug: str, asset: str, cash_ref: dict, market_budget: float, exec_sim: ExecutionSimulator = None):
         self.slug = slug
         self.asset = asset
         self.up_token_id = None
@@ -3628,8 +3629,8 @@ class MarketTracker:
         self.last_up_bid = 0.0
         self.last_down_bid = 0.0
         self.market_budget = market_budget
-        # NEW: Use ArbitrageStrategy instead of old PaperTrader
-        self.paper_trader = ArbitrageStrategy(market_budget=market_budget, starting_balance=market_budget)
+        # NEW: Use ArbitrageStrategy with shared ExecutionSimulator
+        self.paper_trader = ArbitrageStrategy(market_budget=market_budget, starting_balance=market_budget, exec_sim=exec_sim)
         self.paper_trader.cash_ref = cash_ref  # Share cash reference
         self.initialized = False
         self.last_update = 0
@@ -3662,6 +3663,8 @@ class MultiMarketBot:
         self.manual_markets_loaded = False
         self.trade_log: List[dict] = []
         self.paused = False
+        # Shared execution simulator — stats persist across all markets
+        self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
     
     async def load_manual_markets(self, session: aiohttp.ClientSession):
         """Load manually specified markets"""
@@ -3738,7 +3741,7 @@ class MultiMarketBot:
                                     down_token = tokens[0]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -3842,7 +3845,7 @@ class MultiMarketBot:
                                         down_token = tokens[i]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -4222,23 +4225,9 @@ class MultiMarketBot:
                             'total_pnl': total_pnl
                         }
                     
-                    # Aggregate execution simulator stats across all active markets
-                    total_slippage_cost = 0.0
-                    total_exec_fills = 0
-                    total_exec_rejections = 0
-                    total_exec_partials = 0
-                    all_recent_slippage = []
-                    for slug, tracker in self.active_markets.items():
-                        if hasattr(tracker.paper_trader, 'exec_sim'):
-                            es = tracker.paper_trader.exec_sim.get_stats()
-                            total_slippage_cost += es.get('total_slippage_cost', 0)
-                            total_exec_fills += es.get('total_fills', 0)
-                            total_exec_rejections += es.get('total_rejections', 0)
-                            total_exec_partials += es.get('total_partial_fills', 0)
-                            for slip in es.get('recent_slippage', []):
-                                slip['asset'] = tracker.asset.upper()
-                                all_recent_slippage.append(slip)
-                    all_recent_slippage.sort(key=lambda x: x.get('time', ''), reverse=True)
+                    # Use shared execution simulator stats (persists across all markets)
+                    es = self.exec_sim.get_stats()
+                    total_slippage_cost = es.get('total_slippage_cost', 0)
 
                     data = {
                         'starting_balance': self.starting_balance,
@@ -4251,16 +4240,8 @@ class MultiMarketBot:
                         'paused': self.paused,
                         'asset_wdl': asset_wdl,
                         'supported_assets': SUPPORTED_ASSETS,
-                        # Execution simulator aggregate stats
-                        'exec_stats': {
-                            'total_slippage_cost': round(total_slippage_cost, 4),
-                            'total_fills': total_exec_fills,
-                            'total_rejections': total_exec_rejections,
-                            'total_partial_fills': total_exec_partials,
-                            'fill_rate': round(total_exec_fills / max(1, total_exec_fills + total_exec_rejections) * 100, 1),
-                            'pnl_impact': round(-total_slippage_cost, 4),
-                            'recent_slippage': all_recent_slippage[:20],
-                        }
+                        # Execution simulator stats (shared, never resets between markets)
+                        'exec_stats': es
                     }
                     
                     await self.broadcast(data)
