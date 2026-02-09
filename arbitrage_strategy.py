@@ -76,8 +76,8 @@ class ArbitrageStrategy:
 
         # ── Trading parameters ──
         self.min_trade_size = 1.0        # Polymarket minimum ~$1
-        self.max_single_trade = 5.0      # Smaller trades for $100 budget
-        self.max_shares_per_order = 50   # Fits typical book depth at this budget
+        self.max_single_trade = 5.0      # Default for incremental trades
+        self.max_shares_per_order = 200  # Allow large fills for profit-locking
         self.api_rate_limit = 0.5        # 0.5s — only to avoid API throttle, NOT a trading cooldown
         self.last_trade_time = 0
 
@@ -105,8 +105,8 @@ class ArbitrageStrategy:
         self.mgp_budget_fraction = 0.20  # Budget fraction for MGP lock trades
 
         # ── Risk management ──
-        self.max_position_pct = 0.80     # Use up to 80% of $100 budget ($80)
-        self.min_reserve_cash = 5.0      # Keep $5 reserve
+        self.max_position_pct = 1.00     # Full budget available when locking profit
+        self.min_reserve_cash = 0.0      # No reserve — profit-locking uses everything
         self.max_loss_per_market = 10.0  # Max $10 loss per market
 
         # ── Pair cost limits ──
@@ -427,16 +427,15 @@ class ArbitrageStrategy:
         is_hedge_candidate = (my_qty == 0 and other_qty > 0)
 
         total_cost = self.cost_up + self.cost_down
-        budget_limit = self.starting_balance * self.max_position_pct
-        remaining_budget = max(0, budget_limit - total_cost)
+        remaining_budget = max(0, self.market_budget - total_cost)
         current_mgp = self.calculate_locked_profit()
         combined_price = price + other_price
 
         # ──────────────────────────────────────────────────────────
-        #  GLOBAL GUARD: Don't stop trading — keep compounding if MGP improves
+        #  BUDGET RULE: If a trade would lock profit (MGP > 0),
+        #  the bot may spend up to the FULL $100 market budget.
+        #  No sub-limits, no fractions — just lock the profit.
         # ──────────────────────────────────────────────────────────
-        invested_pct = total_cost / (self.starting_balance * self.max_position_pct) if self.starting_balance > 0 else 0
-        # No stop — we keep working to improve position
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 0 – EMERGENCY REBALANCE
@@ -458,9 +457,20 @@ class ArbitrageStrategy:
                 return False, 0, f"Rebalance: ${price:.3f} > max lock price ${p_max:.3f}"
 
             target_qty = self.deficit()
-            budget_cap = remaining_budget * 0.30  # More aggressive — up to 30% of remaining
-            max_by_budget = budget_cap / price if price > 0 else 0
-            qty = min(target_qty, max_by_budget, self.max_single_trade / price)
+
+            # Check if buying full deficit would lock profit
+            full_mgp = self.mgp_after_buy(side, price, target_qty)
+            full_cost = target_qty * price
+
+            if full_mgp >= 0 and full_cost <= remaining_budget and full_cost <= self.cash:
+                # PROFIT LOCK — use full budget, no sub-limits
+                qty = target_qty
+            else:
+                # Conservative — fractional budget
+                budget_cap = remaining_budget * 0.30
+                max_by_budget = budget_cap / price if price > 0 else 0
+                qty = min(target_qty, max_by_budget, self.max_single_trade / price)
+
             qty = max(0, qty)
 
             # Ensure minimum trade size
@@ -473,9 +483,10 @@ class ArbitrageStrategy:
             if new_mgp <= current_mgp:
                 return False, 0, f"Rebalance would not improve MGP"
 
+            lock_tag = ' 🔒 PROFIT LOCKED' if new_mgp >= 0 else ''
             self.current_mode = 'rebalancing'
-            self.mode_reason = f'⚖️ Δ {delta:.1f}% → balance | MGP ${current_mgp:.2f}→${new_mgp:.2f}'
-            return True, qty, f"⚖️ REBALANCE {side} {qty:.1f}×${price:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}"
+            self.mode_reason = f'⚖️ Δ {delta:.1f}% → balance | MGP ${current_mgp:.2f}→${new_mgp:.2f}{lock_tag}'
+            return True, qty, f"⚖️ REBALANCE {side} {qty:.1f}×${price:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}{lock_tag}"
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 1 – INITIAL ENTRY  (no position)
@@ -528,16 +539,26 @@ class ArbitrageStrategy:
             # Match the other side's quantity — aggressive hedge to lock profit fast
             target_qty = other_qty
             cost_needed = target_qty * price
-            max_spend = min(cost_needed, remaining_budget * 0.50, self.cash * 0.25, self.max_single_trade)
-            qty = max_spend / price if price > 0 else 0
+
+            # Check if full hedge would lock profit
+            full_mgp = self.mgp_after_buy(side, price, target_qty)
+
+            if full_mgp >= 0 and cost_needed <= remaining_budget and cost_needed <= self.cash:
+                # PROFIT LOCK — buy full hedge, no sub-limits
+                qty = target_qty
+            else:
+                # Conservative — fractional budget
+                max_spend = min(cost_needed, remaining_budget * 0.50, self.cash * 0.25, self.max_single_trade)
+                qty = max_spend / price if price > 0 else 0
 
             if qty * price < self.min_trade_size:
                 return False, 0, "Budget too low for hedge"
 
             new_mgp = self.mgp_after_buy(side, price, qty)
+            lock_tag = ' 🔒 PROFIT LOCKED' if new_mgp >= 0 else ''
             self.current_mode = 'hedge'
-            self.mode_reason = f'🔒 Hedging @ pair ${potential_pair:.3f} | MGP ${new_mgp:.2f}'
-            return True, qty, f"🔒 HEDGE {side} {qty:.1f}×${price:.3f} | pair ${potential_pair:.3f} | MGP ${new_mgp:.2f}"
+            self.mode_reason = f'🔒 Hedging @ pair ${potential_pair:.3f} | MGP ${new_mgp:.2f}{lock_tag}'
+            return True, qty, f"🔒 HEDGE {side} {qty:.1f}×${price:.3f} | pair ${potential_pair:.3f} | MGP ${new_mgp:.2f}{lock_tag}"
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 2b – MGP LOCK  (both sides exist, but MGP < 0)
@@ -567,9 +588,19 @@ class ArbitrageStrategy:
                 return False, 0, f"MGP Lock would push pair to ${est_pair:.3f}"
 
             target_qty = self.deficit()
-            budget_for_lock = remaining_budget * self.mgp_budget_fraction
-            max_by_budget = budget_for_lock / price if price > 0 else 0
-            qty = min(target_qty, max_by_budget)
+            full_cost = target_qty * price
+
+            # Check if buying full deficit would lock profit
+            full_mgp = self.mgp_after_buy(side, price, target_qty)
+
+            if full_mgp >= 0 and full_cost <= remaining_budget and full_cost <= self.cash:
+                # PROFIT LOCK — buy full deficit in one go
+                qty = target_qty
+            else:
+                # Conservative — fractional budget
+                budget_for_lock = remaining_budget * self.mgp_budget_fraction
+                max_by_budget = budget_for_lock / price if price > 0 else 0
+                qty = min(target_qty, max_by_budget)
 
             if qty * price < self.min_trade_size:
                 qty = self.min_trade_size / price
@@ -582,9 +613,10 @@ class ArbitrageStrategy:
             if delta_mgp <= 0:
                 return False, 0, f"MGP Lock: no improvement (ΔMGP=${delta_mgp:.3f})"
 
+            lock_tag = ' 🔒 PROFIT LOCKED' if new_mgp >= 0 else ''
             self.current_mode = 'mgp_lock'
-            self.mode_reason = f'🔒 Locking MGP: ${current_mgp:.2f}→${new_mgp:.2f}'
-            return True, qty, f"🔒 MGP LOCK {side} {qty:.1f}×${price:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}"
+            self.mode_reason = f'🔒 Locking MGP: ${current_mgp:.2f}→${new_mgp:.2f}{lock_tag}'
+            return True, qty, f"🔒 MGP LOCK {side} {qty:.1f}×${price:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}{lock_tag}"
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 3 – Z-SCORE GUIDED IMPROVEMENT
