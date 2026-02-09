@@ -442,6 +442,9 @@ class ArbitrageStrategy:
         #  PHASE 0 – EMERGENCY REBALANCE
         #  Only for TWO-SIDED positions where delta drifted high.
         #  ONE-SIDED positions (one side has 0 qty) go to Phase 2.
+        #  KEY: Use MGP improvement check, NOT combined price gate.
+        #  Combined price is irrelevant — we only care if buying
+        #  the smaller side improves MGP (it almost always does).
         # ──────────────────────────────────────────────────────────
         has_both_sides = self.qty_up > 0 and self.qty_down > 0
         if delta > self.max_allowed_delta_pct and has_both_sides:
@@ -449,24 +452,27 @@ class ArbitrageStrategy:
             if side != smaller:
                 return False, 0, f"Rebal: need {smaller}"
 
-            # Don't rebalance if it would create terrible pair_cost
-            potential_pair = price + other_price
-            if potential_pair > 0.98:
-                return False, 0, f"Rebalance pair ${potential_pair:.3f} too expensive"
-
-            if price > 0.60:
-                return False, 0, f"Rebalance price ${price:.2f} too high"
+            # Price sanity — don't buy if price is very high
+            p_max = self.max_price_for_positive_mgp()
+            if price > p_max:
+                return False, 0, f"Rebalance: ${price:.3f} > max lock price ${p_max:.3f}"
 
             target_qty = self.deficit()
-            budget_cap = remaining_budget * 0.20
+            budget_cap = remaining_budget * 0.30  # More aggressive — up to 30% of remaining
             max_by_budget = budget_cap / price if price > 0 else 0
             qty = min(target_qty, max_by_budget, self.max_single_trade / price)
             qty = max(0, qty)
 
+            # Ensure minimum trade size
             if qty * price < self.min_trade_size:
-                return False, 0, "Budget too low for rebalance"
+                qty = self.min_trade_size / price
+                if qty * price > remaining_budget:
+                    return False, 0, "Budget too low for rebalance"
 
             new_mgp = self.mgp_after_buy(side, price, qty)
+            if new_mgp <= current_mgp:
+                return False, 0, f"Rebalance would not improve MGP"
+
             self.current_mode = 'rebalancing'
             self.mode_reason = f'⚖️ Δ {delta:.1f}% → balance | MGP ${current_mgp:.2f}→${new_mgp:.2f}'
             return True, qty, f"⚖️ REBALANCE {side} {qty:.1f}×${price:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}"
@@ -582,55 +588,55 @@ class ArbitrageStrategy:
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 3 – Z-SCORE GUIDED IMPROVEMENT
-        #  When z-score is extreme, one side is temporarily cheap.
-        #  Buy the cheap side to lower its average → lowers pair_cost → improves MGP.
-        #  This is the KEY mechanism when combined > $1.00 at entry.
+        #  Buy the SMALLER side when z-score says it's cheap.
+        #  NEVER buy the larger side — that creates deficit.
+        #  EVERY trade MUST improve MGP — no exceptions.
         # ──────────────────────────────────────────────────────────
         if my_qty > 0 and (self.qty_up + self.qty_down) > 0:
             my_avg = my_cost / my_qty if my_qty > 0 else price
 
-            # Z-score tells us which side is cheap:
-            #   z << 0 → UP is cheap (buy UP to lower avg_up)
-            #   z >> 0 → DOWN is cheap (buy DOWN to lower avg_down)
-            z_threshold = 1.5  # Act on moderate z-score, not just extreme
-            z_side_is_cheap = (
-                (side == 'UP' and z < -z_threshold) or
-                (side == 'DOWN' and z > z_threshold)
-            )
+            # CRITICAL: Only buy the SMALLER side (or equal side at low delta)
+            # Never create or increase deficit — only close it
+            is_smaller = side == self.smaller_side()
+            is_balanced = self.deficit() < 1.0
 
-            # Also buy if price is simply below our average (improves pair_cost)
-            price_below_avg = price < my_avg
+            if not is_smaller and not is_balanced:
+                # This is the larger side — skip
+                pass
+            else:
+                # Z-score tells us if this side is cheap right now
+                z_threshold = 1.5
+                z_side_is_cheap = (
+                    (side == 'UP' and z < -z_threshold) or
+                    (side == 'DOWN' and z > z_threshold)
+                )
 
-            if z_side_is_cheap or price_below_avg:
-                # Don't make delta worse if already imbalanced
-                if side == self.position_delta_direction and delta > 10.0:
-                    return False, 0, "Larger side – skip z-score buy"
+                # Also buy if price is below our average (any discount helps)
+                price_below_avg = price < my_avg * 0.95  # Need 5% discount minimum
 
-                # Scale spend by z-score intensity — more extreme = more aggressive
-                az = abs(z)
-                if az > 3.0:
-                    spend = min(5.0, remaining_budget * 0.08)
-                elif az > 2.0:
-                    spend = min(4.0, remaining_budget * 0.06)
-                elif price_below_avg:
-                    spend = min(3.0, remaining_budget * 0.04)
-                else:
-                    spend = min(2.0, remaining_budget * 0.03)
+                if z_side_is_cheap or (price_below_avg and is_smaller):
+                    # Scale spend by z-score intensity
+                    az = abs(z)
+                    if az > 3.0:
+                        spend = min(5.0, remaining_budget * 0.08)
+                    elif az > 2.0:
+                        spend = min(4.0, remaining_budget * 0.06)
+                    else:
+                        spend = min(3.0, remaining_budget * 0.04)
 
-                if spend < self.min_trade_size:
-                    return False, 0, "Budget too low"
+                    if spend < self.min_trade_size:
+                        return False, 0, "Budget too low"
 
-                qty = spend / price if price > 0 else 0
-                new_mgp = self.mgp_after_buy(side, price, qty)
+                    qty = spend / price if price > 0 else 0
+                    new_mgp = self.mgp_after_buy(side, price, qty)
 
-                # Buy if it improves MGP OR if price is significantly below avg
-                discount_pct = (my_avg - price) / my_avg if my_avg > 0 else 0
-                if new_mgp > current_mgp or discount_pct > 0.10:
-                    new_avg = (my_cost + spend) / (my_qty + qty)
-                    reason_tag = f"z={z:.1f}" if z_side_is_cheap else f"discount {discount_pct*100:.0f}%"
-                    self.current_mode = 'z_rebalance'
-                    self.mode_reason = f'📊 Z-buy {side} ({reason_tag}) avg ${my_avg:.3f}→${new_avg:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}'
-                    return True, qty, f"📊 Z-SCORE {side} {qty:.1f}×${price:.3f} ({reason_tag}) | avg ${my_avg:.3f}→${new_avg:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}"
+                    # HARD RULE: Every trade MUST improve MGP
+                    if new_mgp > current_mgp:
+                        new_avg = (my_cost + spend) / (my_qty + qty)
+                        reason_tag = f"z={z:.1f}" if z_side_is_cheap else f"discount"
+                        self.current_mode = 'z_rebalance'
+                        self.mode_reason = f'📊 Z-buy {side} ({reason_tag}) avg ${my_avg:.3f}→${new_avg:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}'
+                        return True, qty, f"📊 Z-SCORE {side} {qty:.1f}×${price:.3f} ({reason_tag}) | avg ${my_avg:.3f}→${new_avg:.3f} | MGP ${current_mgp:.2f}→${new_mgp:.2f}"
 
         self.current_mode = 'seeking_arb'
         self.mode_reason = f'Monitoring | z={z:.2f} MGP=${current_mgp:.2f} pair=${combined_price:.3f}'
