@@ -89,16 +89,16 @@ class ArbitrageStrategy:
         self.rebalance_target_delta_pct = 2.0
 
         # ── Entry / Price limits ──
-        self.max_entry_price = 0.48      # Max price for ONE side on sequential entry
-        self.preferred_entry_price = 0.43
-        self.ideal_entry_price = 0.38
+        self.max_entry_price = 0.60      # Allow entry up to $0.60 per side
+        self.preferred_entry_price = 0.50
+        self.ideal_entry_price = 0.45
 
         # ── Paired entry ── (buy both sides simultaneously)
         # Polymarket UP+DOWN always sums to ~$1.00 due to market efficiency.
         # We profit when combined < $1.00 minus fees (~1.5%).
         # So max_combined = $0.985 gives ~1.5 cent profit per matched share.
-        self.max_combined_entry = 0.985  # Realistic: UP+DOWN < this for paired entry
-        self.min_time_to_enter = 300     # Need 5 min (300s) left for new entries
+        self.max_combined_entry = 0.995  # Enter as long as combined < $0.995
+        self.min_time_to_enter = 120     # Enter up to 2 min before close
 
         # ── MGP-specific limits ──
         self.mgp_max_price = 0.55        # Max price when MGP-balancing
@@ -112,9 +112,9 @@ class ArbitrageStrategy:
         # ── Pair cost limits ──
         # pair_cost = avg_up + avg_down; must stay < $1.00 for profit
         # After ~1.5% Polymarket fees, need pair_cost < ~0.985 to break even
-        self.max_pair_cost = 0.99        # Hard ceiling for hedge pair_cost
-        self.warning_pair_cost = 0.96
-        self.profitable_pair_cost = 0.98 # Below this = likely profit after fees
+        self.max_pair_cost = 0.995       # Hard ceiling for hedge pair_cost
+        self.warning_pair_cost = 0.97
+        self.profitable_pair_cost = 0.99 # Below this = likely profit after fees
         # Accumulation cooldown
         self.accumulate_cooldown = 60    # Seconds between accumulate trades
         self._last_accumulate_time = 0
@@ -433,11 +433,10 @@ class ArbitrageStrategy:
         combined_price = price + other_price
 
         # ──────────────────────────────────────────────────────────
-        #  GLOBAL GUARD: If profit is locked with meaningful position, STOP.
+        #  GLOBAL GUARD: Don't stop trading — keep compounding if MGP improves
         # ──────────────────────────────────────────────────────────
         invested_pct = total_cost / (self.starting_balance * self.max_position_pct) if self.starting_balance > 0 else 0
-        if self.both_scenarios_positive() and current_mgp > self.profit_lock_threshold and invested_pct >= self.min_invested_to_lock:
-            return False, 0, f"Profit locked ${current_mgp:.2f} — holding"
+        # No stop — we keep working to improve position
 
         # ──────────────────────────────────────────────────────────
         #  PHASE 0 – EMERGENCY REBALANCE
@@ -756,9 +755,9 @@ class ArbitrageStrategy:
             and invested_pct >= self.min_invested_to_lock
         )
         if position_is_locked:
-            # Compound aggressively — profit is secured, grow the position
+            # Keep compounding — every pair at combined < max improves MGP
             if combined_price <= self.max_combined_entry:
-                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.12, self.max_single_trade)
+                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.20, self.max_single_trade)
                 cost_per_share = combined_price
                 qty = budget / cost_per_share if cost_per_share > 0 else 0
                 total_cost = qty * cost_per_share
@@ -798,8 +797,7 @@ class ArbitrageStrategy:
                 return trades_made
 
             if combined_price <= self.max_combined_entry:
-                # Paired entry: buy equal SHARE quantities of both sides
-                # Small initial position — will compound quickly after
+                # Always enter — work to secure profit from inside
                 budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
                 # Equal shares so that min(qty_up, qty_down) is maximized
                 cost_per_share = up_price + down_price

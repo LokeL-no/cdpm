@@ -20,7 +20,7 @@ from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
 
 # Supported assets
-SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
+SUPPORTED_ASSETS = ['btc', 'eth']
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
