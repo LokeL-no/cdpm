@@ -102,7 +102,7 @@ class ArbitrageStrategy:
 
         # ── MGP-specific limits ──
         self.mgp_max_price = 0.55        # Max price when MGP-balancing
-        self.mgp_budget_fraction = 0.10  # Budget fraction for MGP lock trades
+        self.mgp_budget_fraction = 0.20  # Budget fraction for MGP lock trades
 
         # ── Risk management ──
         self.max_position_pct = 0.35     # Limit exposure per market
@@ -120,8 +120,8 @@ class ArbitrageStrategy:
         self._last_accumulate_time = 0
 
         # ── Profit lock threshold ──
-        self.profit_lock_threshold = 0.20   # Lower threshold — lock profit earlier
-        self.min_invested_to_lock = 0.05   # Only need 5% invested to start compounding
+        self.profit_lock_threshold = 0.50   # Only stop trading when MGP > $0.50
+        self.min_invested_to_lock = 0.10   # Need 10% invested before we stop
 
         # (Hedge uses same api_rate_limit — no separate cooldown needed)
 
@@ -520,10 +520,10 @@ class ArbitrageStrategy:
             if potential_pair > self.max_pair_cost:
                 return False, 0, f"Hedge pair ${potential_pair:.3f} > max ${self.max_pair_cost}"
 
-            # Match the other side's quantity — but in smaller bites to avoid slippage
+            # Match the other side's quantity — aggressive hedge to lock profit fast
             target_qty = other_qty
             cost_needed = target_qty * price
-            max_spend = min(cost_needed, remaining_budget * 0.25, self.cash * 0.15, self.max_single_trade)
+            max_spend = min(cost_needed, remaining_budget * 0.50, self.cash * 0.25, self.max_single_trade)
             qty = max_spend / price if price > 0 else 0
 
             if qty * price < self.min_trade_size:
@@ -593,13 +593,13 @@ class ArbitrageStrategy:
             my_avg = my_cost / my_qty
             discount_pct = (my_avg - price) / my_avg if my_avg > 0 else 0
 
-            # Only improve if significant discount AND it's the smaller/equal side
-            if discount_pct > 0.08:
+            # Improve at moderate discount — lower avg means easier hedge
+            if discount_pct > 0.05:
                 # Don't improve the larger side (makes delta worse)
                 if side == self.position_delta_direction and delta > 3.0:
                     return False, 0, "Larger side – skip improvement"
 
-                spend = min(5.0, remaining_budget * 0.03)
+                spend = min(8.0, remaining_budget * 0.05)
                 if spend < self.min_trade_size:
                     return False, 0, "Budget too low"
 
@@ -756,9 +756,9 @@ class ArbitrageStrategy:
             and invested_pct >= self.min_invested_to_lock
         )
         if position_is_locked:
-            # Compound aggressively but in small bites every tick
+            # Compound aggressively — profit is secured, grow the position
             if combined_price <= self.max_combined_entry:
-                budget = min(self.market_budget * 0.03, self.cash * 0.03, remaining_budget * 0.08, self.max_single_trade)
+                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.12, self.max_single_trade)
                 cost_per_share = combined_price
                 qty = budget / cost_per_share if cost_per_share > 0 else 0
                 total_cost = qty * cost_per_share
@@ -800,7 +800,7 @@ class ArbitrageStrategy:
             if combined_price <= self.max_combined_entry:
                 # Paired entry: buy equal SHARE quantities of both sides
                 # Small initial position — will compound quickly after
-                budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.10, self.max_single_trade)
+                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.15, self.max_single_trade)
                 # Equal shares so that min(qty_up, qty_down) is maximized
                 cost_per_share = up_price + down_price
                 qty = budget / cost_per_share
@@ -825,15 +825,15 @@ class ArbitrageStrategy:
         # ════════════════════════════════════════════════════════
         if self.qty_up > 0 and self.qty_down > 0 and not position_is_locked:
             avg_pair_cost = (self.cost_up + self.cost_down) / min(self.qty_up, self.qty_down) if min(self.qty_up, self.qty_down) > 0 else 99
-            # Only compound at combined price cheaper than our current avg pair cost
-            if combined_price < avg_pair_cost and combined_price <= self.max_combined_entry:
+            # Compound at any favorable combined price that improves MGP
+            if combined_price <= self.max_combined_entry:
                 now = time.time()
                 if now - self.last_trade_time >= self.api_rate_limit:
-                    budget = min(self.market_budget * 0.03, self.cash * 0.03, remaining_budget * 0.08, self.max_single_trade)
+                    budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.12, self.max_single_trade)
                     cost_per_share = combined_price
                     qty = budget / cost_per_share if cost_per_share > 0 else 0
                     total_cost = qty * cost_per_share
-                if qty > 0.5 and total_cost >= self.min_trade_size and total_cost <= self.cash:
+                if qty > 0.3 and total_cost >= self.min_trade_size and total_cost <= self.cash:
                         # Verify it actually improves MGP
                         new_qty_up = self.qty_up + qty
                         new_qty_down = self.qty_down + qty
@@ -880,17 +880,16 @@ class ArbitrageStrategy:
                 trades_made.append((first_side, ap_f, aq_f))
                 print(f"✅ {reason}")
 
-        # Try other side (only if first didn't trade)
-        if not trades_made:
-            second_side = 'DOWN' if first_side == 'UP' else 'UP'
-            price_2 = up_price if second_side == 'UP' else down_price
-            other_2 = down_price if second_side == 'UP' else up_price
-            ok2, qty2, reason2 = self.should_buy(second_side, price_2, other_2, se_info, time_to_close=time_to_close)
-            if ok2 and qty2 > 0:
-                ok_s, ap_s, aq_s = self.execute_buy(second_side, price_2, qty2, timestamp)
-                if ok_s:
-                    trades_made.append((second_side, ap_s, aq_s))
-                    print(f"✅ {reason2}")
+        # Try other side too — both sides can trade in same tick for faster balancing
+        second_side = 'DOWN' if first_side == 'UP' else 'UP'
+        price_2 = up_price if second_side == 'UP' else down_price
+        other_2 = down_price if second_side == 'UP' else up_price
+        ok2, qty2, reason2 = self.should_buy(second_side, price_2, other_2, se_info, time_to_close=time_to_close)
+        if ok2 and qty2 > 0:
+            ok_s, ap_s, aq_s = self.execute_buy(second_side, price_2, qty2, timestamp)
+            if ok_s:
+                trades_made.append((second_side, ap_s, aq_s))
+                print(f"✅ {reason2}")
 
         # Track prices for reactive logic
         self._prev_up_price = up_price
