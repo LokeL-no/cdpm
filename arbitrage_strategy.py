@@ -907,6 +907,13 @@ class ArbitrageStrategy:
                 self.mode_reason = f'Only {time_to_close:.0f}s left — skipping market'
                 return trades_made
 
+            # CRITICAL: Never enter when combined price > max_combined_entry
+            # Combined > $1.00 means guaranteed loss after fees!
+            if combined_price > self.max_combined_entry:
+                self.current_mode = 'seeking_arb'
+                self.mode_reason = f'⏳ Waiting for spread | combined ${combined_price:.3f} > ${self.max_combined_entry:.3f}'
+                return trades_made
+
             # Scale initial entry by combined price quality
             if combined_price < 0.98:
                 entry_pct = 0.15  # Great price — enter bigger
