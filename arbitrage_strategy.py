@@ -42,6 +42,7 @@ from spread_engine import (
     SIGNAL_LONG_UP_SHORT_DOWN,
     SIGNAL_EXIT_ALL,
 )
+from execution_simulator import ExecutionSimulator, FillResult
 
 # Fee rate (Polymarket ~1.5 % effective)
 FEE_RATE = 0.015
@@ -147,6 +148,10 @@ class ArbitrageStrategy:
         self.mgp_history: deque = deque(maxlen=120)  # ~2 min at 1s ticks
         self.pnl_up_history: deque = deque(maxlen=120)
         self.pnl_down_history: deque = deque(maxlen=120)
+
+        # ── Execution Simulator (realistic fills) ──
+        self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
+        self._pending_orderbooks: Dict[str, dict] = {'UP': {}, 'DOWN': {}}
 
     # ═══════════════════════════════════════════════════════════════
     #  PROPERTIES
@@ -622,24 +627,58 @@ class ArbitrageStrategy:
                     timestamp: str = None) -> bool:
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-        cost = price * qty
-        if cost > self.cash:
+
+        # ── Simulate realistic fill against order book ──
+        orderbook = self._pending_orderbooks.get(side, {})
+        fill = self.exec_sim.simulate_fill(side, price, qty, orderbook)
+
+        if not fill.filled:
+            print(f"❌ [{side}] ORDER REJECTED: {fill.reason}")
             return False
 
-        self.cash -= cost
+        # Use actual fill price and qty from simulator
+        actual_price = fill.fill_price
+        actual_qty = fill.filled_qty
+        actual_cost = fill.total_cost
+
+        if actual_cost > self.cash:
+            return False
+
+        # Log slippage if it occurred
+        if fill.slippage > 0.00001:
+            slip_dir = "WORSE" if fill.slippage > 0 else "BETTER"
+            print(
+                f"⚡ [{side}] SLIPPAGE: wanted ${price:.4f} → got ${actual_price:.4f} "
+                f"({slip_dir} {fill.slippage_pct:+.3f}%, cost +${fill.slippage_cost:.4f}) "
+                f"| {fill.levels_consumed} level(s) | latency {fill.latency_ms:.0f}ms"
+            )
+        if fill.partial:
+            print(
+                f"⚠️ [{side}] PARTIAL FILL: {actual_qty:.1f}/{qty:.1f} shares "
+                f"({actual_qty/qty*100:.0f}%)"
+            )
+
+        self.cash -= actual_cost
         self.trade_count += 1
         self.last_trade_time = time.time()
 
         if side == 'UP':
-            self.qty_up += qty
-            self.cost_up += cost
+            self.qty_up += actual_qty
+            self.cost_up += actual_cost
         else:
-            self.qty_down += qty
-            self.cost_down += cost
+            self.qty_down += actual_qty
+            self.cost_down += actual_cost
 
         self.trade_log.append({
             'time': timestamp, 'side': 'BUY', 'token': side,
-            'price': price, 'qty': qty, 'cost': cost
+            'price': actual_price, 'qty': actual_qty, 'cost': actual_cost,
+            'desired_price': price, 'desired_qty': qty,
+            'slippage': round(fill.slippage, 6),
+            'slippage_pct': round(fill.slippage_pct, 4),
+            'slippage_cost': round(fill.slippage_cost, 6),
+            'partial': fill.partial,
+            'levels': fill.levels_consumed,
+            'latency_ms': fill.latency_ms,
         })
         if len(self.trade_log) > 50:
             self.trade_log = self.trade_log[-50:]
@@ -653,11 +692,17 @@ class ArbitrageStrategy:
                         timestamp: str,
                         time_to_close: float = None,
                         up_bid: Optional[float] = None,
-                        down_bid: Optional[float] = None) -> List[Tuple[str, float, float]]:
+                        down_bid: Optional[float] = None,
+                        up_orderbook: Optional[dict] = None,
+                        down_orderbook: Optional[dict] = None) -> List[Tuple[str, float, float]]:
         trades_made: List[Tuple[str, float, float]] = []
 
         if up_price <= 0 or down_price <= 0:
             return trades_made
+
+        # Store orderbooks for execute_buy() to use
+        self._pending_orderbooks['UP'] = up_orderbook or {}
+        self._pending_orderbooks['DOWN'] = down_orderbook or {}
 
         # 1. Feed SpreadEngine
         se_info = self._feed_spread_engine(up_price, down_price)
@@ -893,6 +938,8 @@ class ArbitrageStrategy:
             'bb_upper_history': se.get('bb_upper_history', []),
             'bb_lower_history': se.get('bb_lower_history', []),
             'signal_history': se.get('signal_history', []),
+            # Execution simulator stats (slippage, latency, fill quality)
+            'exec_stats': self.exec_sim.get_stats(),
         }
 
     def get_status_summary(self) -> Dict:

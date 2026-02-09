@@ -447,6 +447,54 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
+        <!-- Execution Simulator Panel (Slippage & Latency) -->
+        <div class="exec-sim-panel" style="margin-bottom: 20px; background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
+            <h2 style="color: #f59e0b; margin-bottom: 12px;">⚡ Execution Simulator (25ms latency)</h2>
+            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 15px;">
+                <div style="text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Total Fills</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #22c55e;" id="exec-fills">0</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Rejections</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #ef4444;" id="exec-rejections">0</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Partial Fills</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #f59e0b;" id="exec-partials">0</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Fill Rate</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #3b82f6;" id="exec-fill-rate">--</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="color: #888; font-size: 11px;">PnL Impact (Slippage)</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="exec-pnl-impact">$0.00</div>
+                </div>
+            </div>
+            <div id="slippage-log" style="max-height: 200px; overflow-y: auto; font-size: 11px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr style="color: #888; border-bottom: 1px solid #333;">
+                            <th style="text-align: left; padding: 4px 6px;">Time</th>
+                            <th style="text-align: left; padding: 4px 6px;">Asset</th>
+                            <th style="text-align: left; padding: 4px 6px;">Side</th>
+                            <th style="text-align: right; padding: 4px 6px;">Wanted</th>
+                            <th style="text-align: right; padding: 4px 6px;">Got</th>
+                            <th style="text-align: right; padding: 4px 6px;">Slip %</th>
+                            <th style="text-align: right; padding: 4px 6px;">Slip $</th>
+                            <th style="text-align: right; padding: 4px 6px;">Qty</th>
+                            <th style="text-align: center; padding: 4px 6px;">Levels</th>
+                            <th style="text-align: center; padding: 4px 6px;">Partial</th>
+                        </tr>
+                    </thead>
+                    <tbody id="slippage-tbody">
+                        <tr><td colspan="10" style="color: #555; text-align: center; padding: 15px;">No slippage events yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
         <h2 style="color: #3b82f6; margin-bottom: 15px;">📊 Active Markets</h2>
         <div class="markets-grid" id="active-markets">
             <div style="color: #888; text-align: center; padding: 40px; grid-column: span 2;">
@@ -793,8 +841,14 @@ HTML_TEMPLATE = """
             document.getElementById('current-balance').textContent = data.true_balance.toFixed(2);
             
             const totalPnl = data.true_balance - data.starting_balance;
+            const slippageCost = (data.exec_stats && data.exec_stats.total_slippage_cost) || 0;
             const pnlEl = document.getElementById('total-pnl');
-            pnlEl.textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
+            if (slippageCost > 0.001) {
+                pnlEl.innerHTML = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2) + 
+                    '<br><span style="font-size:11px;color:#f59e0b;">slip: -$' + slippageCost.toFixed(4) + '</span>';
+            } else {
+                pnlEl.textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
+            }
             pnlEl.className = 'value ' + (totalPnl >= 0 ? 'profit' : 'loss');
             
             document.getElementById('markets-resolved').textContent = data.history.length;
@@ -1147,6 +1201,45 @@ HTML_TEMPLATE = """
                 } else {
                     pauseBtn.textContent = '⏸️ PAUSE';
                     pauseBtn.style.background = '#f59e0b';
+                }
+            }
+            
+            // Update Execution Simulator panel
+            if (data.exec_stats) {
+                const es = data.exec_stats;
+                document.getElementById('exec-fills').textContent = es.total_fills || 0;
+                document.getElementById('exec-rejections').textContent = es.total_rejections || 0;
+                document.getElementById('exec-partials').textContent = es.total_partial_fills || 0;
+                document.getElementById('exec-fill-rate').textContent = (es.fill_rate || 0) + '%';
+                
+                const pnlImpact = es.pnl_impact || 0;
+                const pnlEl = document.getElementById('exec-pnl-impact');
+                pnlEl.textContent = (pnlImpact >= 0 ? '' : '-') + '$' + Math.abs(pnlImpact).toFixed(4);
+                pnlEl.style.color = pnlImpact >= 0 ? '#22c55e' : '#ef4444';
+                
+                // Update slippage log table
+                const slipTbody = document.getElementById('slippage-tbody');
+                if (es.recent_slippage && es.recent_slippage.length > 0) {
+                    let slipHtml = '';
+                    for (const s of es.recent_slippage) {
+                        const slipColor = s.slip_pct > 0 ? '#ef4444' : s.slip_pct < 0 ? '#22c55e' : '#888';
+                        const partialBadge = s.partial ? '<span style="color:#f59e0b;">⚠️</span>' : '✓';
+                        slipHtml += `
+                            <tr style="border-bottom: 1px solid #1a1a2e;">
+                                <td style="padding: 3px 6px; color: #888;">${s.time || '--'}</td>
+                                <td style="padding: 3px 6px; color: #3b82f6;">${s.asset || '--'}</td>
+                                <td style="padding: 3px 6px; color: ${s.side === 'UP' ? '#22c55e' : '#ef4444'};">${s.side}</td>
+                                <td style="padding: 3px 6px; text-align: right;">$${(s.desired || 0).toFixed(4)}</td>
+                                <td style="padding: 3px 6px; text-align: right;">$${(s.filled || 0).toFixed(4)}</td>
+                                <td style="padding: 3px 6px; text-align: right; color: ${slipColor};">${s.slip_pct > 0 ? '+' : ''}${(s.slip_pct || 0).toFixed(3)}%</td>
+                                <td style="padding: 3px 6px; text-align: right; color: ${slipColor};">$${(s.slip_cost || 0).toFixed(4)}</td>
+                                <td style="padding: 3px 6px; text-align: right;">${(s.qty || 0).toFixed(1)}</td>
+                                <td style="padding: 3px 6px; text-align: center;">${s.levels || 1}</td>
+                                <td style="padding: 3px 6px; text-align: center;">${partialBadge}</td>
+                            </tr>
+                        `;
+                    }
+                    slipTbody.innerHTML = slipHtml;
                 }
             }
         }
@@ -3887,7 +3980,9 @@ class MultiMarketBot:
                     timestamp,
                     time_to_close=time_to_close,
                     up_bid=up_bid,
-                    down_bid=down_bid
+                    down_bid=down_bid,
+                    up_orderbook=up_book,
+                    down_orderbook=down_book
                 )
                 
                 if trades:
@@ -4127,6 +4222,24 @@ class MultiMarketBot:
                             'total_pnl': total_pnl
                         }
                     
+                    # Aggregate execution simulator stats across all active markets
+                    total_slippage_cost = 0.0
+                    total_exec_fills = 0
+                    total_exec_rejections = 0
+                    total_exec_partials = 0
+                    all_recent_slippage = []
+                    for slug, tracker in self.active_markets.items():
+                        if hasattr(tracker.paper_trader, 'exec_sim'):
+                            es = tracker.paper_trader.exec_sim.get_stats()
+                            total_slippage_cost += es.get('total_slippage_cost', 0)
+                            total_exec_fills += es.get('total_fills', 0)
+                            total_exec_rejections += es.get('total_rejections', 0)
+                            total_exec_partials += es.get('total_partial_fills', 0)
+                            for slip in es.get('recent_slippage', []):
+                                slip['asset'] = tracker.asset.upper()
+                                all_recent_slippage.append(slip)
+                    all_recent_slippage.sort(key=lambda x: x.get('time', ''), reverse=True)
+
                     data = {
                         'starting_balance': self.starting_balance,
                         'current_balance': self.cash_ref['balance'],
@@ -4137,7 +4250,17 @@ class MultiMarketBot:
                         'trade_log': self.trade_log,
                         'paused': self.paused,
                         'asset_wdl': asset_wdl,
-                        'supported_assets': SUPPORTED_ASSETS
+                        'supported_assets': SUPPORTED_ASSETS,
+                        # Execution simulator aggregate stats
+                        'exec_stats': {
+                            'total_slippage_cost': round(total_slippage_cost, 4),
+                            'total_fills': total_exec_fills,
+                            'total_rejections': total_exec_rejections,
+                            'total_partial_fills': total_exec_partials,
+                            'fill_rate': round(total_exec_fills / max(1, total_exec_fills + total_exec_rejections) * 100, 1),
+                            'pnl_impact': round(-total_slippage_cost, 4),
+                            'recent_slippage': all_recent_slippage[:20],
+                        }
                     }
                     
                     await self.broadcast(data)
@@ -4145,7 +4268,9 @@ class MultiMarketBot:
                     self.update_count += 1
                     if self.update_count % 10 == 0:
                         total_pnl = true_balance - self.starting_balance
-                        print(f"📊 Cash: ${self.cash_ref['balance']:.2f} | True Balance: ${true_balance:.2f} | PnL: ${total_pnl:+.2f} | Active: {len(self.active_markets)}")
+                        slip_str = f" | Slippage: -${total_slippage_cost:.4f}" if total_slippage_cost > 0 else ""
+                        adj_pnl = total_pnl - total_slippage_cost
+                        print(f"📊 Cash: ${self.cash_ref['balance']:.2f} | True Balance: ${true_balance:.2f} | Paper PnL: ${total_pnl:+.2f} | Real PnL (adj): ${adj_pnl:+.2f}{slip_str} | Active: {len(self.active_markets)}")
                     
                 except Exception as e:
                     import traceback
