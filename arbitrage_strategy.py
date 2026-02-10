@@ -324,7 +324,7 @@ class ArbitrageStrategy:
         self.winner_entry_price_max = 0.57  # Entry cap: max $0.57 (v8.0)
         self.loser_entry_price_max = 0.38   # Only buy loser at $0.38 or below (v8.0)
         self.arb_lock_max_pair_cost = 0.95  # Arb-lock only when pair cost ≤ $0.95 (v8.0)
-        self.pivot_entry_price_max = 0.57   # Pivot entries: same as entry cap $0.57 (v8.3)
+        self.pivot_entry_price_max = 0.62   # Pivot entries: up to $0.62 (v8.4.4 — pivots are defensive)
 
         # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
