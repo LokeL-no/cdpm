@@ -324,16 +324,15 @@ class ArbitrageStrategy:
         self.winner_entry_price_max = 0.75  # Don't buy winner above $0.75 (enter aggressively)
         self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
 
-        # ── MARKET-FLIP PIVOT (NEW v6.3) ──
-        #  When the market flips (our primary holding is now the loser),
-        #  buy enough of the new winner to exceed the old position.
-        #  Simple: match the other side's qty + buffer.
-        #  If it flips again, repeat — always weight toward current winner.
+        # ── MARKET-FLIP PIVOT (v6.3) ──
+        #  When the market flips, buy enough of the new winner that
+        #  if that side wins → profit (covers all accumulated cost).
+        #  If it flips again, repeat — always enough to profit on current winner.
         self.pivot_enabled = True
         self.pivot_winner_threshold = 0.55  # New winner must be >= 55% probability
-        self.pivot_buffer = 0.15            # Buy 15% more shares than other side
-        self._pivot_mode = False            # Set per-tick
-        self._pivot_target_qty = 0.0        # Shares to buy this pivot
+        self.pivot_profit_buffer = 0.10     # 10% past break-even for profit margin
+        self._pivot_mode = False
+        self._pivot_target_qty = 0.0
 
         # ── Momentum Filter ──
         self.require_momentum_confirm = True
@@ -905,6 +904,10 @@ class ArbitrageStrategy:
         # Combined entry score (for UI display)
         self._entry_score = max(0, -min(z_up, z_down) * 25)
 
+        # Early arb check for stop conditions
+        _early_combined = up_price + down_price
+        has_arb_opportunity = (BREAK_EVEN - _early_combined) > 0
+
         # ════════════════════════════════════════════════════════
         #  STOP CONDITIONS
         # ════════════════════════════════════════════════════════
@@ -912,19 +915,25 @@ class ArbitrageStrategy:
         if self.market_status in ('stopped', 'resolved', 'closed'):
             return trades_made
 
+        # Skip stop-loss if arb exists (can still recover) or pivot in progress
         if mgp < -self.max_loss_per_market and has_position:
-            self.market_status = 'stopped'
-            self.current_mode = 'stopped'
-            self.mode_reason = f'🛑 Stop loss — MGP ${mgp:.2f}'
-            self._record_history()
-            return trades_made
+            if not has_arb_opportunity and self._pivot_mode is None:
+                self.market_status = 'stopped'
+                self.current_mode = 'stopped'
+                self.mode_reason = f'🛑 Stop loss — MGP ${mgp:.2f}'
+                self._record_history()
+                return trades_made
+            # else: arb exists or pivoting — skip stop-loss, let bot try to recover
 
+        # Budget exhausted — hold unless arb opportunity exists (can still lock profit)
         if remaining_budget < self.min_trade_size and has_position:
-            self.current_mode = 'holding'
-            self.mode_reason = (f'💰 Budget used ${total_invested:.0f}/${self.market_budget:.0f} | '
-                                f'MGP ${mgp:.2f} | Δ {self.position_delta_pct:.0f}%')
-            self._record_history()
-            return trades_made
+            if not has_arb_opportunity:
+                self.current_mode = 'holding'
+                self.mode_reason = (f'💰 Budget used ${total_invested:.0f}/${self.market_budget:.0f} | '
+                                    f'MGP ${mgp:.2f} | Δ {self.position_delta_pct:.0f}%')
+                self._record_history()
+                return trades_made
+            # else: arb exists — let bot continue to ARB-LOCK even with tiny budget
 
         if time_to_close is not None and time_to_close < self.min_time_to_enter and not has_position:
             self.current_mode = 'too_late'
@@ -985,18 +994,24 @@ class ArbitrageStrategy:
 
         if has_position and not has_arb_opportunity:
             # ── Market-flip detection (v6.3 Pivot) ──
-            #  Simple logic: if our heavier side is the loser, pivot.
-            #  Buy enough of the new winner to EXCEED what we hold on the old side.
-            #  If market flips again, repeat — always weight toward current winner.
+            #  If our heavier side is losing, buy enough of the new winner
+            #  that if it wins → total payout > total cost × fees.
             new_winner = 'DOWN' if down_price > up_price else 'UP'
             new_winner_price = down_price if new_winner == 'DOWN' else up_price
             qty_new = self.qty_down if new_winner == 'DOWN' else self.qty_up
-            qty_old = self.qty_up if new_winner == 'DOWN' else self.qty_down
             primary_side = 'UP' if self.qty_up >= self.qty_down else 'DOWN'
 
-            # Target: match the old side qty + buffer, minus what we already have
-            target_qty = qty_old * (1.0 + self.pivot_buffer)
-            additional_needed = max(0, target_qty - qty_new)
+            # Break-even formula: qty_needed × $1 = total_cost_after × FEE_MULT
+            #  qty_needed = (cost_before + qty_needed × price) × FEE_MULT
+            #  qty_needed × (1 - price × FEE_MULT) = cost_before × FEE_MULT
+            total_cost_before = self.cost_up + self.cost_down
+            denom = 1.0 - new_winner_price * FEE_MULT
+            if denom > 0.01:
+                be_qty = (total_cost_before * FEE_MULT) / denom
+                target_qty = be_qty * (1.0 + self.pivot_profit_buffer)
+                additional_needed = max(0, target_qty - qty_new)
+            else:
+                additional_needed = 0
 
             need_pivot = (self.pivot_enabled and
                           new_winner_price >= self.pivot_winner_threshold and
@@ -1006,9 +1021,11 @@ class ArbitrageStrategy:
             if need_pivot:
                 self._pivot_mode = True
                 self._pivot_target_qty = additional_needed
-                print(f"🔄 PIVOT: {primary_side} was ours, {new_winner} now winner "
-                      f"@ ${new_winner_price:.3f} | have {qty_new:.1f}, need {target_qty:.1f} "
-                      f"(+{additional_needed:.1f}sh)")
+                pnl_new = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
+                           else self.calculate_pnl_if_up_wins())
+                print(f"🔄 PIVOT: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                      f"need +{additional_needed:.1f}sh (${additional_needed * new_winner_price:.2f}) | "
+                      f"current {new_winner} pnl=${pnl_new:.2f}")
             else:
                 self.current_mode = 'waiting_for_dip'
                 self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
@@ -1016,10 +1033,59 @@ class ArbitrageStrategy:
                 self._record_history()
                 return trades_made
 
-        # When pivoting (v6.3b), override priority to NEUTRAL
+        # When pivoting, override priority to NEUTRAL
         # so hedge sections don't intercept — pivot handles its own sizing.
         if self._pivot_mode:
             priority = 'NEUTRAL'
+
+        # ════════════════════════════════════════════════════════
+        #  ARB-LOCK (v6.4) — Lock profit when arb appears
+        #  When combined < break-even AND we have a position,
+        #  buy the smaller side to close deficit, then build new pairs.
+        #  NO z-score required — the arb margin IS the edge.
+        #  Allowed to overshoot deficit (up to 5 shares) to meet
+        #  min_trade_size and to keep building pairs.
+        # ════════════════════════════════════════════════════════
+
+        if not self._pivot_mode and has_position and has_arb_opportunity:
+            deficit = self.deficit()
+            # Pick side: smaller side if deficit exists, else cheaper side
+            if deficit >= 0.5:
+                lock_side = self.smaller_side()
+            else:
+                lock_side = 'UP' if up_price <= down_price else 'DOWN'
+
+            lock_price = up_price if lock_side == 'UP' else down_price
+
+            # Size: enough for at least min_trade_size, up to deficit + overshoot
+            min_shares = self.min_trade_size / lock_price if lock_price > 0 else 0
+            max_overshoot = 5.0  # Allow building up to 5 shares beyond balance
+            target = max(deficit, min_shares) + max_overshoot
+            target = max(target, min_shares)  # Always at least min_trade_size
+
+            # Budget: actual remaining cash (arb is guaranteed profit)
+            actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+            max_budget_qty = actual_cash / lock_price if lock_price > 0 else 0
+            qty = min(target, max_budget_qty, self.max_shares_per_order)
+
+            if qty * lock_price >= self.min_trade_size:
+                # Skip MGP check for arb-lock — each completed pair
+                # at combined < breakeven is guaranteed profit.
+                # Individual trades may temporarily worsen one side,
+                # but the alternating buy pattern builds net-positive pairs.
+                ok, ap, aq = self.execute_buy(lock_side, lock_price, qty, timestamp)
+                if ok:
+                    trades_made.append((lock_side, ap, aq))
+                    actual_mgp = self.calculate_locked_profit()
+                    new_deficit = self.deficit()
+                    lock_tag = " 🔒" if self.both_scenarios_positive() else ""
+                    self.current_mode = 'arb_lock'
+                    self.mode_reason = (f'💰 ARB-LOCK {lock_side} {aq:.1f}sh@${ap:.3f} | '
+                                        f'margin=${arb_margin:.3f} | Δ{new_deficit:.0f} | MGP ${actual_mgp:.2f}{lock_tag}')
+                    print(f"💰 ARB-LOCK: {lock_side} {aq:.1f}×${ap:.3f} | "
+                          f"arb=${arb_margin:.3f} | Δ{new_deficit:.0f} | MGP ${actual_mgp:.2f}{lock_tag}")
+                    self._record_history()
+                    return trades_made
 
         # ════════════════════════════════════════════════════════
         #  PRE-EMPTIVE HEDGE — Balance early at small deltas
@@ -1352,8 +1418,8 @@ class ArbitrageStrategy:
         qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
 
         # ── PIVOT sizing (v6.3) ──
-        #  Buy enough to exceed the other side by buffer %.
-        #  Full target at once — splitting creates sub-$1 chunks.
+        #  Buy enough that if new winner wins → profit.
+        #  Full target at once to avoid sub-$1 Polymarket rejections.
         if self._pivot_mode:
             qty = self._pivot_target_qty
             # Budget constraint — use full remaining budget for pivots

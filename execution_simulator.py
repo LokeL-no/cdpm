@@ -265,8 +265,8 @@ class ExecutionSimulator:
         slippage_pct = (slippage / desired_price * 100) if desired_price > 0 else 0.0
         slippage_cost = slippage * filled_qty
 
-        # ── Max slippage check ──
-        if slippage_pct > self.max_slippage_pct:
+        # ── Max slippage check (use epsilon to avoid float rounding rejections) ──
+        if slippage_pct > self.max_slippage_pct + 1e-9:
             self.total_rejections += 1
             self._side_stats[side]['rejections'] += 1
             reason = (
