@@ -1,45 +1,54 @@
 #!/usr/bin/env python3
 """
-Pair-Building Arbitrage Strategy v6 for Polymarket
+HFT Mean-Reversion Strategy v5 — Smart Position Weighting for Polymarket
 
-CORE INSIGHT: In prediction markets, price = probability of winning.
-  A side at $0.22 has 78% chance of LOSING. Buying it just because
-  it's "cheap" (low z-score) means you're accumulating shares that
-  will most likely be worth $0.00 at resolution.
+Core Principle:  NEVER buy UP and DOWN simultaneously.
+  Instead, buy one side when it's cheap (oversold), then hedge by
+  buying the other side when IT becomes cheap. This works because
+  prices fluctuate within a 15-minute window — buying at different
+  dip points gives a combined cost well below break-even.
 
-  v6 fixes this by treating arb as PAIR BUILDING, not single-side
-  mean reversion. The bot only enters when a profitable pair can
-  be constructed, and favors the likely winner.
+v5 Upgrades:
+  1. MOMENTUM FILTER:  Don't buy falling knives. A side that's in a
+     sustained downtrend (negative momentum + trend_direction=-1) is
+     blocked from entry unless Z-score is extreme (<-2.5) or a
+     reversal is confirmed (EMA-5 crossing above EMA-20).
 
-Strategy: PAIR-BUILDING with Winner-First Entry
-  1. COMBINED COST GATE:  Only enter when UP + DOWN < $0.9852 (break-even).
-     If combined > break-even, there is NO arb opportunity at current prices.
-     The bot waits instead of buying falling knives.
+  2. REVERSAL DETECTION:  Composite reversal_score (0-100) based on:
+     - EMA-5 crossing above EMA-20 (30 pts, fades over 15 ticks)
+     - Positive momentum after negative period (25 pts)
+     - Price near session low but bouncing (25 pts)
+     - Consecutive up ticks (20 pts)
+     Confirmed reversals get position size boost (1.5x).
 
-  2. WINNER-FIRST:  When entering a new market, buy the side MORE likely
-     to win (price > $0.50). If the bot gets stuck without completing
-     the pair, at least it holds the likely winner.
+  3. PROBABILITY-AWARE SIZING:  Binary market price ≈ probability.
+     Kelly fraction is scaled by probability zone:
+     - <20% (longshot): 30% of Kelly — cheap but likely to lose
+     - 35-65% (uncertain): 100% Kelly — best arb zone
+     - >75% (expensive): 40% of Kelly — poor value
+     Prevents over-committing to extreme probabilities.
 
-  3. QTY RATIO CAP:  The loser side can NEVER exceed 1.5× the winner
-     side in quantity. This prevents the exact problem the user described:
-     accumulating tons of the cheap/losing side, then getting stuck
-     needing an impossibly expensive hedge.
+  4. BUDGET TRANCHES & RESERVE:
+     - 35% of budget always reserved for hedging
+     - Entries capped to 65% of budget, in 5 tranches
+     - Max 45% budget on any single side
+     This prevents budget exhaustion before hedge positions are built.
 
-  4. ROLE-BASED PRICE CAPS:
-     - Winner (likely to win): max entry price $0.68
-     - Loser (likely to lose): max entry price $0.45
-     This ensures the loser side is always cheap enough for arb value.
+  5. PRE-EMPTIVE HEDGING:  Small hedge trades start at 8% delta
+     (not 25%). Buys 30% of the deficit at good prices before
+     the position becomes critically unbalanced.
 
-  5. PRE-EMPTIVE HEDGING:  Small balancing trades start at just 6% delta,
-     buying 40% of the deficit. This keeps positions balanced from the
-     start, not after they're already critically unbalanced.
+  6. ENTRY QUALITY SCORING:  Multi-factor quality score (0-100):
+     - Z-score depth (40 pts)
+     - Reversal confirmation (25 pts)
+     - Probability zone (20 pts)
+     - Balance improvement (15 pts)
+     - Momentum quality (±10 pts)
+     Best candidate wins when both sides signal.
 
-  6. MGP PROTECTION:  Every trade is checked against projected MGP.
-     Trades that would worsen MGP by >$2 are blocked.
-     Hedge trades that exceed max_price_for_positive_mgp are blocked.
-
-  7. ARB MARGIN SCORING:  Entry quality is weighted by arb margin
-     (combined cost below break-even). More margin = bigger position.
+  7. MGP PROTECTION:  Entries that would drop MGP by >$3 are blocked.
+     Hedge prices checked against max_price_for_positive_mgp to
+     prevent buying hedges that make the overall position worse.
 
 Binary Market Rules:
   - UP + DOWN = $1.00 at resolution
@@ -47,13 +56,44 @@ Binary Market Rules:
   - Break-even combined avg = 1/1.015 ≈ $0.9852
   - Profit = min(qty_up, qty_down) - total_cost × 1.015
 
-Key Differences from v5:
-  - v5 bought whichever side had lowest z-score → always bought the loser
-  - v6 requires combined < break-even first, then prefers the winner
-  - v5 had no qty ratio limits → got stuck with 25 UP vs 15 DOWN
-  - v6 caps loser/winner ratio at 1.5:1
-  - v5 used same entry price cap for both sides
-  - v6 uses strict $0.45 cap for the improbable side
+Indicators:
+  1. Z-Score (Mean Reversion):
+     - Per-side EMA-5 / EMA-20 / EMA-50
+     - Z = (price - EMA_50) / std_dev
+     - Z < -0.8 → oversold → BUY signal (IF momentum confirms)
+     - Z > +0.8 → overbought → avoid
+
+  2. ATR (Average True Range):
+     - Measures volatility per tick
+     - Used for dynamic entry thresholds
+
+  3. Momentum (Rate of Change):
+     - 10-tick rate of change
+     - Negative + strong trend = falling knife (blocked)
+     - Positive after negative = potential reversal
+
+  4. Kelly Criterion (Position Sizing):
+     - f* = (p·b − q) / b
+     - Scaled by risk_factor × probability_zone_scale
+     - Capped by budget tranche size
+
+  5. Exposure / Risk Module:
+     - Pre-emptive hedging at 8% delta
+     - Standard hedging at 15% delta
+     - Urgent hedging at 35% delta
+     - Forced hedging at 55% delta
+
+Algorithm:
+  1. WARMUP (20 ticks): Build EMA/ATR/momentum baselines
+  2. Each tick:
+     a. Update per-side indicators (EMA-5/20/50, Z-score, ATR, momentum, reversal)
+     b. Run pre-emptive hedge check → small balancing trades early
+     c. Run exposure check → determine priority
+     d. If HEDGING needed: buy deficit side with smart pricing
+     e. Else: score entry candidates, filter falling knives
+     f. Execute best candidate with urgency scaling
+     g. Verify MGP impact before committing
+  3. Cooldown: 2s between trades
 """
 
 import math
@@ -246,17 +286,10 @@ class SideTracker:
 
 class ArbitrageStrategy:
     """
-    HFT Pair-Building Strategy v6.1 for Polymarket binary markets.
+    HFT Mean-Reversion Strategy for Polymarket binary markets.
 
-    KEY INSIGHT: In prediction markets, cheap = likely to LOSE.
-    Never buy the cheap side just because z-score says 'oversold'.
-
-    Strategy:
-      1. COMBINED COST GATE: Only trade when UP + DOWN < break-even (~$0.985)
-      2. WINNER-FIRST: Always start with the likely winner (safer single position)
-      3. ROLE-BASED Z-THRESHOLDS: Winner z<=+0.5, Loser z<=-1.5
-      4. POST-TRADE RATIO CHECK: Prevents imbalance before it happens
-      5. MGP PROTECTION: Every trade must maintain or improve MGP
+    Buys each side independently when oversold, hedges to lock profit.
+    Uses Kelly Criterion for position sizing and Z-Score for signals.
     """
 
     def __init__(self, market_budget: float, starting_balance: float,
@@ -282,85 +315,61 @@ class ArbitrageStrategy:
         )
 
         # ══════════════════════════════════════════════════════
-        #  HFT PARAMETERS v6 — Pair-Building Strategy
-        #
-        #  Core insight: In prediction markets, price = probability.
-        #  Cheap side is cheap because it's likely to LOSE.
-        #  Strategy: build BALANCED PAIRS, favor the likely winner,
-        #  never let qty ratio exceed 1.5:1.
+        #  HFT PARAMETERS v5 — Smart Position Weighting
         # ══════════════════════════════════════════════════════
 
         # ── Warmup ──
         self.warmup_ticks = 20
 
         # ── Z-Score thresholds ──
-        self.z_entry = -0.5            # General entry threshold (fallback)
-        self.z_entry_winner = 0.5      # Winner: any small dip is enough (arb margin IS the signal)
-        self.z_entry_loser = -1.5      # Loser: must be deeply oversold (cheap ≠ oversold!)
-        self.z_entry_first_trade = 3.0 # First trade winner: almost always OK if arb exists
-        self.z_strong_entry = -1.2     # Strong signal
-        self.z_hedge_relaxed = -0.2    # Relaxed threshold when hedging
+        self.z_entry = -0.8            # Normal entry: oversold
+        self.z_strong_entry = -1.5     # Strong signal: heavily oversold
+        self.z_hedge_relaxed = -0.3    # Relaxed threshold when hedging
         self.z_hedge_urgent = 0.5      # Buy hedge even slightly above EMA
 
-        # ── PAIR-BUILDING: Combined Cost Gate (NEW v6) ──
-        #  Only enter when combined price (up + down) < break-even.
-        #  This is THE critical filter: no arb exists above this.
-        self.combined_entry_threshold = BREAK_EVEN - 0.005  # ~0.9802
-        self.combined_good_threshold = BREAK_EVEN - 0.015   # ~0.9702 (good margin)
-        self.combined_great_threshold = BREAK_EVEN - 0.025  # ~0.9602 (great margin)
-
-        # ── QUANTITY RATIO LIMITS (NEW v6) ──
-        #  Never let one side get far ahead of the other.
-        #  This prevents the "bought too much cheap side" problem.
-        self.max_qty_ratio = 1.5       # Max allowed ratio between sides
-        self.ideal_qty_ratio = 1.0     # Target perfect balance
-        self.max_qty_ratio_no_position = 3.0  # Slightly looser for first entries
-
-        # ── WINNER-FIRST LOGIC (NEW v6) ──
-        #  When entering a new market, prefer the likely winner.
-        #  If you can't complete the pair, at least you hold the winner.
-        self.winner_first_enabled = True
-        self.winner_entry_price_max = 0.68  # Don't buy winner above $0.68
-        self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
-
-        # ── Momentum Filter ──
-        self.require_momentum_confirm = True
-        self.falling_knife_override_z = -2.5
-        self.reversal_score_min = 25.0
-        self.reversal_boost_multiplier = 1.3
+        # ── Momentum Filter (NEW) ──
+        self.require_momentum_confirm = True   # Don't buy falling knives
+        self.falling_knife_override_z = -2.5   # Override momentum filter at extreme Z
+        self.reversal_score_min = 25.0          # Min reversal confidence to enter
+        self.reversal_boost_multiplier = 1.5    # Boost position size on confirmed reversal
 
         # ── Kelly Criterion ──
         self.risk_factor = 0.5         # Half-Kelly for safety
-        self.max_kelly_fraction = 0.10 # Max 10% of remaining budget per trade
+        self.max_kelly_fraction = 0.10 # Max 10% of remaining budget per trade (was 12%)
         self.min_trade_size = 1.0      # Polymarket minimum ~$1
 
-        # ── Budget Tranches ──
-        self.budget_reserve_pct = 0.30         # 30% reserved for hedging
-        self.entry_budget_pct = 0.70           # Max 70% for entries
-        self.max_single_side_budget_pct = 0.50 # Max 50% on a single side
-        self.tranche_count = 6                 # Split entries into 6 tranches
+        # ── Budget Tranches (NEW) ──
+        self.budget_reserve_pct = 0.35         # Always reserve 35% for hedging
+        self.entry_budget_pct = 0.65           # Max 65% for entries
+        self.max_single_side_budget_pct = 0.45 # Max 45% on a single side
+        self.tranche_count = 5                 # Split entries into 5 tranches
         self._tranche_size = market_budget * self.entry_budget_pct / self.tranche_count
 
+        # ── Probability-Aware Sizing (NEW) ──
+        self.prob_low_threshold = 0.20         # Below 20%: tiny positions only
+        self.prob_uncertain_range = (0.35, 0.65)  # Uncertain range: best for arb
+        self.prob_high_threshold = 0.75        # Above 75%: very expensive, small
+
         # ── Timing ──
-        self.cooldown_seconds = 2.0
-        self.min_time_to_enter = 30
+        self.cooldown_seconds = 2.0    # HFT: 2s between trades
+        self.min_time_to_enter = 30    # Don't open new positions in last 30s
 
         # ── Risk / Exposure ──
-        self.max_individual_price = 0.72  # General max price
-        self.max_loss_per_market = 10.0   # Tight stop-loss
-        self.hedge_delta_pct = 12.0       # Start hedging at 12% delta
-        self.urgent_hedge_delta = 30.0    # Urgent hedge at 30% delta
-        self.forced_hedge_delta = 50.0    # Forced hedge at 50% delta
-        self.max_risk_per_leg = 5.0       # Max $ loss on one scenario
+        self.max_individual_price = 0.72  # Don't buy expensive sides (was 0.78)
+        self.max_loss_per_market = 12.0   # Tighter stop-loss (was 15.0)
+        self.hedge_delta_pct = 15.0       # Start hedging at 15% delta (was 25%)
+        self.urgent_hedge_delta = 35.0    # Urgent hedge at 35% delta (was 50%)
+        self.forced_hedge_delta = 55.0    # Forced hedge at 55% delta (was 70%)
+        self.max_risk_per_leg = 6.0       # Max $ loss on one scenario (was 8.0)
 
-        # ── Pre-emptive Hedging ──
-        self.preemptive_hedge_enabled = True
-        self.preemptive_hedge_threshold = 6.0  # Start pre-hedge at 6% delta
-        self.preemptive_hedge_fraction = 0.4   # Hedge 40% of deficit
+        # ── Pre-emptive Hedging (NEW) ──
+        self.preemptive_hedge_enabled = True    # Start small hedges early
+        self.preemptive_hedge_threshold = 8.0   # Start pre-hedge at 8% delta
+        self.preemptive_hedge_fraction = 0.3    # Hedge 30% of deficit
 
         # ── Position limits ──
-        self.max_shares_per_order = 120
-        self.max_allowed_delta_pct = 5.0
+        self.max_shares_per_order = 150         # Smaller max orders (was 200)
+        self.max_allowed_delta_pct = 5.0        # Considered "balanced" under this
 
         # ── State ──
         self.last_trade_time: float = 0
@@ -512,27 +521,6 @@ class ArbitrageStrategy:
         return min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
 
     # ═══════════════════════════════════════════════════════════════
-    #  ARB-AWARE FAIR VALUE
-    # ═══════════════════════════════════════════════════════════════
-
-    def _arb_adjusted_fair(self, side: str, price: float, other_price: float,
-                           tracker_fair: float) -> float:
-        """
-        Compute fair value that accounts for PAIR arbitrage opportunity.
-
-        In pair trading, the "edge" isn't "this side is undervalued vs EMA" —
-        it's "this side + the other side creates a profitable pair".
-
-        arb_fair = BREAK_EVEN - other_price
-        (what this side is WORTH as part of a pair)
-
-        If arb_fair > tracker_fair, the arb opportunity gives us a bigger edge
-        than the EMA alone suggests.
-        """
-        arb_fair = BREAK_EVEN - other_price
-        return max(tracker_fair, arb_fair)
-
-    # ═══════════════════════════════════════════════════════════════
     #  KELLY CRITERION — Position Sizing
     # ═══════════════════════════════════════════════════════════════
 
@@ -578,35 +566,28 @@ class ArbitrageStrategy:
 
     def _probability_scale(self, implied_prob: float) -> float:
         """
-        Scale factor based on implied probability (v6 — aggressive).
-
-        In prediction markets, price = probability of winning.
-        Buying a side at $0.20 means 80% chance of losing your $0.20.
-        The optimal zone for arb is 40-60% where both sides are uncertain.
-
-        Scale factors:
-          <15%:  0.10  (almost certainly loses, tiny position only)
-          15-30%: 0.20-0.40  (long shot, small positions)
-          30-50%: 0.60-1.0   (uncertain, good for arb)
-          50-65%: 1.0         (sweet spot — likely winner at fair price)
-          65-72%: 0.80-0.50  (expensive but likely winner)
-          >72%:  0.30        (too expensive for arb value)
+        Scale factor based on implied probability.
+        Best zone for arb is 35-65% (uncertain markets).
+        Extreme probabilities mean expensive or near-worthless sides.
         """
-        if implied_prob < 0.15:
-            return 0.10
-        elif implied_prob < 0.30:
-            t = (implied_prob - 0.15) / 0.15
-            return 0.20 + 0.20 * t
-        elif implied_prob < 0.50:
-            t = (implied_prob - 0.30) / 0.20
-            return 0.60 + 0.40 * t
-        elif implied_prob <= 0.65:
-            return 1.0
-        elif implied_prob <= 0.72:
-            t = (implied_prob - 0.65) / 0.07
-            return 0.80 - 0.30 * t
+        low = self.prob_low_threshold      # 0.20
+        unc_lo, unc_hi = self.prob_uncertain_range  # (0.35, 0.65)
+        high = self.prob_high_threshold    # 0.75
+
+        if implied_prob < low:
+            return 0.3   # Very cheap but likely to lose
+        elif implied_prob < unc_lo:
+            # Gradual ramp from 0.3 to 1.0
+            t = (implied_prob - low) / (unc_lo - low)
+            return 0.3 + 0.7 * t
+        elif implied_prob <= unc_hi:
+            return 1.0   # Optimal zone
+        elif implied_prob <= high:
+            # Gradual ramp from 1.0 to 0.4
+            t = (implied_prob - unc_hi) / (high - unc_hi)
+            return 1.0 - 0.6 * t
         else:
-            return 0.30
+            return 0.4   # Very expensive, likely to win but poor arb value
 
     def _budget_available_for_side(self, side: str, is_hedge: bool = False) -> float:
         """
@@ -950,18 +931,8 @@ class ArbitrageStrategy:
         priority = self._exposure_priority
 
         # ════════════════════════════════════════════════════════
-        #  COMBINED COST GATE (v6)
-        #  The FUNDAMENTAL arb check: can we build profitable pairs?
-        #  UP + DOWN must sum to < break-even ($0.9852) for arb to exist.
-        # ════════════════════════════════════════════════════════
-
-        combined = up_price + down_price
-        arb_margin = BREAK_EVEN - combined   # Positive = arb exists
-        has_arb_opportunity = arb_margin > 0
-
-        # ════════════════════════════════════════════════════════
-        #  PRE-EMPTIVE HEDGE — Balance early at small deltas
-        #  Only hedges if price won't destroy MGP
+        #  PRE-EMPTIVE HEDGE — Start hedging early at small deltas
+        #  (NEW: don't wait until delta is 25%+, start at 8%)
         # ════════════════════════════════════════════════════════
 
         if (priority == 'NEUTRAL' and has_position and
@@ -974,21 +945,22 @@ class ArbitrageStrategy:
             ph_z = z_up if ph_side == 'UP' else z_down
             ph_tracker = self.up_tracker if ph_side == 'UP' else self.down_tracker
 
-            max_hedge_price = self.max_price_for_positive_mgp()
-
-            # Only pre-hedge if price is reasonable
-            if (ph_price <= max_hedge_price and
-                    ph_price <= self.max_individual_price and
+            # Only pre-hedge if price is reasonable and not a falling knife
+            if (ph_price <= self.max_individual_price and
+                    ph_z <= self.z_hedge_relaxed and
                     not ph_tracker.is_falling_knife):
 
+                # Calculate deficit and buy a fraction of it
                 deficit = self.deficit()
                 target_qty = deficit * self.preemptive_hedge_fraction
+                max_hedge_price = self.max_price_for_positive_mgp()
 
-                if target_qty * ph_price >= self.min_trade_size:
+                if ph_price <= max_hedge_price and target_qty * ph_price >= self.min_trade_size:
                     qty = self._calculate_trade_size(ph_side, ph_price, ph_fair, 1.0, is_hedge=True)
                     qty = min(qty, target_qty)
 
                     if qty * ph_price >= self.min_trade_size:
+                        # Verify hedge improves MGP
                         projected_mgp = self.mgp_after_buy(ph_side, ph_price, qty)
                         if projected_mgp > mgp:
                             ok, ap, aq = self.execute_buy(ph_side, ph_price, qty, timestamp)
@@ -1020,15 +992,17 @@ class ArbitrageStrategy:
             pnl_down = self.calculate_pnl_if_down_wins()
             worst_pnl = min(pnl_up, pnl_down)
 
+            # Check max price for positive MGP — don't overpay for hedges
             max_hedge_price = self.max_price_for_positive_mgp()
 
-            # Forced hedge: delta is critical — buy at market if price OK
+            # Forced hedge: delta is critical — buy at market
             if delta >= self.forced_hedge_delta:
                 urgency = 2.0
                 adjusted_fair = max(hedge_fair, hedge_price * 1.05)
                 qty = self._calculate_trade_size(hedge_side, hedge_price, adjusted_fair, urgency, is_hedge=True)
 
-                price_ok = hedge_price <= min(max_hedge_price * 1.10, 0.80)
+                # Even forced hedge respects max price (but with some slack)
+                price_ok = hedge_price <= min(max_hedge_price * 1.15, 0.85)
 
                 if qty * hedge_price >= self.min_trade_size and price_ok:
                     ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
@@ -1042,22 +1016,18 @@ class ArbitrageStrategy:
                               f"delta {delta:.0f}%→{self.position_delta_pct:.0f}% | MGP ${new_mgp:.2f}")
                         self._record_history()
                         return trades_made
-                elif not price_ok:
-                    self.current_mode = 'hedge_too_expensive'
-                    self.mode_reason = (f'💸 {hedge_side} @${hedge_price:.3f} too expensive '
-                                        f'(max ${max_hedge_price:.3f}) | Δ {delta:.0f}% | MGP ${mgp:.2f}')
-                    self._record_history()
-                    return trades_made
 
-            # Normal hedge: check z-threshold and price cap
+            # Smart hedge: check if the hedge side is showing a reversal
+            # If reversing, boost urgency and relax threshold
             hedge_is_reversing = hedge_tracker.is_reversing or hedge_tracker.reversal_score > 30
             if hedge_is_reversing:
-                z_threshold = max(z_threshold, 0.0)
+                z_threshold = max(z_threshold, 0.0)  # Very relaxed
                 hedge_urgency_boost = 1.3
             else:
                 hedge_urgency_boost = 1.0
 
             if hedge_z <= z_threshold and hedge_price <= self.max_individual_price:
+                # Verify hedge price won't blow MGP
                 if hedge_price <= max_hedge_price * 1.05:
                     urgency = (1.5 if delta > self.urgent_hedge_delta else 1.2) * hedge_urgency_boost
                     qty = self._calculate_trade_size(hedge_side, hedge_price, hedge_fair, urgency, is_hedge=True)
@@ -1080,173 +1050,83 @@ class ArbitrageStrategy:
                             self._record_history()
                             return trades_made
 
+            # Hedge signal not triggered yet
             rev_info = f" | rev={hedge_tracker.reversal_score:.0f}" if hedge_tracker.reversal_score > 0 else ""
-            hmax = f" | maxP=${max_hedge_price:.2f}" if max_hedge_price < 0.9 else ""
             self.current_mode = 'waiting_hedge'
             self.mode_reason = (f'⏳ Need {hedge_side} hedge | z={hedge_z:+.1f} (need <{z_threshold:+.1f}) | '
-                                f'Δ {self.position_delta_pct:.0f}% | PnL worst ${worst_pnl:.2f}{rev_info}{hmax}')
+                                f'Δ {self.position_delta_pct:.0f}% | PnL worst ${worst_pnl:.2f}{rev_info}')
             self._record_history()
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  ENTRY MODE v6 — Pair-Building Strategy
-        #
-        #  KEY CHANGE: Don't buy a side just because its z-score is low.
-        #  In prediction markets, cheap = likely to lose.
-        #
-        #  Rules:
-        #  1. COMBINED COST GATE: Only enter when up+down < break-even
-        #  2. WINNER FIRST: Prefer the likely winner (price > 0.50)
-        #  3. QTY RATIO CAP: Never let one side exceed 1.5× the other
-        #  4. MGP CHECK: Every trade must improve or maintain MGP
-        #  5. PAIR BUILDING: After buying one side, actively seek the other
+        #  ENTRY MODE — Smart Oversold Detection
+        #  (NEW: momentum filter + reversal confirmation)
         # ════════════════════════════════════════════════════════
 
-        # ── Step 1: Check if arb opportunity exists ──
-        if not has_arb_opportunity:
-            # Combined > break-even: NO profitable pairs at current prices
-            self.current_mode = 'no_arb'
-            self.mode_reason = (f'🚫 No arb | UP ${up_price:.2f} + DOWN ${down_price:.2f} = '
-                                f'${combined:.3f} > ${BREAK_EVEN:.3f} (need margin)')
-            self._record_history()
-            return trades_made
-
-        # ── Step 2: Determine likely winner and roles ──
-        likely_winner = 'DOWN' if down_price > up_price else 'UP'
-        likely_loser = 'UP' if likely_winner == 'DOWN' else 'DOWN'
-        winner_price = down_price if likely_winner == 'DOWN' else up_price
-        loser_price = up_price if likely_winner == 'DOWN' else down_price
-        winner_z = z_down if likely_winner == 'DOWN' else z_up
-        loser_z = z_up if likely_winner == 'DOWN' else z_down
-        winner_fair = fair_down if likely_winner == 'DOWN' else fair_up
-        loser_fair = fair_up if likely_winner == 'DOWN' else fair_down
-        winner_tracker = self.down_tracker if likely_winner == 'DOWN' else self.up_tracker
-        loser_tracker = self.up_tracker if likely_winner == 'DOWN' else self.down_tracker
-
-        # ── Arb-adjusted fair values (v6.1) ──
-        #  Use pair-aware fair value instead of raw EMA.
-        #  This ensures Kelly sees the arb edge, not just the EMA lag.
-        winner_fair = self._arb_adjusted_fair(likely_winner, winner_price, loser_price, winner_fair)
-        loser_fair = self._arb_adjusted_fair(likely_loser, loser_price, winner_price, loser_fair)
-
-        # ── Step 3: Calculate qty ratio constraint ──
-        qty_winner = self.qty_down if likely_winner == 'DOWN' else self.qty_up
-        qty_loser = self.qty_up if likely_winner == 'DOWN' else self.qty_down
-
-        can_buy_loser = True
-        can_buy_winner = True
-
-        # ── WINNER-FIRST RULE: No position → ONLY consider winner ──
-        #  In prediction markets, cheap = likely to lose.
-        #  Starting with the loser is catastrophic (the old bug).
-        #  Starting with the winner is safe even if we can't hedge.
-        if not has_position:
-            can_buy_loser = False  # Force winner-first entry
-
-        if has_position:
-            # Don't let the loser side get ahead of winner
-            if qty_loser > 0 and qty_winner > 0:
-                ratio = qty_loser / qty_winner
-                if ratio >= self.max_qty_ratio:
-                    can_buy_loser = False  # Already have too much loser side
-            elif qty_loser > 0 and qty_winner == 0:
-                # We somehow have loser side but no winner — ONLY buy winner
-                can_buy_loser = False
-            # Winner side can always be ahead (it's more likely to pay out)
-
-        # ── Step 4: Price caps per role ──
-        if winner_price > self.winner_entry_price_max:
-            can_buy_winner = False
-        if loser_price > self.loser_entry_price_max:
-            can_buy_loser = False
-
-        # ── Step 5: Build candidate list with pair-aware scoring ──
+        # Build entry candidates with quality scoring
         candidates = []
+        for side, z, price, fair, tracker in [
+            ('UP', z_up, up_price, fair_up, self.up_tracker),
+            ('DOWN', z_down, down_price, fair_down, self.down_tracker),
+        ]:
+            if price > self.max_individual_price:
+                continue
+            if z > self.z_entry:
+                # Time pressure: in final quarter, slightly relax threshold
+                if time_to_close is not None and time_to_close < 225:
+                    if z > self.z_entry + 0.3:
+                        continue
+                else:
+                    continue
 
-        # Evaluate winner side — RELAXED z threshold (winner naturally trends up)
-        winner_z_threshold = self.z_entry_winner  # +0.5 (allow buying even slightly above EMA)
-        if can_buy_winner and winner_z <= winner_z_threshold:
-            if not (self.require_momentum_confirm and winner_tracker.is_falling_knife and
-                    winner_z > self.falling_knife_override_z):
-                quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
-                                               winner_fair, winner_tracker, arb_margin,
-                                               is_likely_winner=True)
-                candidates.append((likely_winner, winner_z, winner_price, winner_fair,
-                                   winner_tracker, quality))
+            # ── MOMENTUM FILTER: Don't buy falling knives ──
+            if self.require_momentum_confirm:
+                if tracker.is_falling_knife:
+                    # Exception: extreme Z-score overrides momentum filter
+                    if z > self.falling_knife_override_z:
+                        print(f"🔪 FALLING KNIFE blocked: {side} z={z:+.1f} | "
+                              f"mom={tracker.momentum:.4f} | trend={tracker.trend_direction}")
+                        continue
 
-        # Evaluate loser side — STRICT z threshold (cheap ≠ oversold in prediction markets!)
-        loser_z_threshold = self.z_entry_loser  # -1.5 (must be genuinely distressed)
-        if can_buy_loser and loser_z <= loser_z_threshold:
-            if not (self.require_momentum_confirm and loser_tracker.is_falling_knife and
-                    loser_z > self.falling_knife_override_z):
-                quality = self._score_entry_v6(likely_loser, loser_z, loser_price,
-                                               loser_fair, loser_tracker, arb_margin,
-                                               is_likely_winner=False)
-                # Loser needs higher threshold AND reversal hint
-                if quality >= 35:
-                    candidates.append((likely_loser, loser_z, loser_price, loser_fair,
-                                       loser_tracker, quality))
-
-        # ── WINNER-FIRST: If no position, buy winner WITHOUT z requirement ──
-        #  The arb margin is the signal, not the z-score.
-        #  Winner naturally trends up → high z is NORMAL, not a reason to skip.
-        #  Combined cost gate already ensures profitable opportunity exists.
-        if self.winner_first_enabled and not has_position:
-            if can_buy_winner and winner_price <= self.winner_entry_price_max:
-                # Winner side doesn't need to be oversold for first entry
-                already_in = any(c[0] == likely_winner for c in candidates)
-                if not already_in:
-                    quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
-                                                   winner_fair, winner_tracker, arb_margin,
-                                                   is_likely_winner=True)
-                    quality += 15  # Bonus for being our first trade on the winner
-                    candidates.append((likely_winner, winner_z, winner_price, winner_fair,
-                                       winner_tracker, quality))
-
-        # Time pressure: relax thresholds in final quarter
-        if time_to_close is not None and time_to_close < 225 and not candidates:
-            relaxed_z = self.z_entry + 0.3
-            for side, z, price, fair, tracker in [
-                (likely_winner, winner_z, winner_price, winner_fair, winner_tracker),
-                (likely_loser, loser_z, loser_price, loser_fair, loser_tracker),
-            ]:
-                if z <= relaxed_z and price <= self.max_individual_price:
-                    quality = self._score_entry_v6(side, z, price, fair, tracker,
-                                                   arb_margin, side == likely_winner)
-                    candidates.append((side, z, price, fair, tracker, quality))
+            # ── Calculate entry quality score ──
+            entry_quality = self._score_entry(side, z, price, fair, tracker)
+            candidates.append((side, z, price, fair, tracker, entry_quality))
 
         if not candidates:
+            # Show why no entries
             up_knife = "🔪" if self.up_tracker.is_falling_knife else ""
             dn_knife = "🔪" if self.down_tracker.is_falling_knife else ""
-            ratio_tag = f" | ratio={qty_loser:.0f}:{qty_winner:.0f}" if has_position else ""
             self.current_mode = 'scanning'
-            self.mode_reason = (f'👁 Scanning | UP ${up_price:.2f}{up_knife} DOWN ${down_price:.2f}{dn_knife} | '
-                                f'margin ${arb_margin:.3f}{ratio_tag}')
+            self.mode_reason = (f'👁 Scanning | UP z={z_up:+.1f}{up_knife} DOWN z={z_down:+.1f}{dn_knife} | '
+                                f'thres {self.z_entry:+.1f}')
             self._record_history()
             return trades_made
 
-        # ── Step 6: Select best candidate ──
+        # ── Choose best candidate by quality score ──
         candidates.sort(key=lambda c: c[5], reverse=True)
         buy_side, buy_z, buy_price, buy_fair, buy_tracker, quality = candidates[0]
 
-        # ── Step 7: Calculate size with pair-aware urgency ──
+        # ── Urgency scaling based on multiple factors ──
         urgency = 1.0
 
-        # Strong oversold + arb margin → bigger trade
+        # Strong z-score oversold → bigger position
         if buy_z <= self.z_strong_entry:
-            urgency *= 1.2
-        if arb_margin > 0.02:  # > 2 cent margin
-            urgency *= 1.2
+            urgency *= 1.3
 
-        # Reversal confirmation → boost
+        # Confirmed reversal → boost
         if buy_tracker.is_reversing or buy_tracker.reversal_score > self.reversal_score_min:
             urgency *= self.reversal_boost_multiplier
+            print(f"🔄 REVERSAL BOOST: {buy_side} | rev_score={buy_tracker.reversal_score:.0f}")
 
-        # Buying the larger side → reduce size (worsens balance)
+        # Confirmed dip (not falling knife + recovery signs) → mild boost
+        elif buy_tracker.is_confirmed_dip:
+            urgency *= 1.15
+
+        # Consider balance: if buying this side increases delta, reduce urgency
         if has_position:
-            if ((buy_side == 'UP' and self.qty_up > self.qty_down * 1.1) or
-                    (buy_side == 'DOWN' and self.qty_down > self.qty_up * 1.1)):
-                urgency *= 0.5
+            if ((buy_side == 'UP' and self.qty_up > self.qty_down) or
+                    (buy_side == 'DOWN' and self.qty_down > self.qty_up)):
+                urgency *= 0.6  # Reduce size — would worsen balance
 
         qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
 
@@ -1257,111 +1137,69 @@ class ArbitrageStrategy:
             self._record_history()
             return trades_made
 
-        # ── Step 7b: Post-trade ratio check (NEW v6.1) ──
-        #  Prevent trades that would create excessive imbalance.
-        #  The ratio check must consider the position AFTER the trade.
-        if has_position:
-            post_qty_this = (self.qty_up if buy_side == 'UP' else self.qty_down) + qty
-            post_qty_other = self.qty_down if buy_side == 'UP' else self.qty_up
-            if post_qty_other > 0 and buy_side == likely_loser:
-                post_ratio = post_qty_this / post_qty_other
-                if post_ratio > self.max_qty_ratio:
-                    # Cap qty to stay within ratio
-                    max_allowed = post_qty_other * self.max_qty_ratio - (post_qty_this - qty)
-                    if max_allowed < self.min_trade_size / buy_price:
-                        self.current_mode = 'scanning'
-                        self.mode_reason = (f'⚠️ Ratio cap: {buy_side} would exceed '
-                                            f'{self.max_qty_ratio:.1f}:1 ratio')
-                        self._record_history()
-                        return trades_made
-                    qty = max_allowed
-
-        # ── Step 8: MGP protection ──
+        # ── Verify entry doesn't wreck MGP ──
         if has_position:
             projected_mgp = self.mgp_after_buy(buy_side, buy_price, qty)
-            if projected_mgp < mgp - 2.0:
+            if projected_mgp < mgp - 3.0:  # Don't enter if it worsens MGP by >$3
                 self.current_mode = 'scanning'
                 self.mode_reason = (f'⚠️ Skipped {buy_side} — would drop MGP by ${mgp - projected_mgp:.2f}')
                 self._record_history()
                 return trades_made
 
-        # ── Step 9: Execute ──
+        # ── Execute single-side buy ──
         kelly_f = self._kelly_fraction(buy_price, buy_fair)
-        role_tag = "👑" if buy_side == likely_winner else "🎲"
         rev_tag = f" REV={buy_tracker.reversal_score:.0f}" if buy_tracker.reversal_score > 15 else ""
-        print(f"📊 SIGNAL: {role_tag} {buy_side} z={buy_z:+.2f} | ${buy_price:.3f} | "
-              f"margin=${arb_margin:.3f} | Kelly={kelly_f:.3f} | qty={qty:.1f} | Q={quality:.0f}{rev_tag}")
+        mom_tag = f" mom={buy_tracker.momentum:+.3f}" if abs(buy_tracker.momentum) > 0.001 else ""
+        print(f"📊 SIGNAL: {buy_side} z={buy_z:+.2f} | ${buy_price:.3f} vs fair ${buy_fair:.3f} | "
+              f"Kelly={kelly_f:.3f} | qty={qty:.1f} (${qty*buy_price:.2f}) | Q={quality:.0f}{rev_tag}{mom_tag}")
 
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
             trades_made.append((buy_side, ap, aq))
             mgp_new = self.calculate_locked_profit()
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-            self.current_mode = 'pair_building'
-            self.mode_reason = (f'{role_tag} BUY {buy_side} {aq:.1f}sh@${ap:.3f} | '
-                                f'margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}')
-            print(f"🎯 TRADE #{self.trade_count}: {role_tag} {buy_side} {aq:.1f}×${ap:.3f} | "
-                  f"margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}")
+            self.current_mode = 'accumulating'
+            self.mode_reason = (f'📈 BUY {buy_side} {aq:.1f}sh@${ap:.3f} | z={buy_z:+.1f} | '
+                                f'Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}')
+            print(f"🎯 TRADE #{self.trade_count}: {buy_side} {aq:.1f}×${ap:.3f} | "
+                  f"z={buy_z:+.1f} | Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}")
 
         self._record_history()
         return trades_made
 
-    def _score_entry_v6(self, side: str, z: float, price: float,
-                        fair: float, tracker: 'SideTracker',
-                        arb_margin: float, is_likely_winner: bool) -> float:
+    def _score_entry(self, side: str, z: float, price: float,
+                     fair: float, tracker: 'SideTracker') -> float:
         """
-        Score an entry candidate (0-100) with pair-building awareness.
-
-        Key difference from v5: heavily weights probability/role and
-        penalizes buying the improbable side.
+        Score an entry candidate (0-100) based on multiple factors.
+        Higher score = better entry opportunity.
         """
         score = 0.0
 
-        # Factor 1: Arb margin quality (25 pts max)
-        # More margin = more room for profit
-        if arb_margin > 0.025:
-            score += 25.0
-        elif arb_margin > 0.015:
-            score += 20.0
-        elif arb_margin > 0.005:
-            score += 12.0
-        else:
-            score += 5.0
+        # Factor 1: Z-score depth (40 pts max)
+        # More oversold = higher score
+        z_depth = max(0, -z - 0.5)  # How far below -0.5
+        score += min(40.0, z_depth * 20.0)
 
-        # Factor 2: Role (20 pts)
-        # Winner side gets a big bonus — if trade gets stuck, you hold the winner
-        if is_likely_winner:
-            score += 20.0
-        else:
-            # Loser side only scores if it's cheap enough to be a good pair
-            if price < 0.30:
-                score += 10.0  # Cheap pair leg
-            elif price < 0.40:
-                score += 5.0
-            # Expensive loser (>0.40) gets no bonus
+        # Factor 2: Reversal confirmation (25 pts max)
+        score += tracker.reversal_score * 0.25
 
-        # Factor 3: Z-score dip quality
-        #  Winner: up to 20 pts (a dip in the winner IS a real opportunity)
-        #  Loser:  up to 8 pts (the loser's low z is often just the trend, not a dip)
-        z_depth = max(0, -z - 0.3)
-        z_max = 20.0 if is_likely_winner else 8.0
-        score += min(z_max, z_depth * 10.0)
+        # Factor 3: Price in optimal probability zone (20 pts)
+        prob_scale = self._probability_scale(price)
+        score += prob_scale * 20.0
 
-        # Factor 4: Reversal confirmation (15 pts)
-        score += min(15.0, tracker.reversal_score * 0.15)
-
-        # Factor 5: Balance improvement (10 pts)
+        # Factor 4: Balance improvement (15 pts)
+        # Buying the smaller side should be rewarded
         if self.qty_up + self.qty_down > 0:
             if side == self.smaller_side():
-                score += 10.0
+                score += 15.0
             elif side == self.larger_side():
-                score -= 15.0  # Strong penalty for increasing imbalance
+                score -= 10.0  # Penalize increasing imbalance
 
-        # Factor 6: Momentum quality (-10 to +10 pts)
+        # Factor 5: Momentum quality (-10 to +10 pts)
         if tracker.momentum > 0.002:
-            score += 10.0
+            score += 10.0  # Positive momentum confirms dip recovery
         elif tracker.momentum < -0.005:
-            score -= 10.0
+            score -= 10.0  # Strong negative momentum is risky
 
         return max(0, min(100, score))
 
