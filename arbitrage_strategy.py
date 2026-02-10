@@ -333,6 +333,12 @@ class ArbitrageStrategy:
         self.pivot_profit_buffer = 0.10     # 10% past break-even for profit margin
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
+        self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
+
+        # Start-delay and entry gating
+        self.start_delay_seconds = 10    # Wait 10s after first tick before entering new markets
+        self._first_tick_time = None
+        self.min_entry_price_to_start = 0.59  # Don't enter market until one side >= this price
 
         # ── Momentum Filter ──
         self.require_momentum_confirm = True
@@ -944,12 +950,27 @@ class ArbitrageStrategy:
         #  WARMUP — Build indicator baselines
         # ════════════════════════════════════════════════════════
 
-        if self._tick_count <= self.warmup_ticks:
-            self.current_mode = 'warmup'
-            self.mode_reason = (f'📊 Warmup ({self._tick_count}/{self.warmup_ticks}) | '
-                                f'UP z={z_up:+.1f} DOWN z={z_down:+.1f}')
+        # ── START-DELAY (replace warmup): wait a fixed number of seconds after first tick
+        now = time.time()
+        if self._first_tick_time is None:
+            self._first_tick_time = now
+
+        elapsed = now - (self._first_tick_time or now)
+        if not has_position and elapsed < self.start_delay_seconds:
+            self.current_mode = 'starting_delay'
+            self.mode_reason = (f'⏳ Waiting {self.start_delay_seconds:.0f}s before entering market — {elapsed:.0f}s elapsed')
             self._record_history()
             return trades_made
+
+        # Additionally, don't perform initial entries until one side reaches the entry price threshold
+        allow_initial_entry = True
+        if not has_position:
+            if up_price < self.min_entry_price_to_start and down_price < self.min_entry_price_to_start:
+                self.current_mode = 'waiting_for_price'
+                self.mode_reason = (f'⏳ Waiting for price >= ${self.min_entry_price_to_start:.2f} | '
+                                    f'UP ${up_price:.2f} DOWN ${down_price:.2f}')
+                self._record_history()
+                return trades_made
 
         # ════════════════════════════════════════════════════════
         #  COOLDOWN
@@ -1019,13 +1040,57 @@ class ArbitrageStrategy:
                           additional_needed * new_winner_price >= self.min_trade_size)
 
             if need_pivot:
-                self._pivot_mode = True
-                self._pivot_target_qty = additional_needed
-                pnl_new = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
-                           else self.calculate_pnl_if_up_wins())
-                print(f"🔄 PIVOT: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
-                      f"need +{additional_needed:.1f}sh (${additional_needed * new_winner_price:.2f}) | "
-                      f"current {new_winner} pnl=${pnl_new:.2f}")
+                # Fail-safe: check actual cash available for full pivot
+                actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+                required_cost = additional_needed * new_winner_price
+
+                if actual_cash >= required_cost:
+                    # We can afford the full pivot target
+                    self._pivot_mode = True
+                    self._pivot_target_qty = additional_needed
+                    pnl_new = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
+                               else self.calculate_pnl_if_up_wins())
+                    print(f"🔄 PIVOT: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                          f"need +{additional_needed:.1f}sh (${required_cost:.2f}) | "
+                          f"current {new_winner} pnl=${pnl_new:.2f}")
+                else:
+                    # Can't afford full pivot. Try to find a qty that reaches break-even (including fees);
+                    # if not possible, buy as much as we can (min_trade_size enforced) and mark as failsafe.
+                    qty_affordable = max(0.0, actual_cash / new_winner_price) if new_winner_price > 0 else 0.0
+                    qty_affordable = min(qty_affordable, self.max_shares_per_order)
+
+                    # Numeric search for smallest qty <= qty_affordable that yields projected_mgp >= 0
+                    qty_needed_for_be = 0.0
+                    found = False
+                    steps = 20
+                    if qty_affordable >= 1.0:
+                        step_size = max(1.0, qty_affordable / steps)
+                    else:
+                        step_size = qty_affordable / steps if steps > 0 else qty_affordable
+                    q = step_size
+                    while q <= qty_affordable + 1e-9:
+                        q_rounded = round(q, 3)
+                        projected_mgp = self.mgp_after_buy(new_winner, new_winner_price, q_rounded)
+                        if projected_mgp >= 0:
+                            qty_needed_for_be = q_rounded
+                            found = True
+                            break
+                        q += step_size
+
+                    if found and qty_needed_for_be * new_winner_price >= self.min_trade_size:
+                        # We can reach break-even — do a reduced pivot to reach BE
+                        self._pivot_mode = True
+                        self._pivot_target_qty = qty_needed_for_be
+                        self._pivot_failsafe = False
+                        print(f"⛑️ PIVOT-FAILSAFE: afford partial pivot {qty_needed_for_be:.1f}sh@${new_winner_price:.3f} to reach BE")
+                    else:
+                        # Can't reach BE and we WILL NOT risk a "best-effort" pivot.
+                        # Fail-safe policy: if we can't reach break-even with available cash,
+                        # skip pivot and move to holding so we do not increase downside risk.
+                        self.current_mode = 'holding'
+                        self.mode_reason = (f'⛑️ Pivot skipped — insufficient cash to reach break-even (need ${required_cost:.2f}, have ${actual_cash:.2f})')
+                        self._record_history()
+                        return trades_made
             else:
                 self.current_mode = 'waiting_for_dip'
                 self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '

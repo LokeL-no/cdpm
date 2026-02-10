@@ -26,8 +26,8 @@ SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
 ASSET_BUDGETS = {
     'btc': 100.0,
     'eth': 100.0,
-    'sol': 50.0,
-    'xrp': 50.0,
+    'sol': 100.0,
+    'xrp': 100.0,
 }
 
 # Manual markets to track (leave empty for auto-discovery)
