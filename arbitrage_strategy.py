@@ -330,8 +330,8 @@ class ArbitrageStrategy:
         #  After max_pivot_count pivots → equalize both sides and give up.
         self.pivot_enabled = True
         self.pivot_winner_threshold = 0.55  # New winner must be >= 55% probability
-        self.pivot_profit_target = 1.0      # Target $1 profit per successful pivot
-        self.max_pivot_count = 3            # After N pivots → equalize and stop
+        self.pivot_profit_target = 5.0      # Target $5 profit per successful pivot
+        self.max_pivot_count = 2            # After N pivots → equalize and stop
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
         self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
