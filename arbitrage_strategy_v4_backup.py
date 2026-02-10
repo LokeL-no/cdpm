@@ -1,54 +1,12 @@
 #!/usr/bin/env python3
 """
-HFT Mean-Reversion Strategy v5 — Smart Position Weighting for Polymarket
+HFT Mean-Reversion Strategy with Kelly Criterion for Polymarket
 
 Core Principle:  NEVER buy UP and DOWN simultaneously.
   Instead, buy one side when it's cheap (oversold), then hedge by
   buying the other side when IT becomes cheap. This works because
   prices fluctuate within a 15-minute window — buying at different
   dip points gives a combined cost well below break-even.
-
-v5 Upgrades:
-  1. MOMENTUM FILTER:  Don't buy falling knives. A side that's in a
-     sustained downtrend (negative momentum + trend_direction=-1) is
-     blocked from entry unless Z-score is extreme (<-2.5) or a
-     reversal is confirmed (EMA-5 crossing above EMA-20).
-
-  2. REVERSAL DETECTION:  Composite reversal_score (0-100) based on:
-     - EMA-5 crossing above EMA-20 (30 pts, fades over 15 ticks)
-     - Positive momentum after negative period (25 pts)
-     - Price near session low but bouncing (25 pts)
-     - Consecutive up ticks (20 pts)
-     Confirmed reversals get position size boost (1.5x).
-
-  3. PROBABILITY-AWARE SIZING:  Binary market price ≈ probability.
-     Kelly fraction is scaled by probability zone:
-     - <20% (longshot): 30% of Kelly — cheap but likely to lose
-     - 35-65% (uncertain): 100% Kelly — best arb zone
-     - >75% (expensive): 40% of Kelly — poor value
-     Prevents over-committing to extreme probabilities.
-
-  4. BUDGET TRANCHES & RESERVE:
-     - 35% of budget always reserved for hedging
-     - Entries capped to 65% of budget, in 5 tranches
-     - Max 45% budget on any single side
-     This prevents budget exhaustion before hedge positions are built.
-
-  5. PRE-EMPTIVE HEDGING:  Small hedge trades start at 8% delta
-     (not 25%). Buys 30% of the deficit at good prices before
-     the position becomes critically unbalanced.
-
-  6. ENTRY QUALITY SCORING:  Multi-factor quality score (0-100):
-     - Z-score depth (40 pts)
-     - Reversal confirmation (25 pts)
-     - Probability zone (20 pts)
-     - Balance improvement (15 pts)
-     - Momentum quality (±10 pts)
-     Best candidate wins when both sides signal.
-
-  7. MGP PROTECTION:  Entries that would drop MGP by >$3 are blocked.
-     Hedge prices checked against max_price_for_positive_mgp to
-     prevent buying hedges that make the overall position worse.
 
 Binary Market Rules:
   - UP + DOWN = $1.00 at resolution
@@ -58,42 +16,38 @@ Binary Market Rules:
 
 Indicators:
   1. Z-Score (Mean Reversion):
-     - Per-side EMA-5 / EMA-20 / EMA-50
+     - Per-side EMA-20 / EMA-50
      - Z = (price - EMA_50) / std_dev
-     - Z < -0.8 → oversold → BUY signal (IF momentum confirms)
+     - Z < -0.8 → oversold → BUY signal
      - Z > +0.8 → overbought → avoid
 
   2. ATR (Average True Range):
      - Measures volatility per tick
      - Used for dynamic entry thresholds
+     - High ATR = wider grid, more opportunity
 
-  3. Momentum (Rate of Change):
-     - 10-tick rate of change
-     - Negative + strong trend = falling knife (blocked)
-     - Positive after negative = potential reversal
-
-  4. Kelly Criterion (Position Sizing):
+  3. Kelly Criterion (Position Sizing):
      - f* = (p·b − q) / b
-     - Scaled by risk_factor × probability_zone_scale
-     - Capped by budget tranche size
+     - p = fair_value (EMA-50), b = (1−price)/price
+     - Scaled by risk_factor (half-Kelly default)
+     - Exposure = balance × risk_factor × probability_from_model
 
-  5. Exposure / Risk Module:
-     - Pre-emptive hedging at 8% delta
-     - Standard hedging at 15% delta
-     - Urgent hedging at 35% delta
-     - Forced hedging at 55% delta
+  4. Exposure / Risk Module:
+     - Runs every tick
+     - Checks pnl_if_up vs pnl_if_down
+     - Prioritizes hedging when one scenario is losing
+     - Delta > 25% → lower hedge threshold
+     - Delta > 50% → hedge at market
 
 Algorithm:
-  1. WARMUP (20 ticks): Build EMA/ATR/momentum baselines
+  1. WARMUP (20 ticks): Build EMA/ATR baselines
   2. Each tick:
-     a. Update per-side indicators (EMA-5/20/50, Z-score, ATR, momentum, reversal)
-     b. Run pre-emptive hedge check → small balancing trades early
-     c. Run exposure check → determine priority
-     d. If HEDGING needed: buy deficit side with smart pricing
-     e. Else: score entry candidates, filter falling knives
-     f. Execute best candidate with urgency scaling
-     g. Verify MGP impact before committing
-  3. Cooldown: 2s between trades
+     a. Update per-side indicators (EMA-20, EMA-50, Z-score, ATR)
+     b. Run exposure check → determine priority
+     c. If HEDGING needed: buy deficit side with relaxed threshold
+     d. Else: buy oversold side via Kelly sizing
+     e. Scale in with small tranches (grid effect)
+  3. Cooldown: 2s between trades (true HFT pacing)
 """
 
 import math
@@ -119,12 +73,11 @@ BREAK_EVEN = 1.0 / FEE_MULT     # ~0.9852
 
 class SideTracker:
     """
-    Tracks EMA-5/20/50, Z-Score, ATR, Momentum, Trend, and Reversal
-    for one side (UP or DOWN). Uses mid-price (bid+ask)/2.
+    Tracks EMA-20, EMA-50, Z-Score, and ATR for one side (UP or DOWN).
+    Uses mid-price (bid+ask)/2 for indicator accuracy.
     """
 
     def __init__(self):
-        self.ema_5: Optional[float] = None
         self.ema_20: Optional[float] = None
         self.ema_50: Optional[float] = None
         self.prices: deque = deque(maxlen=60)
@@ -137,18 +90,6 @@ class SideTracker:
         self.session_low: float = 999.0
         self.session_high: float = 0.0
 
-        # ── Momentum & Trend tracking ──
-        self.momentum: float = 0.0           # Rate of change over last N ticks
-        self.momentum_history: deque = deque(maxlen=20)
-        self.trend_strength: float = 0.0     # 0=no trend, 1=strong trend
-        self.trend_direction: int = 0         # +1 up, -1 down, 0 neutral
-        self.is_reversing: bool = False       # EMA-5 crossing EMA-20
-        self.reversal_score: float = 0.0      # 0-100 reversal confidence
-        self._prev_ema5_above_20: Optional[bool] = None
-        self._consecutive_up_ticks: int = 0
-        self._consecutive_down_ticks: int = 0
-        self._ticks_since_reversal: int = 999
-
     def update(self, price: float):
         """Update all indicators with new price tick."""
         self.tick_count += 1
@@ -156,11 +97,9 @@ class SideTracker:
         self.session_low = min(self.session_low, price)
         self.session_high = max(self.session_high, price)
 
-        # ── EMA-5, EMA-20, EMA-50 ──
-        a5 = 2.0 / 6.0
+        # ── EMA-20 and EMA-50 ──
         a20 = 2.0 / 21.0
         a50 = 2.0 / 51.0
-        self.ema_5 = price if self.ema_5 is None else a5 * price + (1 - a5) * self.ema_5
         self.ema_20 = price if self.ema_20 is None else a20 * price + (1 - a20) * self.ema_20
         self.ema_50 = price if self.ema_50 is None else a50 * price + (1 - a50) * self.ema_50
 
@@ -170,59 +109,7 @@ class SideTracker:
             self.tr_history.append(tr)
             if len(self.tr_history) >= 3:
                 self.atr = sum(self.tr_history) / len(self.tr_history)
-
-        # ── Momentum: rate of change over 10 ticks ──
-        if len(self.prices) >= 10:
-            old_price = self.prices[-10]
-            if old_price > 0:
-                self.momentum = (price - old_price) / old_price
-        elif self.prev_price and self.prev_price > 0:
-            self.momentum = (price - self.prev_price) / self.prev_price
-        self.momentum_history.append(self.momentum)
-
-        # ── Consecutive tick direction ──
-        if self.prev_price is not None:
-            if price > self.prev_price:
-                self._consecutive_up_ticks += 1
-                self._consecutive_down_ticks = 0
-            elif price < self.prev_price:
-                self._consecutive_down_ticks += 1
-                self._consecutive_up_ticks = 0
-
         self.prev_price = price
-
-        # ── Trend Strength & Direction ──
-        if self.ema_5 and self.ema_20 and self.ema_50:
-            # Trend direction: EMA alignment
-            if self.ema_5 > self.ema_20 > self.ema_50:
-                self.trend_direction = 1   # Strong uptrend
-            elif self.ema_5 < self.ema_20 < self.ema_50:
-                self.trend_direction = -1  # Strong downtrend
-            else:
-                self.trend_direction = 0   # Mixed / ranging
-
-            # Trend strength: how far EMA-5 is from EMA-50
-            if self.ema_50 > 0:
-                self.trend_strength = min(1.0, abs(self.ema_5 - self.ema_50) / max(0.001, self.ema_50) * 10)
-
-        # ── Reversal Detection: EMA-5 crossing EMA-20 ──
-        self._ticks_since_reversal += 1
-        if self.ema_5 is not None and self.ema_20 is not None:
-            ema5_above_20 = self.ema_5 > self.ema_20
-            if self._prev_ema5_above_20 is not None:
-                # EMA-5 just crossed above EMA-20 = bullish reversal for this side
-                if ema5_above_20 and not self._prev_ema5_above_20:
-                    self.is_reversing = True
-                    self._ticks_since_reversal = 0
-                elif not ema5_above_20 and self._prev_ema5_above_20:
-                    # EMA-5 crossed below EMA-20 = bearish turn
-                    self.is_reversing = False
-                elif self._ticks_since_reversal > 15:
-                    self.is_reversing = False
-            self._prev_ema5_above_20 = ema5_above_20
-
-        # ── Reversal Score (0-100): composite confidence ──
-        self._compute_reversal_score(price)
 
         # ── Z-Score relative to EMA-50 ──
         if len(self.prices) >= 10:
@@ -233,55 +120,6 @@ class SideTracker:
             self.z_score = (price - self.ema_50) / self.std_dev if self.ema_50 else 0.0
         else:
             self.z_score = 0.0
-
-    def _compute_reversal_score(self, price: float):
-        """Compute a 0-100 reversal confidence score."""
-        score = 0.0
-
-        # Factor 1: EMA-5 crossed above EMA-20 recently (30 pts)
-        if self.is_reversing:
-            freshness = max(0, 1.0 - self._ticks_since_reversal / 15.0)
-            score += 30.0 * freshness
-
-        # Factor 2: Positive momentum after negative period (25 pts)
-        if len(self.momentum_history) >= 5:
-            recent_mom = list(self.momentum_history)[-5:]
-            older_mom = list(self.momentum_history)[-10:-5] if len(self.momentum_history) >= 10 else []
-            if older_mom:
-                avg_recent = sum(recent_mom) / len(recent_mom)
-                avg_older = sum(older_mom) / len(older_mom)
-                if avg_older < -0.001 and avg_recent > 0:
-                    score += 25.0 * min(1.0, avg_recent / 0.01)
-
-        # Factor 3: Price near session low but bouncing (25 pts)
-        if self.session_high > self.session_low and self.session_high > 0:
-            price_range = self.session_high - self.session_low
-            if price_range > 0:
-                position_in_range = (price - self.session_low) / price_range
-                if position_in_range < 0.3 and self._consecutive_up_ticks >= 2:
-                    score += 25.0 * (1.0 - position_in_range / 0.3)
-
-        # Factor 4: Consecutive up ticks (20 pts)
-        if self._consecutive_up_ticks >= 3:
-            score += min(20.0, self._consecutive_up_ticks * 5.0)
-
-        self.reversal_score = min(100.0, score)
-
-    @property
-    def is_falling_knife(self) -> bool:
-        """True if side is in strong sustained downtrend — avoid buying."""
-        return (self.trend_direction == -1 and
-                self.trend_strength > 0.3 and
-                self.momentum < -0.005 and
-                not self.is_reversing)
-
-    @property
-    def is_confirmed_dip(self) -> bool:
-        """True if price dipped but shows signs of recovery."""
-        return (self.z_score < -0.5 and
-                (self.is_reversing or
-                 self.reversal_score > 30 or
-                 self._consecutive_up_ticks >= 2))
 
 
 class ArbitrageStrategy:
@@ -315,7 +153,7 @@ class ArbitrageStrategy:
         )
 
         # ══════════════════════════════════════════════════════
-        #  HFT PARAMETERS v5 — Smart Position Weighting
+        #  HFT PARAMETERS
         # ══════════════════════════════════════════════════════
 
         # ── Warmup ──
@@ -327,49 +165,26 @@ class ArbitrageStrategy:
         self.z_hedge_relaxed = -0.3    # Relaxed threshold when hedging
         self.z_hedge_urgent = 0.5      # Buy hedge even slightly above EMA
 
-        # ── Momentum Filter (NEW) ──
-        self.require_momentum_confirm = True   # Don't buy falling knives
-        self.falling_knife_override_z = -2.5   # Override momentum filter at extreme Z
-        self.reversal_score_min = 25.0          # Min reversal confidence to enter
-        self.reversal_boost_multiplier = 1.5    # Boost position size on confirmed reversal
-
         # ── Kelly Criterion ──
         self.risk_factor = 0.5         # Half-Kelly for safety
-        self.max_kelly_fraction = 0.10 # Max 10% of remaining budget per trade (was 12%)
+        self.max_kelly_fraction = 0.12 # Max 12% of remaining budget per trade
         self.min_trade_size = 1.0      # Polymarket minimum ~$1
-
-        # ── Budget Tranches (NEW) ──
-        self.budget_reserve_pct = 0.35         # Always reserve 35% for hedging
-        self.entry_budget_pct = 0.65           # Max 65% for entries
-        self.max_single_side_budget_pct = 0.45 # Max 45% on a single side
-        self.tranche_count = 5                 # Split entries into 5 tranches
-        self._tranche_size = market_budget * self.entry_budget_pct / self.tranche_count
-
-        # ── Probability-Aware Sizing (NEW) ──
-        self.prob_low_threshold = 0.20         # Below 20%: tiny positions only
-        self.prob_uncertain_range = (0.35, 0.65)  # Uncertain range: best for arb
-        self.prob_high_threshold = 0.75        # Above 75%: very expensive, small
 
         # ── Timing ──
         self.cooldown_seconds = 2.0    # HFT: 2s between trades
         self.min_time_to_enter = 30    # Don't open new positions in last 30s
 
         # ── Risk / Exposure ──
-        self.max_individual_price = 0.72  # Don't buy expensive sides (was 0.78)
-        self.max_loss_per_market = 12.0   # Tighter stop-loss (was 15.0)
-        self.hedge_delta_pct = 15.0       # Start hedging at 15% delta (was 25%)
-        self.urgent_hedge_delta = 35.0    # Urgent hedge at 35% delta (was 50%)
-        self.forced_hedge_delta = 55.0    # Forced hedge at 55% delta (was 70%)
-        self.max_risk_per_leg = 6.0       # Max $ loss on one scenario (was 8.0)
-
-        # ── Pre-emptive Hedging (NEW) ──
-        self.preemptive_hedge_enabled = True    # Start small hedges early
-        self.preemptive_hedge_threshold = 8.0   # Start pre-hedge at 8% delta
-        self.preemptive_hedge_fraction = 0.3    # Hedge 30% of deficit
+        self.max_individual_price = 0.78  # Don't buy expensive sides
+        self.max_loss_per_market = 15.0   # Stop-loss
+        self.hedge_delta_pct = 25.0       # Start hedging at 25% delta
+        self.urgent_hedge_delta = 50.0    # Urgent hedge at 50% delta
+        self.forced_hedge_delta = 70.0    # Forced hedge at 70% delta
+        self.max_risk_per_leg = 8.0       # Max $ loss on one scenario
 
         # ── Position limits ──
-        self.max_shares_per_order = 150         # Smaller max orders (was 200)
-        self.max_allowed_delta_pct = 5.0        # Considered "balanced" under this
+        self.max_shares_per_order = 200
+        self.max_allowed_delta_pct = 5.0  # Considered "balanced" under this
 
         # ── State ──
         self.last_trade_time: float = 0
@@ -531,12 +346,7 @@ class ArbitrageStrategy:
         f* = (p·b − q) / b
         where p = fair_value (estimated win probability from EMA-50),
               q = 1 − p,
-              b = (1−price)/price (net payout odds).
-
-        Enhanced with probability-aware scaling:
-          - Low probability (<20%): scale down to 30% of Kelly
-          - Uncertain range (35-65%): full Kelly (best arb zone)
-          - High probability (>75%): scale down to 40% (expensive)
+              b = (1 − price) / price (net payout odds).
 
         Returns the fraction of remaining budget to bet.
         """
@@ -556,80 +366,22 @@ class ArbitrageStrategy:
 
         # Scale by risk factor (0.5 = half-Kelly)
         f *= self.risk_factor
-
-        # Probability-aware scaling: reduce size outside optimal zone
-        implied_prob = price  # In binary markets, price ≈ probability
-        prob_scale = self._probability_scale(implied_prob)
-        f *= prob_scale
-
         return min(f, self.max_kelly_fraction)
 
-    def _probability_scale(self, implied_prob: float) -> float:
-        """
-        Scale factor based on implied probability.
-        Best zone for arb is 35-65% (uncertain markets).
-        Extreme probabilities mean expensive or near-worthless sides.
-        """
-        low = self.prob_low_threshold      # 0.20
-        unc_lo, unc_hi = self.prob_uncertain_range  # (0.35, 0.65)
-        high = self.prob_high_threshold    # 0.75
-
-        if implied_prob < low:
-            return 0.3   # Very cheap but likely to lose
-        elif implied_prob < unc_lo:
-            # Gradual ramp from 0.3 to 1.0
-            t = (implied_prob - low) / (unc_lo - low)
-            return 0.3 + 0.7 * t
-        elif implied_prob <= unc_hi:
-            return 1.0   # Optimal zone
-        elif implied_prob <= high:
-            # Gradual ramp from 1.0 to 0.4
-            t = (implied_prob - unc_hi) / (high - unc_hi)
-            return 1.0 - 0.6 * t
-        else:
-            return 0.4   # Very expensive, likely to win but poor arb value
-
-    def _budget_available_for_side(self, side: str, is_hedge: bool = False) -> float:
-        """
-        Calculate available budget for a given side, respecting:
-        1. Budget reserve for hedging (35% always available for hedges)
-        2. Max single-side budget cap (45%)
-        3. Tranche sizing
-        """
-        total_invested = self.cost_up + self.cost_down
-        remaining_total = max(0, self.market_budget - total_invested)
-
-        if is_hedge:
-            # Hedges can use the full remaining budget including reserve
-            return remaining_total
-
-        # Entries are capped to entry_budget_pct of total market budget
-        entry_budget = self.market_budget * self.entry_budget_pct
-        entry_used = total_invested  # Simplified: all invested counts
-        entry_remaining = max(0, entry_budget - entry_used)
-
-        # Single side cap
-        side_cost = self.cost_up if side == 'UP' else self.cost_down
-        side_cap = self.market_budget * self.max_single_side_budget_pct
-        side_remaining = max(0, side_cap - side_cost)
-
-        return min(remaining_total, entry_remaining, side_remaining)
-
     def _calculate_trade_size(self, side: str, price: float,
-                              fair_value: float, urgency: float = 1.0,
-                              is_hedge: bool = False) -> float:
+                              fair_value: float, urgency: float = 1.0) -> float:
         """
-        Calculate trade size using Kelly Criterion + budget controls.
+        Calculate trade size using Kelly Criterion.
 
-        Exposure = (available_budget × kelly_fraction) × urgency
-        Available budget respects tranche sizing and reserve.
+        Exposure = (remaining_budget × kelly_fraction) × urgency
         Urgency > 1.0 for hedge trades, < 1.0 for speculative trades.
 
         Returns quantity (shares).
         """
-        available = self._budget_available_for_side(side, is_hedge=is_hedge)
+        total_invested = self.cost_up + self.cost_down
+        remaining_budget = max(0, self.market_budget - total_invested)
 
-        if available < self.min_trade_size:
+        if remaining_budget < self.min_trade_size:
             return 0.0
 
         kelly = self._kelly_fraction(price, fair_value)
@@ -637,19 +389,16 @@ class ArbitrageStrategy:
             return 0.0
 
         # Base dollar amount from Kelly
-        dollars = available * kelly * urgency
-
-        # Tranche cap: don't exceed one tranche for normal entries
-        if not is_hedge:
-            dollars = min(dollars, self._tranche_size)
+        dollars = remaining_budget * kelly * urgency
 
         # Account balance constraint
+        # Exposure = balance × risk_factor × probability_from_model
         model_prob = fair_value
         account_limit = self.cash * self.risk_factor * model_prob
         dollars = min(dollars, account_limit)
 
         # Enforce bounds
-        dollars = max(self.min_trade_size, min(dollars, available, self.cash))
+        dollars = max(self.min_trade_size, min(dollars, remaining_budget, self.cash))
 
         # Convert to shares
         qty = dollars / price if price > 0 else 0
@@ -931,51 +680,6 @@ class ArbitrageStrategy:
         priority = self._exposure_priority
 
         # ════════════════════════════════════════════════════════
-        #  PRE-EMPTIVE HEDGE — Start hedging early at small deltas
-        #  (NEW: don't wait until delta is 25%+, start at 8%)
-        # ════════════════════════════════════════════════════════
-
-        if (priority == 'NEUTRAL' and has_position and
-                self.preemptive_hedge_enabled and
-                self.position_delta_pct >= self.preemptive_hedge_threshold):
-
-            ph_side = self.smaller_side()
-            ph_price = up_price if ph_side == 'UP' else down_price
-            ph_fair = fair_up if ph_side == 'UP' else fair_down
-            ph_z = z_up if ph_side == 'UP' else z_down
-            ph_tracker = self.up_tracker if ph_side == 'UP' else self.down_tracker
-
-            # Only pre-hedge if price is reasonable and not a falling knife
-            if (ph_price <= self.max_individual_price and
-                    ph_z <= self.z_hedge_relaxed and
-                    not ph_tracker.is_falling_knife):
-
-                # Calculate deficit and buy a fraction of it
-                deficit = self.deficit()
-                target_qty = deficit * self.preemptive_hedge_fraction
-                max_hedge_price = self.max_price_for_positive_mgp()
-
-                if ph_price <= max_hedge_price and target_qty * ph_price >= self.min_trade_size:
-                    qty = self._calculate_trade_size(ph_side, ph_price, ph_fair, 1.0, is_hedge=True)
-                    qty = min(qty, target_qty)
-
-                    if qty * ph_price >= self.min_trade_size:
-                        # Verify hedge improves MGP
-                        projected_mgp = self.mgp_after_buy(ph_side, ph_price, qty)
-                        if projected_mgp > mgp:
-                            ok, ap, aq = self.execute_buy(ph_side, ph_price, qty, timestamp)
-                            if ok:
-                                trades_made.append((ph_side, ap, aq))
-                                actual_mgp = self.calculate_locked_profit()
-                                self.current_mode = 'pre_hedge'
-                                self.mode_reason = (f'🔄 PRE-HEDGE {ph_side} {aq:.1f}sh@${ap:.3f} | '
-                                                    f'Δ {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}')
-                                print(f"🔄 PRE-HEDGE: {ph_side} {aq:.1f}×${ap:.3f} | "
-                                      f"Δ {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}")
-                                self._record_history()
-                                return trades_made
-
-        # ════════════════════════════════════════════════════════
         #  HEDGE MODE — Position is unbalanced, prioritize hedging
         # ════════════════════════════════════════════════════════
 
@@ -984,7 +688,6 @@ class ArbitrageStrategy:
             hedge_price = up_price if hedge_side == 'UP' else down_price
             hedge_fair = fair_up if hedge_side == 'UP' else fair_down
             hedge_z = z_up if hedge_side == 'UP' else z_down
-            hedge_tracker = self.up_tracker if hedge_side == 'UP' else self.down_tracker
             z_threshold = self._get_hedge_z_threshold()
 
             delta = self.position_delta_pct
@@ -992,19 +695,13 @@ class ArbitrageStrategy:
             pnl_down = self.calculate_pnl_if_down_wins()
             worst_pnl = min(pnl_up, pnl_down)
 
-            # Check max price for positive MGP — don't overpay for hedges
-            max_hedge_price = self.max_price_for_positive_mgp()
-
             # Forced hedge: delta is critical — buy at market
             if delta >= self.forced_hedge_delta:
                 urgency = 2.0
+                # Use a generous fair value to ensure Kelly gives a size
                 adjusted_fair = max(hedge_fair, hedge_price * 1.05)
-                qty = self._calculate_trade_size(hedge_side, hedge_price, adjusted_fair, urgency, is_hedge=True)
-
-                # Even forced hedge respects max price (but with some slack)
-                price_ok = hedge_price <= min(max_hedge_price * 1.15, 0.85)
-
-                if qty * hedge_price >= self.min_trade_size and price_ok:
+                qty = self._calculate_trade_size(hedge_side, hedge_price, adjusted_fair, urgency)
+                if qty * hedge_price >= self.min_trade_size:
                     ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
                     if ok:
                         trades_made.append((hedge_side, ap, aq))
@@ -1017,141 +714,88 @@ class ArbitrageStrategy:
                         self._record_history()
                         return trades_made
 
-            # Smart hedge: check if the hedge side is showing a reversal
-            # If reversing, boost urgency and relax threshold
-            hedge_is_reversing = hedge_tracker.is_reversing or hedge_tracker.reversal_score > 30
-            if hedge_is_reversing:
-                z_threshold = max(z_threshold, 0.0)  # Very relaxed
-                hedge_urgency_boost = 1.3
-            else:
-                hedge_urgency_boost = 1.0
-
+            # Hedge if z-score is below threshold (relaxed for urgency)
             if hedge_z <= z_threshold and hedge_price <= self.max_individual_price:
-                # Verify hedge price won't blow MGP
-                if hedge_price <= max_hedge_price * 1.05:
-                    urgency = (1.5 if delta > self.urgent_hedge_delta else 1.2) * hedge_urgency_boost
-                    qty = self._calculate_trade_size(hedge_side, hedge_price, hedge_fair, urgency, is_hedge=True)
+                urgency = 1.5 if delta > self.urgent_hedge_delta else 1.2
+                qty = self._calculate_trade_size(hedge_side, hedge_price, hedge_fair, urgency)
 
-                    if qty * hedge_price >= self.min_trade_size:
-                        new_mgp = self.mgp_after_buy(hedge_side, hedge_price, qty)
+                if qty * hedge_price >= self.min_trade_size:
+                    # Verify hedge improves worst-case scenario
+                    new_mgp = self.mgp_after_buy(hedge_side, hedge_price, qty)
 
-                        ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
-                        if ok:
-                            trades_made.append((hedge_side, ap, aq))
-                            actual_mgp = self.calculate_locked_profit()
-                            lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-                            rev_tag = " 🔄" if hedge_is_reversing else ""
-                            self.current_mode = 'hedging'
-                            self.mode_reason = (f'⚖️ HEDGE {hedge_side} {aq:.1f}sh@${ap:.3f} | '
-                                                f'z={hedge_z:+.1f} | Δ {self.position_delta_pct:.0f}% | '
-                                                f'MGP ${actual_mgp:.2f}{lock_tag}{rev_tag}')
-                            print(f"⚖️ HEDGE: {hedge_side} {aq:.1f}×${ap:.3f} | z={hedge_z:+.1f} | "
-                                  f"delta {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}{lock_tag}{rev_tag}")
-                            self._record_history()
-                            return trades_made
+                    ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
+                    if ok:
+                        trades_made.append((hedge_side, ap, aq))
+                        actual_mgp = self.calculate_locked_profit()
+                        lock_tag = " 🔒" if self.both_scenarios_positive() else ""
+                        self.current_mode = 'hedging'
+                        self.mode_reason = (f'⚖️ HEDGE {hedge_side} {aq:.1f}sh@${ap:.3f} | '
+                                            f'z={hedge_z:+.1f} | Δ {self.position_delta_pct:.0f}% | '
+                                            f'MGP ${actual_mgp:.2f}{lock_tag}')
+                        print(f"⚖️ HEDGE: {hedge_side} {aq:.1f}×${ap:.3f} | z={hedge_z:+.1f} | "
+                              f"delta {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}{lock_tag}")
+                        self._record_history()
+                        return trades_made
 
             # Hedge signal not triggered yet
-            rev_info = f" | rev={hedge_tracker.reversal_score:.0f}" if hedge_tracker.reversal_score > 0 else ""
             self.current_mode = 'waiting_hedge'
             self.mode_reason = (f'⏳ Need {hedge_side} hedge | z={hedge_z:+.1f} (need <{z_threshold:+.1f}) | '
-                                f'Δ {self.position_delta_pct:.0f}% | PnL worst ${worst_pnl:.2f}{rev_info}')
+                                f'Δ {self.position_delta_pct:.0f}% | PnL worst ${worst_pnl:.2f}')
             self._record_history()
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  ENTRY MODE — Smart Oversold Detection
-        #  (NEW: momentum filter + reversal confirmation)
+        #  ENTRY MODE — Look for oversold side to buy
         # ════════════════════════════════════════════════════════
 
-        # Build entry candidates with quality scoring
-        candidates = []
-        for side, z, price, fair, tracker in [
-            ('UP', z_up, up_price, fair_up, self.up_tracker),
-            ('DOWN', z_down, down_price, fair_down, self.down_tracker),
-        ]:
-            if price > self.max_individual_price:
-                continue
-            if z > self.z_entry:
-                # Time pressure: in final quarter, slightly relax threshold
-                if time_to_close is not None and time_to_close < 225:
-                    if z > self.z_entry + 0.3:
-                        continue
-                else:
-                    continue
+        # Find the best entry signal
+        up_signal = z_up <= self.z_entry and up_price <= self.max_individual_price
+        down_signal = z_down <= self.z_entry and down_price <= self.max_individual_price
 
-            # ── MOMENTUM FILTER: Don't buy falling knives ──
-            if self.require_momentum_confirm:
-                if tracker.is_falling_knife:
-                    # Exception: extreme Z-score overrides momentum filter
-                    if z > self.falling_knife_override_z:
-                        print(f"🔪 FALLING KNIFE blocked: {side} z={z:+.1f} | "
-                              f"mom={tracker.momentum:.4f} | trend={tracker.trend_direction}")
-                        continue
+        # Time pressure: in final quarter, slightly relax threshold
+        if time_to_close is not None and time_to_close < 225:  # Last 25%
+            relaxed_z = self.z_entry + 0.3
+            if not up_signal:
+                up_signal = z_up <= relaxed_z and up_price <= self.max_individual_price
+            if not down_signal:
+                down_signal = z_down <= relaxed_z and down_price <= self.max_individual_price
 
-            # ── Calculate entry quality score ──
-            entry_quality = self._score_entry(side, z, price, fair, tracker)
-            candidates.append((side, z, price, fair, tracker, entry_quality))
-
-        if not candidates:
-            # Show why no entries
-            up_knife = "🔪" if self.up_tracker.is_falling_knife else ""
-            dn_knife = "🔪" if self.down_tracker.is_falling_knife else ""
+        if not up_signal and not down_signal:
             self.current_mode = 'scanning'
-            self.mode_reason = (f'👁 Scanning | UP z={z_up:+.1f}{up_knife} DOWN z={z_down:+.1f}{dn_knife} | '
+            self.mode_reason = (f'👁 Scanning | UP z={z_up:+.1f} DOWN z={z_down:+.1f} | '
                                 f'thres {self.z_entry:+.1f}')
             self._record_history()
             return trades_made
 
-        # ── Choose best candidate by quality score ──
-        candidates.sort(key=lambda c: c[5], reverse=True)
-        buy_side, buy_z, buy_price, buy_fair, buy_tracker, quality = candidates[0]
+        # Choose which side to buy: the MORE oversold one
+        if up_signal and down_signal:
+            buy_side = 'UP' if z_up < z_down else 'DOWN'
+        elif up_signal:
+            buy_side = 'UP'
+        else:
+            buy_side = 'DOWN'
 
-        # ── Urgency scaling based on multiple factors ──
+        buy_price = up_price if buy_side == 'UP' else down_price
+        buy_fair = fair_up if buy_side == 'UP' else fair_down
+        buy_z = z_up if buy_side == 'UP' else z_down
+
+        # Urgency scaling: stronger signal → larger trade
         urgency = 1.0
-
-        # Strong z-score oversold → bigger position
         if buy_z <= self.z_strong_entry:
-            urgency *= 1.3
-
-        # Confirmed reversal → boost
-        if buy_tracker.is_reversing or buy_tracker.reversal_score > self.reversal_score_min:
-            urgency *= self.reversal_boost_multiplier
-            print(f"🔄 REVERSAL BOOST: {buy_side} | rev_score={buy_tracker.reversal_score:.0f}")
-
-        # Confirmed dip (not falling knife + recovery signs) → mild boost
-        elif buy_tracker.is_confirmed_dip:
-            urgency *= 1.15
-
-        # Consider balance: if buying this side increases delta, reduce urgency
-        if has_position:
-            if ((buy_side == 'UP' and self.qty_up > self.qty_down) or
-                    (buy_side == 'DOWN' and self.qty_down > self.qty_up)):
-                urgency *= 0.6  # Reduce size — would worsen balance
+            urgency = 1.5  # Heavily oversold → bigger position
 
         qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
 
         if qty * buy_price < self.min_trade_size:
             self.current_mode = 'scanning'
-            self.mode_reason = (f'Trade too small | {buy_side} z={buy_z:+.1f} | '
-                                f'Kelly={self._kelly_fraction(buy_price, buy_fair):.3f}')
+            self.mode_reason = f'Trade too small | {buy_side} z={buy_z:+.1f} | Kelly={self._kelly_fraction(buy_price, buy_fair):.3f}'
             self._record_history()
             return trades_made
 
-        # ── Verify entry doesn't wreck MGP ──
-        if has_position:
-            projected_mgp = self.mgp_after_buy(buy_side, buy_price, qty)
-            if projected_mgp < mgp - 3.0:  # Don't enter if it worsens MGP by >$3
-                self.current_mode = 'scanning'
-                self.mode_reason = (f'⚠️ Skipped {buy_side} — would drop MGP by ${mgp - projected_mgp:.2f}')
-                self._record_history()
-                return trades_made
-
         # ── Execute single-side buy ──
         kelly_f = self._kelly_fraction(buy_price, buy_fair)
-        rev_tag = f" REV={buy_tracker.reversal_score:.0f}" if buy_tracker.reversal_score > 15 else ""
-        mom_tag = f" mom={buy_tracker.momentum:+.3f}" if abs(buy_tracker.momentum) > 0.001 else ""
         print(f"📊 SIGNAL: {buy_side} z={buy_z:+.2f} | ${buy_price:.3f} vs fair ${buy_fair:.3f} | "
-              f"Kelly={kelly_f:.3f} | qty={qty:.1f} (${qty*buy_price:.2f}) | Q={quality:.0f}{rev_tag}{mom_tag}")
+              f"Kelly={kelly_f:.3f} | qty={qty:.1f} (${qty*buy_price:.2f})")
 
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
@@ -1160,48 +804,12 @@ class ArbitrageStrategy:
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
             self.current_mode = 'accumulating'
             self.mode_reason = (f'📈 BUY {buy_side} {aq:.1f}sh@${ap:.3f} | z={buy_z:+.1f} | '
-                                f'Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}')
+                                f'Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f}{lock_tag}')
             print(f"🎯 TRADE #{self.trade_count}: {buy_side} {aq:.1f}×${ap:.3f} | "
-                  f"z={buy_z:+.1f} | Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}")
+                  f"z={buy_z:+.1f} | Kelly={kelly_f:.3f} | MGP ${mgp_new:.2f}{lock_tag}")
 
         self._record_history()
         return trades_made
-
-    def _score_entry(self, side: str, z: float, price: float,
-                     fair: float, tracker: 'SideTracker') -> float:
-        """
-        Score an entry candidate (0-100) based on multiple factors.
-        Higher score = better entry opportunity.
-        """
-        score = 0.0
-
-        # Factor 1: Z-score depth (40 pts max)
-        # More oversold = higher score
-        z_depth = max(0, -z - 0.5)  # How far below -0.5
-        score += min(40.0, z_depth * 20.0)
-
-        # Factor 2: Reversal confirmation (25 pts max)
-        score += tracker.reversal_score * 0.25
-
-        # Factor 3: Price in optimal probability zone (20 pts)
-        prob_scale = self._probability_scale(price)
-        score += prob_scale * 20.0
-
-        # Factor 4: Balance improvement (15 pts)
-        # Buying the smaller side should be rewarded
-        if self.qty_up + self.qty_down > 0:
-            if side == self.smaller_side():
-                score += 15.0
-            elif side == self.larger_side():
-                score -= 10.0  # Penalize increasing imbalance
-
-        # Factor 5: Momentum quality (-10 to +10 pts)
-        if tracker.momentum > 0.002:
-            score += 10.0  # Positive momentum confirms dip recovery
-        elif tracker.momentum < -0.005:
-            score -= 10.0  # Strong negative momentum is risky
-
-        return max(0, min(100, score))
 
     def _record_history(self):
         if self.qty_up + self.qty_down > 0:
@@ -1290,17 +898,6 @@ class ArbitrageStrategy:
             'atr_up': self.up_tracker.atr,
             'atr_down': self.down_tracker.atr,
             'exposure_priority': self._exposure_priority,
-            # Momentum & Reversal indicators (v5)
-            'momentum_up': self.up_tracker.momentum,
-            'momentum_down': self.down_tracker.momentum,
-            'reversal_score_up': self.up_tracker.reversal_score,
-            'reversal_score_down': self.down_tracker.reversal_score,
-            'trend_dir_up': self.up_tracker.trend_direction,
-            'trend_dir_down': self.down_tracker.trend_direction,
-            'is_reversing_up': self.up_tracker.is_reversing,
-            'is_reversing_down': self.down_tracker.is_reversing,
-            'falling_knife_up': self.up_tracker.is_falling_knife,
-            'falling_knife_down': self.down_tracker.is_falling_knife,
             # Execution stats
             'exec_stats': self.exec_sim.get_stats(),
         }
@@ -1339,13 +936,6 @@ class ArbitrageStrategy:
             'z_score_up': self.up_tracker.z_score,
             'z_score_down': self.down_tracker.z_score,
             'exposure_priority': self._exposure_priority,
-            # v5 indicators
-            'momentum_up': self.up_tracker.momentum,
-            'momentum_down': self.down_tracker.momentum,
-            'reversal_score_up': self.up_tracker.reversal_score,
-            'reversal_score_down': self.down_tracker.reversal_score,
-            'falling_knife_up': self.up_tracker.is_falling_knife,
-            'falling_knife_down': self.down_tracker.is_falling_knife,
         }
 
     # ═══════════════════════════════════════════════════════════════
