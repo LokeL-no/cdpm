@@ -321,8 +321,10 @@ class ArbitrageStrategy:
         #  When entering a new market, prefer the likely winner.
         #  If you can't complete the pair, at least you hold the winner.
         self.winner_first_enabled = True
-        self.winner_entry_price_max = 0.75  # Don't buy winner above $0.75 (enter aggressively)
-        self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
+        self.winner_entry_price_max = 0.57  # Entry cap: max $0.57 (v8.0)
+        self.loser_entry_price_max = 0.38   # Only buy loser at $0.38 or below (v8.0)
+        self.arb_lock_max_pair_cost = 0.95  # Arb-lock only when pair cost ≤ $0.95 (v8.0)
+        self.pivot_entry_price_max = 0.65   # Pivot entries allowed up to $0.65 (v8.0)
 
         # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
@@ -340,9 +342,9 @@ class ArbitrageStrategy:
 
         # Entry gating (v6.5: no start-delay — enter immediately when price meets threshold)
         self._first_tick_time = None
-        self.min_entry_price_to_start = 0.59  # Don't enter market until one side >= this price
+        self.min_entry_price_to_start = 0.55  # Don't enter market until one side >= this price (v8.0)
         self.initial_buy_dollars = 5.0        # Force first buy to be exactly $5
-        self.reserve_pivot_price = 0.59       # Worst-case price for pivot reserve calculation
+        self.reserve_pivot_price = 0.57       # Worst-case price for pivot reserve calculation (v8.0)
 
         # ── Momentum Filter ──
         self.require_momentum_confirm = True
@@ -367,7 +369,7 @@ class ArbitrageStrategy:
         self.min_time_to_enter = 30
 
         # ── Risk / Exposure ──
-        self.max_individual_price = 0.72  # General max price
+        self.max_individual_price = 0.65  # General max price (v8.0 — relaxed for pivots)
         self.max_loss_per_market = 10.0   # Tight stop-loss
         self.hedge_delta_pct = 5.0        # Start hedging at 5% delta (was 12 — too slow)
         self.urgent_hedge_delta = 20.0    # Urgent hedge at 20% delta
@@ -375,7 +377,7 @@ class ArbitrageStrategy:
         self.max_risk_per_leg = 5.0       # Max $ loss on one scenario
 
         # ── Pre-emptive Hedging ──
-        self.preemptive_hedge_enabled = True
+        self.preemptive_hedge_enabled = False  # Disabled (v8.0 — only arb-lock and pivot buy other side)
         self.preemptive_hedge_threshold = 3.0  # Start pre-hedge at 3% delta (aggressive)
         self.preemptive_hedge_fraction = 0.4   # Hedge 40% of deficit
 
@@ -1144,53 +1146,60 @@ class ArbitrageStrategy:
             priority = 'NEUTRAL'
 
         # ════════════════════════════════════════════════════════
-        #  ARB-LOCK (v6.4) — Lock profit when arb appears
-        #  When combined < break-even AND we have a position,
-        #  buy the smaller side to close deficit, then build new pairs.
-        #  NO z-score required — the arb margin IS the edge.
-        #  Allowed to overshoot deficit (up to 5 shares) to meet
-        #  min_trade_size and to keep building pairs.
+        #  ARB-LOCK (v8.0) — Lock profit when pair cost ≤ $0.95
+        #  Only triggers when the opposite side is cheap enough
+        #  (pair cost ≤ arb_lock_max_pair_cost) AND we can lock
+        #  guaranteed profit with remaining budget.
+        #  Buys all at once to lock immediately.
         # ════════════════════════════════════════════════════════
 
-        if not self._pivot_mode and has_position and has_arb_opportunity:
-            deficit = self.deficit()
-            # Pick side: smaller side if deficit exists, else cheaper side
-            if deficit >= 0.5:
-                lock_side = self.smaller_side()
-            else:
-                lock_side = 'UP' if up_price <= down_price else 'DOWN'
-
+        if not self._pivot_mode and has_position and combined <= self.arb_lock_max_pair_cost:
+            # Pick the cheap side (smaller qty if deficit, else cheaper price)
+            lock_side = self.smaller_side() if self.deficit() >= 0.5 else ('UP' if up_price <= down_price else 'DOWN')
             lock_price = up_price if lock_side == 'UP' else down_price
 
-            # Size: enough for at least min_trade_size, up to deficit + overshoot
-            min_shares = self.min_trade_size / lock_price if lock_price > 0 else 0
-            max_overshoot = 5.0  # Allow building up to 5 shares beyond balance
-            target = max(deficit, min_shares) + max_overshoot
-            target = max(target, min_shares)  # Always at least min_trade_size
+            qty_strong = max(self.qty_up, self.qty_down)
+            qty_weak = min(self.qty_up, self.qty_down)
+            cost_total = self.cost_up + self.cost_down
+            actual_cash = max(0, self.starting_balance - cost_total)
 
-            # Budget: actual remaining cash MINUS pivot reserve (v6.5)
-            actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
-            pivot_reserve = self._worst_case_pivot_cost()
-            available_for_arb = max(0, actual_cash - pivot_reserve)
-            max_budget_qty = available_for_arb / lock_price if lock_price > 0 else 0
-            qty = min(target, max_budget_qty, self.max_shares_per_order)
+            # Calculate minimum shares to lock profit if WEAK side wins:
+            #   (qty_weak + q) >= (cost_total + q × lock_price) × FEE_MULT
+            #   q ≥ (cost_total × FEE_MULT - qty_weak) / (1 - lock_price × FEE_MULT)
+            denom_lock = 1.0 - lock_price * FEE_MULT
+            if denom_lock > 0.01:
+                q_min_lock = max(0, (cost_total * FEE_MULT - qty_weak) / denom_lock)
+            else:
+                q_min_lock = float('inf')
 
-            if qty * lock_price >= self.min_trade_size:
-                # Skip MGP check for arb-lock — each completed pair
-                # at combined < breakeven is guaranteed profit.
-                # Individual trades may temporarily worsen one side,
-                # but the alternating buy pattern builds net-positive pairs.
+            # Max shares before STRONG side goes negative:
+            #   qty_strong ≥ (cost_total + q × lock_price) × FEE_MULT
+            #   q ≤ (qty_strong - cost_total × FEE_MULT) / (lock_price × FEE_MULT)
+            q_max_lock = ((qty_strong - cost_total * FEE_MULT) / (lock_price * FEE_MULT)
+                          if lock_price > 0 else 0)
+
+            # Target: at least enough to lock, ideally balanced
+            deficit = qty_strong - qty_weak
+            q_target = max(q_min_lock, deficit)
+
+            # Can we lock profit with remaining budget?
+            can_lock = (q_min_lock <= q_max_lock and
+                        q_target <= q_max_lock and
+                        q_target * lock_price <= actual_cash and
+                        q_target * lock_price >= self.min_trade_size)
+
+            if can_lock:
+                qty = min(q_target, actual_cash / lock_price, self.max_shares_per_order)
                 ok, ap, aq = self.execute_buy(lock_side, lock_price, qty, timestamp)
                 if ok:
                     trades_made.append((lock_side, ap, aq))
                     actual_mgp = self.calculate_locked_profit()
-                    new_deficit = self.deficit()
                     lock_tag = " 🔒" if self.both_scenarios_positive() else ""
                     self.current_mode = 'arb_lock'
                     self.mode_reason = (f'💰 ARB-LOCK {lock_side} {aq:.1f}sh@${ap:.3f} | '
-                                        f'margin=${arb_margin:.3f} | Δ{new_deficit:.0f} | MGP ${actual_mgp:.2f}{lock_tag}')
+                                        f'pair=${combined:.3f} | MGP ${actual_mgp:.2f}{lock_tag}')
                     print(f"💰 ARB-LOCK: {lock_side} {aq:.1f}×${ap:.3f} | "
-                          f"arb=${arb_margin:.3f} | Δ{new_deficit:.0f} | MGP ${actual_mgp:.2f}{lock_tag}")
+                          f"pair=${combined:.3f} | MGP ${actual_mgp:.2f}{lock_tag}")
                     self._record_history()
                     return trades_made
 
@@ -1199,6 +1208,20 @@ class ArbitrageStrategy:
         if self._equalized:
             self.current_mode = 'equalized'
             self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
+            self._record_history()
+            return trades_made
+
+        # ════════════════════════════════════════════════════════
+        #  HOLD GATE (v8.0) — After initial entry, only arb-lock
+        #  and pivot can buy. No hedging, no incremental entries.
+        #  This keeps the strategy clean: entry → wait → lock or pivot.
+        # ════════════════════════════════════════════════════════
+
+        if has_position and not self._pivot_mode:
+            delta_str = f' | Δ {self.position_delta_pct:.0f}%' if self.qty_up > 0 and self.qty_down > 0 else ''
+            self.current_mode = 'holding'
+            self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
+                                f'pair ${combined:.3f} | MGP ${mgp:.2f}{delta_str}')
             self._record_history()
             return trades_made
 
@@ -1475,7 +1498,7 @@ class ArbitrageStrategy:
         #  Skip z-score requirement — this is a risk-reduction trade.
         #  The market has decided our side is losing. Buy the new winner.
         if self._pivot_mode and has_position:
-            if winner_price <= self.winner_entry_price_max:
+            if winner_price <= self.pivot_entry_price_max:
                 already_in = any(c[0] == likely_winner for c in candidates)
                 if not already_in:
                     quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
