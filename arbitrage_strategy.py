@@ -246,17 +246,18 @@ class SideTracker:
 
 class ArbitrageStrategy:
     """
-    HFT Pair-Building Strategy v6.1 for Polymarket binary markets.
+    HFT Enter-and-Work Strategy v6.2 for Polymarket binary markets.
 
-    KEY INSIGHT: In prediction markets, cheap = likely to LOSE.
-    Never buy the cheap side just because z-score says 'oversold'.
+    KEY INSIGHT: Don't wait for arb — enter the market immediately.
+    Buy the likely winner, then hedge when the other side dips.
 
     Strategy:
-      1. COMBINED COST GATE: Only trade when UP + DOWN < break-even (~$0.985)
-      2. WINNER-FIRST: Always start with the likely winner (safer single position)
-      3. ROLE-BASED Z-THRESHOLDS: Winner z<=+0.5, Loser z<=-1.5
-      4. POST-TRADE RATIO CHECK: Prevents imbalance before it happens
-      5. MGP PROTECTION: Every trade must maintain or improve MGP
+      1. ENTER IMMEDIATELY: Buy winner side as soon as market opens
+      2. WAIT FOR HEDGE: Watch for combined dip below break-even
+      3. WINNER-FIRST: Always start with the likely winner (safer)
+      4. ROLE-BASED Z-THRESHOLDS: Winner z<=+0.5, Loser z<=-1.5
+      5. POST-TRADE RATIO CHECK: Prevents imbalance before it happens
+      6. MGP PROTECTION: Every trade must maintain or improve MGP
     """
 
     def __init__(self, market_budget: float, starting_balance: float,
@@ -320,7 +321,7 @@ class ArbitrageStrategy:
         #  When entering a new market, prefer the likely winner.
         #  If you can't complete the pair, at least you hold the winner.
         self.winner_first_enabled = True
-        self.winner_entry_price_max = 0.68  # Don't buy winner above $0.68
+        self.winner_entry_price_max = 0.75  # Don't buy winner above $0.75 (enter aggressively)
         self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
 
         # ── Momentum Filter ──
@@ -348,14 +349,14 @@ class ArbitrageStrategy:
         # ── Risk / Exposure ──
         self.max_individual_price = 0.72  # General max price
         self.max_loss_per_market = 10.0   # Tight stop-loss
-        self.hedge_delta_pct = 12.0       # Start hedging at 12% delta
-        self.urgent_hedge_delta = 30.0    # Urgent hedge at 30% delta
-        self.forced_hedge_delta = 50.0    # Forced hedge at 50% delta
+        self.hedge_delta_pct = 5.0        # Start hedging at 5% delta (was 12 — too slow)
+        self.urgent_hedge_delta = 20.0    # Urgent hedge at 20% delta
+        self.forced_hedge_delta = 40.0    # Forced hedge at 40% delta
         self.max_risk_per_leg = 5.0       # Max $ loss on one scenario
 
         # ── Pre-emptive Hedging ──
         self.preemptive_hedge_enabled = True
-        self.preemptive_hedge_threshold = 6.0  # Start pre-hedge at 6% delta
+        self.preemptive_hedge_threshold = 3.0  # Start pre-hedge at 3% delta (aggressive)
         self.preemptive_hedge_fraction = 0.4   # Hedge 40% of deficit
 
         # ── Position limits ──
@@ -530,7 +531,9 @@ class ArbitrageStrategy:
         than the EMA alone suggests.
         """
         arb_fair = BREAK_EVEN - other_price
-        return max(tracker_fair, arb_fair)
+        # For first entry (no arb yet), at least price + small edge
+        min_fair = price * 1.02  # Minimum: assume 2% edge over current price
+        return max(tracker_fair, arb_fair, min_fair)
 
     # ═══════════════════════════════════════════════════════════════
     #  KELLY CRITERION — Position Sizing
@@ -960,6 +963,18 @@ class ArbitrageStrategy:
         has_arb_opportunity = arb_margin > 0
 
         # ════════════════════════════════════════════════════════
+        #  NO-ARB HOLD (v6.2) — Skip hedge/entry when no arb exists
+        #  Hedging without arb worsens MGP. Just hold and wait.
+        # ════════════════════════════════════════════════════════
+
+        if has_position and not has_arb_opportunity:
+            self.current_mode = 'waiting_for_dip'
+            self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
+                                f'combined ${combined:.3f} | need <${BREAK_EVEN:.3f} to hedge')
+            self._record_history()
+            return trades_made
+
+        # ════════════════════════════════════════════════════════
         #  PRE-EMPTIVE HEDGE — Balance early at small deltas
         #  Only hedges if price won't destroy MGP
         # ════════════════════════════════════════════════════════
@@ -1005,6 +1020,8 @@ class ArbitrageStrategy:
 
         # ════════════════════════════════════════════════════════
         #  HEDGE MODE — Position is unbalanced, prioritize hedging
+        #  v6.2: Only hedge when arb exists (combined < BE) or forced
+        #  Without arb, hedging worsens MGP → just wait for dip
         # ════════════════════════════════════════════════════════
 
         if priority != 'NEUTRAL':
@@ -1014,6 +1031,10 @@ class ArbitrageStrategy:
             hedge_z = z_up if hedge_side == 'UP' else z_down
             hedge_tracker = self.up_tracker if hedge_side == 'UP' else self.down_tracker
             z_threshold = self._get_hedge_z_threshold()
+
+            # v6.2: Use arb-adjusted fair for hedge sizing
+            other_price = down_price if hedge_side == 'UP' else up_price
+            hedge_fair = self._arb_adjusted_fair(hedge_side, hedge_price, other_price, hedge_fair)
 
             delta = self.position_delta_pct
             pnl_up = self.calculate_pnl_if_up_wins()
@@ -1028,7 +1049,10 @@ class ArbitrageStrategy:
                 adjusted_fair = max(hedge_fair, hedge_price * 1.05)
                 qty = self._calculate_trade_size(hedge_side, hedge_price, adjusted_fair, urgency, is_hedge=True)
 
-                price_ok = hedge_price <= min(max_hedge_price * 1.10, 0.80)
+                # Accept if price reasonable OR if buying improves MGP
+                projected = self.mgp_after_buy(hedge_side, hedge_price, max(qty, 1.0))
+                price_ok = (hedge_price <= min(max_hedge_price * 1.10, 0.80) or
+                            projected > mgp)
 
                 if qty * hedge_price >= self.min_trade_size and price_ok:
                     ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
@@ -1058,7 +1082,14 @@ class ArbitrageStrategy:
                 hedge_urgency_boost = 1.0
 
             if hedge_z <= z_threshold and hedge_price <= self.max_individual_price:
-                if hedge_price <= max_hedge_price * 1.05:
+                # Price cap: use mgp_after_buy to check if this hedge IMPROVES our position
+                # Don't require positive MGP — just require improvement or acceptable loss
+                max_hedge_price = self.max_price_for_positive_mgp()
+                projected_mgp = self.mgp_after_buy(hedge_side, hedge_price, 1.0)
+                hedge_improves = projected_mgp > mgp  # Does buying 1 share improve MGP?
+                price_acceptable = hedge_price <= max_hedge_price * 1.05 or hedge_improves
+
+                if price_acceptable:
                     urgency = (1.5 if delta > self.urgent_hedge_delta else 1.2) * hedge_urgency_boost
                     qty = self._calculate_trade_size(hedge_side, hedge_price, hedge_fair, urgency, is_hedge=True)
 
@@ -1089,27 +1120,20 @@ class ArbitrageStrategy:
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  ENTRY MODE v6 — Pair-Building Strategy
+        #  ENTRY MODE v6.2 — Enter-and-Work Strategy
         #
-        #  KEY CHANGE: Don't buy a side just because its z-score is low.
-        #  In prediction markets, cheap = likely to lose.
+        #  KEY CHANGE: Don't wait for arb — enter the market NOW.
+        #  Buy the likely winner, then hedge when the other side dips.
         #
         #  Rules:
-        #  1. COMBINED COST GATE: Only enter when up+down < break-even
-        #  2. WINNER FIRST: Prefer the likely winner (price > 0.50)
+        #  1. ENTER IMMEDIATELY: Buy winner side on first opportunity
+        #  2. WAIT FOR HEDGE: Watch for combined dip to pair up
         #  3. QTY RATIO CAP: Never let one side exceed 1.5× the other
         #  4. MGP CHECK: Every trade must improve or maintain MGP
-        #  5. PAIR BUILDING: After buying one side, actively seek the other
+        #  5. ARB GATE ON SECOND LEG: Only add to position when arb exists
         # ════════════════════════════════════════════════════════
 
-        # ── Step 1: Check if arb opportunity exists ──
-        if not has_arb_opportunity:
-            # Combined > break-even: NO profitable pairs at current prices
-            self.current_mode = 'no_arb'
-            self.mode_reason = (f'🚫 No arb | UP ${up_price:.2f} + DOWN ${down_price:.2f} = '
-                                f'${combined:.3f} > ${BREAK_EVEN:.3f} (need margin)')
-            self._record_history()
-            return trades_made
+        # ── Step 1: (No arb check already done above) ──
 
         # ── Step 2: Determine likely winner and roles ──
         likely_winner = 'DOWN' if down_price > up_price else 'UP'
@@ -1142,6 +1166,15 @@ class ArbitrageStrategy:
         #  Starting with the winner is safe even if we can't hedge.
         if not has_position:
             can_buy_loser = False  # Force winner-first entry
+
+        # ── With position: prefer the SMALLER side to balance ──
+        #  When arb exists, prioritize buying the side we have less of.
+        if has_position and has_arb_opportunity:
+            smaller = self.smaller_side()
+            if smaller == likely_loser:
+                # Need more loser to balance → allow it
+                can_buy_loser = True
+                can_buy_winner = False  # Focus on balancing
 
         if has_position:
             # Don't let the loser side get ahead of winner
@@ -1188,11 +1221,11 @@ class ArbitrageStrategy:
                                        loser_tracker, quality))
 
         # ── WINNER-FIRST: If no position, buy winner WITHOUT z requirement ──
-        #  The arb margin is the signal, not the z-score.
+        #  Enter the market immediately. Don't wait for arb or z-score.
         #  Winner naturally trends up → high z is NORMAL, not a reason to skip.
-        #  Combined cost gate already ensures profitable opportunity exists.
+        #  We enter now and hedge later when the loser side dips.
         if self.winner_first_enabled and not has_position:
-            if can_buy_winner and winner_price <= self.winner_entry_price_max:
+            if winner_price <= self.winner_entry_price_max:
                 # Winner side doesn't need to be oversold for first entry
                 already_in = any(c[0] == likely_winner for c in candidates)
                 if not already_in:
