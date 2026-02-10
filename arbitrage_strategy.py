@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pair-Building Arbitrage Strategy v6 for Polymarket
+Pair-Building Arbitrage Strategy v6.3 for Polymarket
 
 CORE INSIGHT: In prediction markets, price = probability of winning.
   A side at $0.22 has 78% chance of LOSING. Buying it just because
@@ -323,6 +323,17 @@ class ArbitrageStrategy:
         self.winner_first_enabled = True
         self.winner_entry_price_max = 0.75  # Don't buy winner above $0.75 (enter aggressively)
         self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
+
+        # ── MARKET-FLIP PIVOT (NEW v6.3) ──
+        #  When the market flips (our primary holding is now the loser),
+        #  buy enough of the new winner to exceed the old position.
+        #  Simple: match the other side's qty + buffer.
+        #  If it flips again, repeat — always weight toward current winner.
+        self.pivot_enabled = True
+        self.pivot_winner_threshold = 0.55  # New winner must be >= 55% probability
+        self.pivot_buffer = 0.15            # Buy 15% more shares than other side
+        self._pivot_mode = False            # Set per-tick
+        self._pivot_target_qty = 0.0        # Shares to buy this pivot
 
         # ── Momentum Filter ──
         self.require_momentum_confirm = True
@@ -965,21 +976,58 @@ class ArbitrageStrategy:
         # ════════════════════════════════════════════════════════
         #  NO-ARB HOLD (v6.2) — Skip hedge/entry when no arb exists
         #  Hedging without arb worsens MGP. Just hold and wait.
+        #  EXCEPTION (v6.3): If the market FLIPPED (our primary holding
+        #  is now the loser), pivot to the new winner to rebalance.
         # ════════════════════════════════════════════════════════
 
+        self._pivot_mode = False
+        self._pivot_target_qty = 0.0
+
         if has_position and not has_arb_opportunity:
-            self.current_mode = 'waiting_for_dip'
-            self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
-                                f'combined ${combined:.3f} | need <${BREAK_EVEN:.3f} to hedge')
-            self._record_history()
-            return trades_made
+            # ── Market-flip detection (v6.3 Pivot) ──
+            #  Simple logic: if our heavier side is the loser, pivot.
+            #  Buy enough of the new winner to EXCEED what we hold on the old side.
+            #  If market flips again, repeat — always weight toward current winner.
+            new_winner = 'DOWN' if down_price > up_price else 'UP'
+            new_winner_price = down_price if new_winner == 'DOWN' else up_price
+            qty_new = self.qty_down if new_winner == 'DOWN' else self.qty_up
+            qty_old = self.qty_up if new_winner == 'DOWN' else self.qty_down
+            primary_side = 'UP' if self.qty_up >= self.qty_down else 'DOWN'
+
+            # Target: match the old side qty + buffer, minus what we already have
+            target_qty = qty_old * (1.0 + self.pivot_buffer)
+            additional_needed = max(0, target_qty - qty_new)
+
+            need_pivot = (self.pivot_enabled and
+                          new_winner_price >= self.pivot_winner_threshold and
+                          primary_side != new_winner and
+                          additional_needed * new_winner_price >= self.min_trade_size)
+
+            if need_pivot:
+                self._pivot_mode = True
+                self._pivot_target_qty = additional_needed
+                print(f"🔄 PIVOT: {primary_side} was ours, {new_winner} now winner "
+                      f"@ ${new_winner_price:.3f} | have {qty_new:.1f}, need {target_qty:.1f} "
+                      f"(+{additional_needed:.1f}sh)")
+            else:
+                self.current_mode = 'waiting_for_dip'
+                self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
+                                    f'combined ${combined:.3f} | need <${BREAK_EVEN:.3f} to hedge')
+                self._record_history()
+                return trades_made
+
+        # When pivoting (v6.3b), override priority to NEUTRAL
+        # so hedge sections don't intercept — pivot handles its own sizing.
+        if self._pivot_mode:
+            priority = 'NEUTRAL'
 
         # ════════════════════════════════════════════════════════
         #  PRE-EMPTIVE HEDGE — Balance early at small deltas
         #  Only hedges if price won't destroy MGP
+        #  SKIP when pivoting (v6.3b) — pivot handles its own sizing
         # ════════════════════════════════════════════════════════
 
-        if (priority == 'NEUTRAL' and has_position and
+        if (not self._pivot_mode and priority == 'NEUTRAL' and has_position and
                 self.preemptive_hedge_enabled and
                 self.position_delta_pct >= self.preemptive_hedge_threshold):
 
@@ -1169,12 +1217,18 @@ class ArbitrageStrategy:
 
         # ── With position: prefer the SMALLER side to balance ──
         #  When arb exists, prioritize buying the side we have less of.
-        if has_position and has_arb_opportunity:
-            smaller = self.smaller_side()
-            if smaller == likely_loser:
-                # Need more loser to balance → allow it
-                can_buy_loser = True
-                can_buy_winner = False  # Focus on balancing
+        #  When market flipped (pivot), only buy the new winner.
+        if has_position and (has_arb_opportunity or self._pivot_mode):
+            if self._pivot_mode:
+                # Pivot: ONLY buy the new winner to rebalance
+                can_buy_winner = True
+                can_buy_loser = False
+            else:
+                smaller = self.smaller_side()
+                if smaller == likely_loser:
+                    # Need more loser to balance → allow it
+                    can_buy_loser = True
+                    can_buy_winner = False  # Focus on balancing
 
         if has_position:
             # Don't let the loser side get ahead of winner
@@ -1236,6 +1290,20 @@ class ArbitrageStrategy:
                     candidates.append((likely_winner, winner_z, winner_price, winner_fair,
                                        winner_tracker, quality))
 
+        # ── PIVOT ENTRY (v6.3): Market flipped → buy new winner to rebalance ──
+        #  Skip z-score requirement — this is a risk-reduction trade.
+        #  The market has decided our side is losing. Buy the new winner.
+        if self._pivot_mode and has_position:
+            if winner_price <= self.winner_entry_price_max:
+                already_in = any(c[0] == likely_winner for c in candidates)
+                if not already_in:
+                    quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
+                                                   winner_fair, winner_tracker, arb_margin,
+                                                   is_likely_winner=True)
+                    quality += 25  # High priority — pivoting to reduce risk
+                    candidates.append((likely_winner, winner_z, winner_price, winner_fair,
+                                       winner_tracker, quality))
+
         # Time pressure: relax thresholds in final quarter
         if time_to_close is not None and time_to_close < 225 and not candidates:
             relaxed_z = self.z_entry + 0.3
@@ -1283,17 +1351,33 @@ class ArbitrageStrategy:
 
         qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
 
+        # ── PIVOT sizing (v6.3) ──
+        #  Buy enough to exceed the other side by buffer %.
+        #  Full target at once — splitting creates sub-$1 chunks.
+        if self._pivot_mode:
+            qty = self._pivot_target_qty
+            # Budget constraint — use full remaining budget for pivots
+            total_invested = self.cost_up + self.cost_down
+            remaining = max(0, self.market_budget - total_invested)
+            max_qty_budget = remaining / buy_price if buy_price > 0 else 0
+            qty = min(qty, max_qty_budget, self.max_shares_per_order)
+
+        # Polymarket minimum is $1 — no exceptions, even for pivots
         if qty * buy_price < self.min_trade_size:
-            self.current_mode = 'scanning'
-            self.mode_reason = (f'Trade too small | {buy_side} z={buy_z:+.1f} | '
-                                f'Kelly={self._kelly_fraction(buy_price, buy_fair):.3f}')
+            if self._pivot_mode:
+                self.current_mode = 'pivot_done'
+                self.mode_reason = (f'🔄 Pivot target reached | {buy_side} need <${self.min_trade_size:.0f} more')
+            else:
+                self.current_mode = 'scanning'
+                self.mode_reason = (f'Trade too small | {buy_side} z={buy_z:+.1f} | '
+                                    f'Kelly={self._kelly_fraction(buy_price, buy_fair):.3f}')
             self._record_history()
             return trades_made
 
         # ── Step 7b: Post-trade ratio check (NEW v6.1) ──
         #  Prevent trades that would create excessive imbalance.
-        #  The ratio check must consider the position AFTER the trade.
-        if has_position:
+        #  Skip for pivots — pivot IS the intentional rebalancing.
+        if has_position and not self._pivot_mode:
             post_qty_this = (self.qty_up if buy_side == 'UP' else self.qty_down) + qty
             post_qty_other = self.qty_down if buy_side == 'UP' else self.qty_up
             if post_qty_other > 0 and buy_side == likely_loser:
@@ -1309,8 +1393,8 @@ class ArbitrageStrategy:
                         return trades_made
                     qty = max_allowed
 
-        # ── Step 8: MGP protection ──
-        if has_position:
+        # ── Step 8: MGP protection (skip for pivots — we accept cost to follow market) ──
+        if has_position and not self._pivot_mode:
             projected_mgp = self.mgp_after_buy(buy_side, buy_price, qty)
             if projected_mgp < mgp - 2.0:
                 self.current_mode = 'scanning'
@@ -1330,11 +1414,12 @@ class ArbitrageStrategy:
             trades_made.append((buy_side, ap, aq))
             mgp_new = self.calculate_locked_profit()
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-            self.current_mode = 'pair_building'
+            pivot_tag = " 🔄PIVOT" if self._pivot_mode else ""
+            self.current_mode = 'pivoting' if self._pivot_mode else 'pair_building'
             self.mode_reason = (f'{role_tag} BUY {buy_side} {aq:.1f}sh@${ap:.3f} | '
-                                f'margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}')
+                                f'margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}')
             print(f"🎯 TRADE #{self.trade_count}: {role_tag} {buy_side} {aq:.1f}×${ap:.3f} | "
-                  f"margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}")
+                  f"margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}")
 
         self._record_history()
         return trades_made
