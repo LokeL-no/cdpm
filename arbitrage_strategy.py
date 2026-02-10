@@ -339,6 +339,9 @@ class ArbitrageStrategy:
         self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
         self._pivot_count = 0              # Number of pivots executed so far
         self._equalized = False            # True after position equalized (gave up market)
+        # Persistent pivot state (v8.1) — survives across ticks for partial fills
+        self._pending_pivot_side = None    # Side we're pivoting TO (e.g. 'DOWN')
+        self._pending_pivot_target = 0.0   # Total qty needed on that side
 
         # Entry gating (v6.5: no start-delay — enter immediately when price meets threshold)
         self._first_tick_time = None
@@ -1041,24 +1044,24 @@ class ArbitrageStrategy:
         self._pivot_target_qty = 0.0
 
         if has_position and not has_arb_opportunity and not self._equalized:
-            # ── Market-flip detection (v7.0 Pivot) ──
-            #  If our heavier side is losing, buy enough of the new winner
-            #  that if it wins → $1 profit (total payout > total cost × fees + $1).
-            #  After max_pivot_count pivots → equalize both sides and give up.
+            # ── Market-flip detection (v8.1 Pivot) ──
+            #  Uses PnL check instead of primary_side check.
+            #  If the current winner side has NEGATIVE PnL, we need more shares.
+            #  Persistent: if a previous pivot was partially filled, continue it.
             new_winner = 'DOWN' if down_price > up_price else 'UP'
             new_winner_price = down_price if new_winner == 'DOWN' else up_price
             qty_new = self.qty_down if new_winner == 'DOWN' else self.qty_up
-            primary_side = 'UP' if self.qty_up >= self.qty_down else 'DOWN'
 
-            # $1-profit formula (v7.0 — targets profit_target instead of just BE):
-            #  target_qty × $1 = (C_before + (target_qty - existing) × price) × FEE_MULT + profit
-            #  target_qty = (FEE_MULT × (C_before - existing × price) + profit) / (1 - price × FEE_MULT)
-            total_cost_before = self.cost_up + self.cost_down
+            # Check PnL if the current winner wins:
+            pnl_if_winner = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
+                             else self.calculate_pnl_if_up_wins())
+
+            # Calculate how many shares needed for $5 profit:
+            total_cost_now = self.cost_up + self.cost_down
             denom = 1.0 - new_winner_price * FEE_MULT
             if denom > 0.01:
-                numerator = FEE_MULT * (total_cost_before - qty_new * new_winner_price) + self.pivot_profit_target
+                numerator = FEE_MULT * (total_cost_now - qty_new * new_winner_price) + self.pivot_profit_target
                 if numerator <= 0:
-                    # Already above profit target on pivot side — no pivot needed
                     additional_needed = 0
                 else:
                     target_qty = numerator / denom
@@ -1066,19 +1069,29 @@ class ArbitrageStrategy:
             else:
                 additional_needed = 0
 
+            # Detect pivot need: winner side has negative PnL AND we need more shares
+            # v8.1: Uses PnL check — works even after partial fills
+            is_continuing_pivot = (self._pending_pivot_side == new_winner and
+                                   additional_needed * new_winner_price >= self.min_trade_size)
+            is_new_pivot = (pnl_if_winner < -0.01 and
+                           additional_needed * new_winner_price >= self.min_trade_size)
+
             need_pivot = (self.pivot_enabled and
                           new_winner_price >= self.pivot_winner_threshold and
-                          primary_side != new_winner and
-                          additional_needed * new_winner_price >= self.min_trade_size)
+                          (is_new_pivot or is_continuing_pivot))
 
             if need_pivot:
-                actual_cash = max(0, self.starting_balance - total_cost_before)
+                actual_cash = max(0, self.starting_balance - total_cost_now)
                 required_cost = additional_needed * new_winner_price
+
+                # Continuing a partial pivot should NOT count as a new pivot
+                is_truly_new = not is_continuing_pivot
+                effective_pivot_count = (self._pivot_count + (1 if is_truly_new else 0))
 
                 # ── EQUALIZE EXIT (v7.0) ──
                 #  Too many pivots OR can't afford next pivot → buy cheap side
                 #  to balance UP ≈ DN and minimize worst-case loss.
-                should_equalize = (self._pivot_count >= self.max_pivot_count or
+                should_equalize = (effective_pivot_count > self.max_pivot_count or
                                    actual_cash < required_cost)
 
                 if should_equalize:
@@ -1117,15 +1130,21 @@ class ArbitrageStrategy:
                     self._record_history()
                     return trades_made
                 else:
-                    # Can afford $1-profit pivot — execute it
+                    # Can afford pivot — execute it
                     self._pivot_mode = True
                     self._pivot_target_qty = additional_needed
-                    pnl_new = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
-                               else self.calculate_pnl_if_up_wins())
-                    print(f"🔄 PIVOT #{self._pivot_count+1}: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                    # Track persistent pivot state (v8.1)
+                    self._pending_pivot_side = new_winner
+                    self._pending_pivot_target = qty_new + additional_needed
+                    # Count new pivots (not continuations)
+                    if is_truly_new:
+                        self._pivot_count += 1
+                    other_side = 'UP' if new_winner == 'DOWN' else 'DOWN'
+                    cont_tag = ' (continuing)' if is_continuing_pivot else ''
+                    print(f"🔄 PIVOT #{self._pivot_count}{cont_tag}: {other_side}→{new_winner} @ ${new_winner_price:.3f} | "
                           f"need +{additional_needed:.1f}sh (${required_cost:.2f}) | "
                           f"target ${self.pivot_profit_target:.0f} profit | "
-                          f"current {new_winner} pnl=${pnl_new:.2f}")
+                          f"current {new_winner} pnl=${pnl_if_winner:.2f}")
             else:
                 self.current_mode = 'waiting_for_dip'
                 self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
@@ -1631,8 +1650,15 @@ class ArbitrageStrategy:
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
             trades_made.append((buy_side, ap, aq))
-            if self._pivot_mode:
-                self._pivot_count += 1
+            # v8.1: pivot_count is already incremented in detection section
+            # Check if this pivot fill completes the target
+            if self._pivot_mode and self._pending_pivot_side:
+                pivot_qty_now = (self.qty_down if self._pending_pivot_side == 'DOWN'
+                                 else self.qty_up)
+                if pivot_qty_now >= self._pending_pivot_target - 0.5:
+                    # Pivot target reached — clear pending state
+                    self._pending_pivot_side = None
+                    self._pending_pivot_target = 0.0
             mgp_new = self.calculate_locked_profit()
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
             pivot_tag = f" 🔄PIVOT#{self._pivot_count}" if self._pivot_mode else ""
