@@ -973,6 +973,20 @@ HTML_TEMPLATE = """
                                     <div class="holding-value" style="color: #22c55e;">$${Math.min(pt.qty_up, pt.qty_down).toFixed(2)}</div>
                                 </div>
                             </div>
+                            <div class="holdings-row-2" style="margin-top: 4px;">
+                                <div class="holding-item">
+                                    <div class="holding-label">Pivots</div>
+                                    <div class="holding-value" style="color: ${pt.pivot_count === 0 ? '#888' : pt.equalized ? '#ef4444' : '#3b82f6'};">🔄 ${pt.pivot_count || 0}/${pt.max_pivots || 4}${pt.equalized ? ' ⚖️' : ''}</div>
+                                </div>
+                                <div class="holding-item">
+                                    <div class="holding-label">Trades</div>
+                                    <div class="holding-value" style="color: #888;">${pt.trade_count || 0}</div>
+                                </div>
+                                <div class="holding-item">
+                                    <div class="holding-label">Budget Used</div>
+                                    <div class="holding-value" style="color: ${(pt.cost_up + pt.cost_down) / 200 < 0.5 ? '#22c55e' : (pt.cost_up + pt.cost_down) / 200 < 0.9 ? '#f59e0b' : '#ef4444'};">$${(pt.cost_up + pt.cost_down).toFixed(0)}/$200</div>
+                                </div>
+                            </div>
                             <div class="holdings-row-2" style="margin-top: 8px; border-top: 1px solid #374151; padding-top: 8px;">
                                 <div class="holding-item" style="grid-column: span 3;">
                                     <div class="holding-label">⚖️ Position Balance</div>
