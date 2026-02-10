@@ -1040,6 +1040,11 @@ class ArbitrageStrategy:
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
 
+        # ── Auto-reset equalization if max_pivot_count was raised (v8.5) ──
+        if self._equalized and self._pivot_count < self.max_pivot_count:
+            self._equalized = False
+            print(f"🔓 Un-equalized: {self._pivot_count} pivots < max {self.max_pivot_count} — resuming trading")
+
         if has_position and not has_arb_opportunity and not self._equalized:
             # ── Market-flip detection (v8.1 Pivot) ──
             #  Uses PnL check instead of primary_side check.
@@ -1151,7 +1156,7 @@ class ArbitrageStrategy:
                 return trades_made
 
         elif has_position and not has_arb_opportunity and self._equalized:
-            # Already equalized — no more pivots/entries, just hold
+            # Already equalized at max pivots — hold
             self.current_mode = 'equalized'
             self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
             self._record_history()
