@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pair-Building Arbitrage Strategy v6.3 for Polymarket
+Pair-Building Arbitrage Strategy v6.5 for Polymarket
 
 CORE INSIGHT: In prediction markets, price = probability of winning.
   A side at $0.22 has 78% chance of LOSING. Buying it just because
@@ -335,10 +335,11 @@ class ArbitrageStrategy:
         self._pivot_target_qty = 0.0
         self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
 
-        # Start-delay and entry gating
-        self.start_delay_seconds = 10    # Wait 10s after first tick before entering new markets
+        # Entry gating (v6.5: no start-delay — enter immediately when price meets threshold)
         self._first_tick_time = None
         self.min_entry_price_to_start = 0.59  # Don't enter market until one side >= this price
+        self.initial_buy_dollars = 5.0        # Force first buy to be exactly $5
+        self.reserve_pivot_price = 0.59       # Worst-case price for pivot reserve calculation
 
         # ── Momentum Filter ──
         self.require_momentum_confirm = True
@@ -469,6 +470,39 @@ class ArbitrageStrategy:
     @property
     def best_case_profit(self) -> float:
         return self.calculate_max_profit()
+
+    # ═══════════════════════════════════════════════════════════════
+    #  CAPITAL RESERVATION — Worst-case pivot cost (v6.5)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _worst_case_pivot_cost(self, pivot_price: float = None) -> float:
+        """
+        Calculate the cash needed for a worst-case BE pivot.
+
+        Uses the CORRECTED formula that accounts for existing shares
+        on the pivot side. Returns the cost of the MORE EXPENSIVE
+        direction (pivot to UP vs pivot to DOWN).
+        """
+        total_cost = self.cost_up + self.cost_down
+        if total_cost == 0:
+            return 0.0
+
+        p = pivot_price or self.reserve_pivot_price
+        denom = 1.0 - p * FEE_MULT
+        if denom <= 0.01:
+            return self.market_budget  # Price too high, reserve everything
+
+        worst = 0.0
+        for existing in (self.qty_up, self.qty_down):
+            numerator = FEE_MULT * (total_cost - existing * p)
+            if numerator <= 0:
+                continue  # Already at BE on this side, no pivot needed
+            be_qty = numerator / denom
+            additional = max(0, be_qty - existing)
+            cost = additional * p
+            worst = max(worst, cost)
+
+        return worst
 
     # ═══════════════════════════════════════════════════════════════
     #  PNL / SCENARIO ANALYSIS
@@ -950,19 +984,7 @@ class ArbitrageStrategy:
         #  WARMUP — Build indicator baselines
         # ════════════════════════════════════════════════════════
 
-        # ── START-DELAY (replace warmup): wait a fixed number of seconds after first tick
-        now = time.time()
-        if self._first_tick_time is None:
-            self._first_tick_time = now
-
-        elapsed = now - (self._first_tick_time or now)
-        if not has_position and elapsed < self.start_delay_seconds:
-            self.current_mode = 'starting_delay'
-            self.mode_reason = (f'⏳ Waiting {self.start_delay_seconds:.0f}s before entering market — {elapsed:.0f}s elapsed')
-            self._record_history()
-            return trades_made
-
-        # Additionally, don't perform initial entries until one side reaches the entry price threshold
+        # ── PRICE GATE: don't enter until one side meets threshold (v6.5: no start-delay)
         allow_initial_entry = True
         if not has_position:
             if up_price < self.min_entry_price_to_start and down_price < self.min_entry_price_to_start:
@@ -1022,15 +1044,20 @@ class ArbitrageStrategy:
             qty_new = self.qty_down if new_winner == 'DOWN' else self.qty_up
             primary_side = 'UP' if self.qty_up >= self.qty_down else 'DOWN'
 
-            # Break-even formula: qty_needed × $1 = total_cost_after × FEE_MULT
-            #  qty_needed = (cost_before + qty_needed × price) × FEE_MULT
-            #  qty_needed × (1 - price × FEE_MULT) = cost_before × FEE_MULT
+            # Break-even formula (v6.5 CORRECTED — accounts for existing shares):
+            #  be_qty × $1 = (C_before + (be_qty - existing) × price) × FEE_MULT
+            #  be_qty = FEE_MULT × (C_before - existing × price) / (1 - price × FEE_MULT)
             total_cost_before = self.cost_up + self.cost_down
             denom = 1.0 - new_winner_price * FEE_MULT
             if denom > 0.01:
-                be_qty = (total_cost_before * FEE_MULT) / denom
-                target_qty = be_qty * (1.0 + self.pivot_profit_buffer)
-                additional_needed = max(0, target_qty - qty_new)
+                numerator = FEE_MULT * (total_cost_before - qty_new * new_winner_price)
+                if numerator <= 0:
+                    # Already at or above BE on pivot side — no pivot needed
+                    additional_needed = 0
+                else:
+                    be_qty = numerator / denom
+                    target_qty = be_qty * (1.0 + self.pivot_profit_buffer)
+                    additional_needed = max(0, target_qty - qty_new)
             else:
                 additional_needed = 0
 
@@ -1128,9 +1155,11 @@ class ArbitrageStrategy:
             target = max(deficit, min_shares) + max_overshoot
             target = max(target, min_shares)  # Always at least min_trade_size
 
-            # Budget: actual remaining cash (arb is guaranteed profit)
+            # Budget: actual remaining cash MINUS pivot reserve (v6.5)
             actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
-            max_budget_qty = actual_cash / lock_price if lock_price > 0 else 0
+            pivot_reserve = self._worst_case_pivot_cost()
+            available_for_arb = max(0, actual_cash - pivot_reserve)
+            max_budget_qty = available_for_arb / lock_price if lock_price > 0 else 0
             qty = min(target, max_budget_qty, self.max_shares_per_order)
 
             if qty * lock_price >= self.min_trade_size:
@@ -1482,6 +1511,11 @@ class ArbitrageStrategy:
 
         qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
 
+        # ── INITIAL BUY: force exactly $5 (v6.5) ──
+        if not has_position and not self._pivot_mode:
+            qty = self.initial_buy_dollars / buy_price if buy_price > 0 else 0
+            qty = min(qty, self.max_shares_per_order)
+
         # ── PIVOT sizing (v6.3) ──
         #  Buy enough that if new winner wins → profit.
         #  Full target at once to avoid sub-$1 Polymarket rejections.
@@ -1492,6 +1526,16 @@ class ArbitrageStrategy:
             remaining = max(0, self.market_budget - total_invested)
             max_qty_budget = remaining / buy_price if buy_price > 0 else 0
             qty = min(qty, max_qty_budget, self.max_shares_per_order)
+
+        # ── CAPITAL RESERVATION (v6.5) ──
+        #  Non-pivot trades must leave enough cash for a worst-case pivot.
+        #  This guarantees the fail-safe can ALWAYS reach break-even.
+        if not self._pivot_mode:
+            actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+            pivot_reserve = self._worst_case_pivot_cost()
+            max_spend = max(0, actual_cash - pivot_reserve)
+            max_qty_reserve = max_spend / buy_price if buy_price > 0 else 0
+            qty = min(qty, max_qty_reserve)
 
         # Polymarket minimum is $1 — no exceptions, even for pivots
         if qty * buy_price < self.min_trade_size:
