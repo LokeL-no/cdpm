@@ -24,10 +24,10 @@ SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
 
 # Per-asset budget (how much $ to allocate per 15-min market)
 ASSET_BUDGETS = {
-    'btc': 100.0,
-    'eth': 100.0,
-    'sol': 100.0,
-    'xrp': 100.0,
+    'btc': 200.0,
+    'eth': 200.0,
+    'sol': 200.0,
+    'xrp': 200.0,
 }
 
 # Manual markets to track (leave empty for auto-discovery)
