@@ -324,16 +324,19 @@ class ArbitrageStrategy:
         self.winner_entry_price_max = 0.75  # Don't buy winner above $0.75 (enter aggressively)
         self.loser_entry_price_max = 0.45   # Don't buy loser above $0.45
 
-        # ── MARKET-FLIP PIVOT (v6.3) ──
+        # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
-        #  if that side wins → profit (covers all accumulated cost).
-        #  If it flips again, repeat — always enough to profit on current winner.
+        #  if that side wins → $1 profit (covers all cost + fees + $1).
+        #  After max_pivot_count pivots → equalize both sides and give up.
         self.pivot_enabled = True
         self.pivot_winner_threshold = 0.55  # New winner must be >= 55% probability
-        self.pivot_profit_buffer = 0.10     # 10% past break-even for profit margin
+        self.pivot_profit_target = 1.0      # Target $1 profit per successful pivot
+        self.max_pivot_count = 3            # After N pivots → equalize and stop
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
         self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
+        self._pivot_count = 0              # Number of pivots executed so far
+        self._equalized = False            # True after position equalized (gave up market)
 
         # Entry gating (v6.5: no start-delay — enter immediately when price meets threshold)
         self._first_tick_time = None
@@ -494,11 +497,11 @@ class ArbitrageStrategy:
 
         worst = 0.0
         for existing in (self.qty_up, self.qty_down):
-            numerator = FEE_MULT * (total_cost - existing * p)
+            numerator = FEE_MULT * (total_cost - existing * p) + self.pivot_profit_target
             if numerator <= 0:
-                continue  # Already at BE on this side, no pivot needed
-            be_qty = numerator / denom
-            additional = max(0, be_qty - existing)
+                continue  # Already above target on this side, no pivot needed
+            target_qty = numerator / denom
+            additional = max(0, target_qty - existing)
             cost = additional * p
             worst = max(worst, cost)
 
@@ -1035,28 +1038,28 @@ class ArbitrageStrategy:
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
 
-        if has_position and not has_arb_opportunity:
-            # ── Market-flip detection (v6.3 Pivot) ──
+        if has_position and not has_arb_opportunity and not self._equalized:
+            # ── Market-flip detection (v7.0 Pivot) ──
             #  If our heavier side is losing, buy enough of the new winner
-            #  that if it wins → total payout > total cost × fees.
+            #  that if it wins → $1 profit (total payout > total cost × fees + $1).
+            #  After max_pivot_count pivots → equalize both sides and give up.
             new_winner = 'DOWN' if down_price > up_price else 'UP'
             new_winner_price = down_price if new_winner == 'DOWN' else up_price
             qty_new = self.qty_down if new_winner == 'DOWN' else self.qty_up
             primary_side = 'UP' if self.qty_up >= self.qty_down else 'DOWN'
 
-            # Break-even formula (v6.5 CORRECTED — accounts for existing shares):
-            #  be_qty × $1 = (C_before + (be_qty - existing) × price) × FEE_MULT
-            #  be_qty = FEE_MULT × (C_before - existing × price) / (1 - price × FEE_MULT)
+            # $1-profit formula (v7.0 — targets profit_target instead of just BE):
+            #  target_qty × $1 = (C_before + (target_qty - existing) × price) × FEE_MULT + profit
+            #  target_qty = (FEE_MULT × (C_before - existing × price) + profit) / (1 - price × FEE_MULT)
             total_cost_before = self.cost_up + self.cost_down
             denom = 1.0 - new_winner_price * FEE_MULT
             if denom > 0.01:
-                numerator = FEE_MULT * (total_cost_before - qty_new * new_winner_price)
+                numerator = FEE_MULT * (total_cost_before - qty_new * new_winner_price) + self.pivot_profit_target
                 if numerator <= 0:
-                    # Already at or above BE on pivot side — no pivot needed
+                    # Already above profit target on pivot side — no pivot needed
                     additional_needed = 0
                 else:
-                    be_qty = numerator / denom
-                    target_qty = be_qty * (1.0 + self.pivot_profit_buffer)
+                    target_qty = numerator / denom
                     additional_needed = max(0, target_qty - qty_new)
             else:
                 additional_needed = 0
@@ -1067,63 +1070,73 @@ class ArbitrageStrategy:
                           additional_needed * new_winner_price >= self.min_trade_size)
 
             if need_pivot:
-                # Fail-safe: check actual cash available for full pivot
-                actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+                actual_cash = max(0, self.starting_balance - total_cost_before)
                 required_cost = additional_needed * new_winner_price
 
-                if actual_cash >= required_cost:
-                    # We can afford the full pivot target
+                # ── EQUALIZE EXIT (v7.0) ──
+                #  Too many pivots OR can't afford next pivot → buy cheap side
+                #  to balance UP ≈ DN and minimize worst-case loss.
+                should_equalize = (self._pivot_count >= self.max_pivot_count or
+                                   actual_cash < required_cost)
+
+                if should_equalize:
+                    weak_side = 'UP' if self.qty_up < self.qty_down else 'DOWN'
+                    weak_price = up_price if weak_side == 'UP' else down_price
+                    strong_qty = max(self.qty_up, self.qty_down)
+                    weak_qty = min(self.qty_up, self.qty_down)
+                    eq_diff = strong_qty - weak_qty
+
+                    max_qty = actual_cash / weak_price if weak_price > 0 else 0
+                    eq_qty = min(eq_diff, max_qty, self.max_shares_per_order)
+
+                    if eq_qty * weak_price >= self.min_trade_size:
+                        ok, ap, aq = self.execute_buy(weak_side, weak_price, eq_qty, timestamp)
+                        if ok:
+                            trades_made.append((weak_side, ap, aq))
+                            self._equalized = True
+                            total_final = self.cost_up + self.cost_down
+                            mgp_final = self.calculate_locked_profit()
+                            eq_reason = ('max pivots reached' if self._pivot_count >= self.max_pivot_count
+                                         else f'budget (need ${required_cost:.0f}, have ${actual_cash:.0f})')
+                            print(f"⚖️ EQUALIZE: {weak_side} {aq:.1f}×${ap:.3f} | "
+                                  f"UP={self.qty_up:.1f} DN={self.qty_down:.1f} | "
+                                  f"inv=${total_final:.2f} | MGP ${mgp_final:.2f} | "
+                                  f"gave up after {self._pivot_count} pivots ({eq_reason})")
+                            self.current_mode = 'equalized'
+                            self.mode_reason = (f'⚖️ Equalized: {weak_side} {aq:.1f}sh@${ap:.3f} | '
+                                                f'MGP ${mgp_final:.2f} | {self._pivot_count} pivots used')
+                            self._record_history()
+                            return trades_made
+
+                    # Can't equalize (trade too small or failed) — just hold
+                    self._equalized = True  # Mark as equalized even without trade
+                    self.current_mode = 'equalized'
+                    self.mode_reason = (f'⚖️ Equalized (no trade needed) after {self._pivot_count} pivots')
+                    self._record_history()
+                    return trades_made
+                else:
+                    # Can afford $1-profit pivot — execute it
                     self._pivot_mode = True
                     self._pivot_target_qty = additional_needed
                     pnl_new = (self.calculate_pnl_if_down_wins() if new_winner == 'DOWN'
                                else self.calculate_pnl_if_up_wins())
-                    print(f"🔄 PIVOT: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                    print(f"🔄 PIVOT #{self._pivot_count+1}: {primary_side}→{new_winner} @ ${new_winner_price:.3f} | "
                           f"need +{additional_needed:.1f}sh (${required_cost:.2f}) | "
+                          f"target ${self.pivot_profit_target:.0f} profit | "
                           f"current {new_winner} pnl=${pnl_new:.2f}")
-                else:
-                    # Can't afford full pivot. Try to find a qty that reaches break-even (including fees);
-                    # if not possible, buy as much as we can (min_trade_size enforced) and mark as failsafe.
-                    qty_affordable = max(0.0, actual_cash / new_winner_price) if new_winner_price > 0 else 0.0
-                    qty_affordable = min(qty_affordable, self.max_shares_per_order)
-
-                    # Numeric search for smallest qty <= qty_affordable that yields projected_mgp >= 0
-                    qty_needed_for_be = 0.0
-                    found = False
-                    steps = 20
-                    if qty_affordable >= 1.0:
-                        step_size = max(1.0, qty_affordable / steps)
-                    else:
-                        step_size = qty_affordable / steps if steps > 0 else qty_affordable
-                    q = step_size
-                    while q <= qty_affordable + 1e-9:
-                        q_rounded = round(q, 3)
-                        projected_mgp = self.mgp_after_buy(new_winner, new_winner_price, q_rounded)
-                        if projected_mgp >= 0:
-                            qty_needed_for_be = q_rounded
-                            found = True
-                            break
-                        q += step_size
-
-                    if found and qty_needed_for_be * new_winner_price >= self.min_trade_size:
-                        # We can reach break-even — do a reduced pivot to reach BE
-                        self._pivot_mode = True
-                        self._pivot_target_qty = qty_needed_for_be
-                        self._pivot_failsafe = False
-                        print(f"⛑️ PIVOT-FAILSAFE: afford partial pivot {qty_needed_for_be:.1f}sh@${new_winner_price:.3f} to reach BE")
-                    else:
-                        # Can't reach BE and we WILL NOT risk a "best-effort" pivot.
-                        # Fail-safe policy: if we can't reach break-even with available cash,
-                        # skip pivot and move to holding so we do not increase downside risk.
-                        self.current_mode = 'holding'
-                        self.mode_reason = (f'⛑️ Pivot skipped — insufficient cash to reach break-even (need ${required_cost:.2f}, have ${actual_cash:.2f})')
-                        self._record_history()
-                        return trades_made
             else:
                 self.current_mode = 'waiting_for_dip'
                 self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
                                     f'combined ${combined:.3f} | need <${BREAK_EVEN:.3f} to hedge')
                 self._record_history()
                 return trades_made
+
+        elif has_position and not has_arb_opportunity and self._equalized:
+            # Already equalized — no more pivots/entries, just hold
+            self.current_mode = 'equalized'
+            self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
+            self._record_history()
+            return trades_made
 
         # When pivoting, override priority to NEUTRAL
         # so hedge sections don't intercept — pivot handles its own sizing.
@@ -1180,6 +1193,14 @@ class ArbitrageStrategy:
                           f"arb=${arb_margin:.3f} | Δ{new_deficit:.0f} | MGP ${actual_mgp:.2f}{lock_tag}")
                     self._record_history()
                     return trades_made
+
+        # ── EQUALIZED: block all further entries/hedges (v7.0) ──
+        #  After equalize, only arb-lock (above) can still trade.
+        if self._equalized:
+            self.current_mode = 'equalized'
+            self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
+            self._record_history()
+            return trades_made
 
         # ════════════════════════════════════════════════════════
         #  PRE-EMPTIVE HEDGE — Balance early at small deltas
@@ -1587,14 +1608,49 @@ class ArbitrageStrategy:
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
             trades_made.append((buy_side, ap, aq))
+            if self._pivot_mode:
+                self._pivot_count += 1
             mgp_new = self.calculate_locked_profit()
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-            pivot_tag = " 🔄PIVOT" if self._pivot_mode else ""
+            pivot_tag = f" 🔄PIVOT#{self._pivot_count}" if self._pivot_mode else ""
             self.current_mode = 'pivoting' if self._pivot_mode else 'pair_building'
             self.mode_reason = (f'{role_tag} BUY {buy_side} {aq:.1f}sh@${ap:.3f} | '
                                 f'margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}')
             print(f"🎯 TRADE #{self.trade_count}: {role_tag} {buy_side} {aq:.1f}×${ap:.3f} | "
                   f"margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}")
+
+            # ── POST-PIVOT EQUALIZE (v7.0) ──
+            #  After the Nth pivot, immediately buy the weak side at the CHEAP
+            #  price (which is still cheap because we just pivoted to the expensive side).
+            #  This minimizes equalize cost vs waiting for next flip.
+            if (self._pivot_mode and self._pivot_count >= self.max_pivot_count
+                    and not self._equalized):
+                weak_side = 'UP' if self.qty_up < self.qty_down else 'DOWN'
+                weak_price = up_price if weak_side == 'UP' else down_price
+                strong_qty = max(self.qty_up, self.qty_down)
+                weak_qty = min(self.qty_up, self.qty_down)
+                eq_diff = strong_qty - weak_qty
+
+                actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+                max_eq_qty = actual_cash / weak_price if weak_price > 0 else 0
+                eq_qty = min(eq_diff, max_eq_qty, self.max_shares_per_order)
+
+                if eq_qty * weak_price >= self.min_trade_size:
+                    ok2, ap2, aq2 = self.execute_buy(weak_side, weak_price, eq_qty, timestamp)
+                    if ok2:
+                        trades_made.append((weak_side, ap2, aq2))
+                        self._equalized = True
+                        total_final = self.cost_up + self.cost_down
+                        mgp_final = self.calculate_locked_profit()
+                        print(f"⚖️ EQUALIZE: {weak_side} {aq2:.1f}×${ap2:.3f} | "
+                              f"UP={self.qty_up:.1f} DN={self.qty_down:.1f} | "
+                              f"inv=${total_final:.2f} | MGP ${mgp_final:.2f} | "
+                              f"gave up after {self._pivot_count} pivots")
+                        self.current_mode = 'equalized'
+                        self.mode_reason = (f'⚖️ Equalized: {weak_side} {aq2:.1f}sh@${ap2:.3f} | '
+                                            f'MGP ${mgp_final:.2f} | {self._pivot_count} pivots')
+                else:
+                    self._equalized = True  # Mark equalized even if trade too small
 
         self._record_history()
         return trades_made
