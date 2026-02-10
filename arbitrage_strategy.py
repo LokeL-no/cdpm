@@ -367,7 +367,7 @@ class ArbitrageStrategy:
         self._tranche_size = market_budget * self.entry_budget_pct / self.tranche_count
 
         # ── Timing ──
-        self.cooldown_seconds = 2.0
+        self.cooldown_seconds = 0.0  # Disabled (v8.7)
         self.min_time_to_enter = 30
 
         # ── Risk / Exposure ──
@@ -998,20 +998,6 @@ class ArbitrageStrategy:
                                     f'UP ${up_price:.2f} DOWN ${down_price:.2f}')
                 self._record_history()
                 return trades_made
-
-        # ════════════════════════════════════════════════════════
-        #  COOLDOWN
-        # ════════════════════════════════════════════════════════
-
-        now = time.time()
-        if now - self.last_trade_time < self.cooldown_seconds:
-            cd_left = self.cooldown_seconds - (now - self.last_trade_time)
-            self.current_mode = 'cooldown'
-            self.mode_reason = (f'⏱ CD {cd_left:.0f}s | '
-                                f'UP z={z_up:+.1f} DOWN z={z_down:+.1f} | '
-                                f'Δ {self.position_delta_pct:.0f}%')
-            self._record_history()
-            return trades_made
 
         # ════════════════════════════════════════════════════════
         #  EXPOSURE CHECK — Risk Module
