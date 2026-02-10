@@ -324,7 +324,7 @@ class ArbitrageStrategy:
         self.winner_entry_price_max = 0.57  # Entry cap: max $0.57 (v8.0)
         self.loser_entry_price_max = 0.38   # Only buy loser at $0.38 or below (v8.0)
         self.arb_lock_max_pair_cost = 0.95  # Arb-lock only when pair cost ≤ $0.95 (v8.0)
-        self.pivot_entry_price_max = 0.65   # Pivot entries allowed up to $0.65 (v8.0)
+        self.pivot_entry_price_max = 0.57   # Pivot entries: same as entry cap $0.57 (v8.3)
 
         # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
@@ -1223,8 +1223,61 @@ class ArbitrageStrategy:
                     return trades_made
 
         # ── EQUALIZED: block all further entries/hedges (v7.0) ──
-        #  After equalize, only arb-lock (above) can still trade.
+        #  After equalize, only arb-lock (above) and recovery-buy can trade.
         if self._equalized:
+            # ── RECOVERY BUY (v8.2) ──
+            #  When equalized + underwater + arb exists: buy BALANCED pairs
+            #  at cheap pair cost to reduce average pair cost and recover losses.
+            #  Each pair at combined < BE earns (1 - combined × FEE_MULT).
+            #  Buys both sides in one tick to stay balanced.
+            if has_arb_opportunity and mgp < -0.10:
+                cheap_side = 'UP' if up_price <= down_price else 'DOWN'
+                expensive_side = 'DOWN' if cheap_side == 'UP' else 'UP'
+                cheap_price = min(up_price, down_price)
+                expensive_price = max(up_price, down_price)
+                pair_cost = cheap_price + expensive_price
+
+                actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+                # How many balanced pairs can we afford?
+                max_pairs = actual_cash / pair_cost if pair_cost > 0 else 0
+                # Buy up to 10 pairs at a time
+                rec_pairs = min(10.0, max_pairs)
+
+                if rec_pairs * pair_cost >= self.min_trade_size * 2:
+                    # Verify both sides improve MGP together
+                    cost_total = self.cost_up + self.cost_down
+                    new_cost = cost_total + rec_pairs * pair_cost
+                    new_qty = min(self.qty_up, self.qty_down) + rec_pairs
+                    # Both scenarios identical for balanced position:
+                    new_pnl = new_qty - new_cost * FEE_MULT
+                    old_pnl = min(self.qty_up, self.qty_down) - cost_total * FEE_MULT
+
+                    if new_pnl > old_pnl + 0.01:  # Must improve
+                        # Buy cheap side first, then expensive side
+                        ok1, ap1, aq1 = self.execute_buy(cheap_side, cheap_price, rec_pairs, timestamp)
+                        if ok1:
+                            trades_made.append((cheap_side, ap1, aq1))
+                            # Verify we can still afford the expensive side
+                            remaining_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
+                            expensive_qty = min(aq1, remaining_cash / expensive_price if expensive_price > 0 else 0)
+                            if expensive_qty * expensive_price >= self.min_trade_size:
+                                self.last_trade_time = 0  # Allow immediate second buy
+                                ok2, ap2, aq2 = self.execute_buy(expensive_side, expensive_price, expensive_qty, timestamp)
+                                if ok2:
+                                    trades_made.append((expensive_side, ap2, aq2))
+                            actual_mgp = self.calculate_locked_profit()
+                            arb_edge = BREAK_EVEN - pair_cost
+                            lock_tag = " 🔒" if self.both_scenarios_positive() else ""
+                            self.current_mode = 'recovery'
+                            self.mode_reason = (f'🔧 RECOVERY +{aq1:.1f}pairs@${pair_cost:.3f} | '
+                                                f'edge=${arb_edge:.3f} | '
+                                                f'MGP ${actual_mgp:.2f}{lock_tag}')
+                            print(f"🔧 RECOVERY: +{aq1:.1f}×${pair_cost:.3f} | "
+                                  f"edge=${arb_edge:.3f} | "
+                                  f"MGP ${actual_mgp:.2f}{lock_tag}")
+                            self._record_history()
+                            return trades_made
+
             self.current_mode = 'equalized'
             self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
             self._record_history()

@@ -3648,7 +3648,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 300.0, per_market_budget: float = 100.0):
+    def __init__(self, starting_balance: float = 800.0, per_market_budget: float = 200.0):
         self.initial_starting_balance = starting_balance
         # Allow overrides via env to match Render/VPS config.
         try:
