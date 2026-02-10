@@ -342,6 +342,7 @@ class ArbitrageStrategy:
         # Persistent pivot state (v8.1) — survives across ticks for partial fills
         self._pending_pivot_side = None    # Side we're pivoting TO (e.g. 'DOWN')
         self._pending_pivot_target = 0.0   # Total qty needed on that side
+        self._pending_pivot_is_new = False # Is this a new pivot (vs continuation)? (v8.4.2)
 
         # Entry gating (v6.5: no start-delay — enter immediately when price meets threshold)
         self._first_tick_time = None
@@ -1136,12 +1137,13 @@ class ArbitrageStrategy:
                     # Track persistent pivot state (v8.1)
                     self._pending_pivot_side = new_winner
                     self._pending_pivot_target = qty_new + additional_needed
-                    # Count new pivots (not continuations)
-                    if is_truly_new:
-                        self._pivot_count += 1
+                    # Store if this is a new pivot (will increment count after successful buy)
+                    self._pending_pivot_is_new = is_truly_new
                     other_side = 'UP' if new_winner == 'DOWN' else 'DOWN'
                     cont_tag = ' (continuing)' if is_continuing_pivot else ''
-                    print(f"🔄 PIVOT #{self._pivot_count}{cont_tag}: {other_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                    # Show projected pivot count in message
+                    projected_count = self._pivot_count + (1 if is_truly_new else 0)
+                    print(f"🔄 PIVOT #{projected_count}{cont_tag}: {other_side}→{new_winner} @ ${new_winner_price:.3f} | "
                           f"need +{additional_needed:.1f}sh (${required_cost:.2f}) | "
                           f"target ${self.pivot_profit_target:.0f} profit | "
                           f"current {new_winner} pnl=${pnl_if_winner:.2f}")
@@ -1596,9 +1598,20 @@ class ArbitrageStrategy:
             up_knife = "🔪" if self.up_tracker.is_falling_knife else ""
             dn_knife = "🔪" if self.down_tracker.is_falling_knife else ""
             ratio_tag = f" | ratio={qty_loser:.0f}:{qty_winner:.0f}" if has_position else ""
-            self.current_mode = 'scanning'
-            self.mode_reason = (f'👁 Scanning | UP ${up_price:.2f}{up_knife} DOWN ${down_price:.2f}{dn_knife} | '
-                                f'margin ${arb_margin:.3f}{ratio_tag}')
+            # Reset pivot state if we were pivoting but couldn't find candidate
+            if self._pivot_mode:
+                self.current_mode = 'pivot_blocked'
+                self.mode_reason = (f'🚫 Pivot blocked: winner price too high | '
+                                    f'UP ${up_price:.2f} DN ${down_price:.2f}{ratio_tag}')
+                self._pivot_mode = False
+                self._pending_pivot_is_new = False
+                # Clear pending pivot so next attempt counts as NEW pivot
+                self._pending_pivot_side = None
+                self._pending_pivot_target = 0.0
+            else:
+                self.current_mode = 'scanning'
+                self.mode_reason = (f'👁 Scanning | UP ${up_price:.2f}{up_knife} DOWN ${down_price:.2f}{dn_knife} | '
+                                    f'margin ${arb_margin:.3f}{ratio_tag}')
             self._record_history()
             return trades_made
 
@@ -1658,6 +1671,11 @@ class ArbitrageStrategy:
             if self._pivot_mode:
                 self.current_mode = 'pivot_done'
                 self.mode_reason = (f'🔄 Pivot target reached | {buy_side} need <${self.min_trade_size:.0f} more')
+                self._pivot_mode = False
+                self._pending_pivot_is_new = False
+                # Clear pending pivot since we couldn't execute
+                self._pending_pivot_side = None
+                self._pending_pivot_target = 0.0
             else:
                 self.current_mode = 'scanning'
                 self.mode_reason = (f'Trade too small | {buy_side} z={buy_z:+.1f} | '
@@ -1703,7 +1721,10 @@ class ArbitrageStrategy:
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
             trades_made.append((buy_side, ap, aq))
-            # v8.1: pivot_count is already incremented in detection section
+            # v8.4.2: Increment pivot count AFTER successful buy (not before)
+            if self._pivot_mode and hasattr(self, '_pending_pivot_is_new') and self._pending_pivot_is_new:
+                self._pivot_count += 1
+                self._pending_pivot_is_new = False
             # Check if this pivot fill completes the target
             if self._pivot_mode and self._pending_pivot_side:
                 pivot_qty_now = (self.qty_down if self._pending_pivot_side == 'DOWN'
