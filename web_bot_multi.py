@@ -1033,20 +1033,14 @@ HTML_TEMPLATE = """
                                       pt.current_mode === 'priority_fix' ? '🎯 PRIORITY FIX' : 
                                       pt.current_mode === 'improve' ? '📉 IMPROVING' :
                                       pt.current_mode === 'arbitrage' ? '💰 ARBITRAGE' :
-                                      pt.current_mode === 'seeking_arb' ? '⏳ SEEKING ARB' :
+                                      pt.current_mode === 'seeking_arb' ? '💰 SEEKING ARB' :
                                       pt.current_mode === 'hedge' ? '🔒 HEDGING' :
                                       pt.current_mode === 'rebalancing' ? '⚖️ REBALANCING' :
                                       pt.current_mode === 'rebalance' ? '⚖️ REBALANCING' :
                                       pt.current_mode === 'optimize' ? '⚡ OPTIMIZING' :
                                       pt.current_mode === 'improving' ? '📉 IMPROVING' :
                                       pt.current_mode === 'exit_wait' ? '⏳ EXIT WAIT' :
-                                      pt.current_mode === 'entry' ? '🎯 ENTERING' :
-                                      pt.current_mode === 'paired_entry' ? '🎯 PAIRED ENTRY' :
-                                      pt.current_mode === 'paired_growth' ? '📈 PAIRED GROWTH' :
-                                      pt.current_mode === 'arbitrage_locked' ? '🔒 PROFIT LOCKED' :
-                                      pt.current_mode === 'mgp_recovery' ? '🔄 MGP RECOVERY' :
-                                      pt.current_mode === 'z_rebalance' ? '📊 Z-REBALANCE' :
-                                      pt.current_mode === 'too_late' ? '⏰ TOO LATE' : '💤 IDLE'}
+                                      pt.current_mode === 'entry' ? '🎯 ENTERING' : '💤 IDLE'}
                                 </div>
                                 <div style="color: #9ca3af; font-size: 0.7rem; margin-top: 3px;">${pt.mode_reason || 'Monitoring market'}</div>
                             </div>

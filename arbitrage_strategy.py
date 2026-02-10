@@ -125,6 +125,12 @@ class ArbitrageStrategy:
 
         # (Hedge uses same api_rate_limit — no separate cooldown needed)
 
+        # ── Paired buy limit ──
+        # Max 2 paired buys per market, ~$50 each
+        self.paired_buy_count = 0
+        self.max_paired_buys = 2
+        self.paired_buy_budget = 50.0  # $50 per paired buy
+
         # ── State ──
         self.market_status = 'open'
         self.trade_count = 0
@@ -570,31 +576,30 @@ class ArbitrageStrategy:
         # ──────────────────────────────────────────────────────────
         #  PHASE 2b – MGP LOCK  (both sides exist, but MGP < 0)
         #  Buy smaller side to move toward positive MGP.
-        #  AGGRESSIVE: When MGP < 0, ignore existing pair_cost (sunk cost)
-        #  and focus ONLY on whether the NEW trade improves MGP.
+        #  AGGRESSIVE: No deficit gate, scale budget by MGP negativity.
         # ──────────────────────────────────────────────────────────
         if not self.both_scenarios_positive() and has_both_sides:
             smaller = self.smaller_side()
             if side != smaller:
                 return False, 0, f"MGP Lock: need {smaller}, not {side}"
 
-            # When MGP is negative, be VERY aggressive - buy at any price that improves MGP
-            # Price threshold: buying smaller side improves MGP when price < 1/FEE_MULT ≈ 0.985
-            max_recovery_price = 0.985 / FEE_MULT  # ≈ $0.970
-            
-            # Allow higher prices for MGP recovery when desperate
-            if current_mgp < -5.0:  # Very negative MGP - desperate
-                max_recovery_price = 0.97
-            elif current_mgp < -2.0:  # Moderately negative
-                max_recovery_price = 0.96
-            else:  # Slightly negative
-                max_recovery_price = min(0.95, self.max_price_for_positive_mgp())
+            p_max = self.max_price_for_positive_mgp()
 
-            if price > max_recovery_price:
-                return False, 0, f"MGP Lock: ${price:.3f} > recovery max ${max_recovery_price:.3f}"
+            if price > min(p_max, self.mgp_max_price):
+                return False, 0, f"MGP Lock: ${price:.3f} > p_max ${p_max:.3f}"
 
-            # Target qty: at least close the deficit, or 1 share minimum
-            target_qty = max(self.deficit(), 1.0)
+            # Don't push pair_cost above threshold
+            my_avg = my_cost / my_qty if my_qty > 0 else price
+            other_avg = other_cost / other_qty if other_qty > 0 else 0
+            target_qty = max(self.deficit(), 1.0)  # At least 1 share even if balanced
+            if my_qty > 0:
+                est_new_avg = (my_cost + price * target_qty) / (my_qty + target_qty)
+            else:
+                est_new_avg = price
+            est_pair = est_new_avg + other_avg if side == 'UP' else other_avg + est_new_avg
+            if est_pair > self.max_pair_cost:
+                return False, 0, f"MGP Lock would push pair to ${est_pair:.3f}"
+
             full_cost = target_qty * price
 
             # Check if buying full deficit would lock profit
@@ -684,14 +689,14 @@ class ArbitrageStrategy:
                 )
 
                 # Also buy if price is below our average (any discount helps)
-                price_below_avg = price < my_avg * 0.97  # 3% discount
+                price_below_avg = price < my_avg * 0.97  # 3% discount (was 5%)
 
-                # WHEN MGP < 0: buy smaller side at ANY price that improves MGP
-                # Every share of smaller side generally improves MGP when p < ~0.97
+                # WHEN MGP < 0: buy smaller side at ANY price < 0.985
+                # Every share of smaller side at p < 0.985 improves MGP
                 mgp_negative_buy = (
                     current_mgp < 0
                     and is_smaller
-                    and price < 0.97  # Reasonable price for recovery trades
+                    and price < 0.985 / FEE_MULT  # price where benefit > 0
                 )
 
                 if z_side_is_cheap or price_below_avg or mgp_negative_buy:
@@ -851,44 +856,16 @@ class ArbitrageStrategy:
 
         combined_price = up_price + down_price
         total_invested = self.cost_up + self.cost_down
-        invested_pct = total_invested / (self.starting_balance * self.max_position_pct) if self.starting_balance > 0 else 0
-        budget_limit = self.starting_balance * self.max_position_pct
-        remaining_budget = max(0, budget_limit - total_invested)
+        remaining_budget = max(0, self.market_budget - total_invested)
 
         # ════════════════════════════════════════════════════════
-        #  PROFIT LOCKED → Only do paired compounding
-        #  Don't give back gains — but keep growing via safe pairs.
+        #  MAX 2 PAIRED BUYS PER MARKET
+        #  Each buy uses ~$50 when pair cost < $1.00.
+        #  After 2 buys, just hold until resolution.
         # ════════════════════════════════════════════════════════
-        position_is_locked = (
-            self.both_scenarios_positive()
-            and mgp > self.profit_lock_threshold
-            and invested_pct >= self.min_invested_to_lock
-        )
-        if position_is_locked:
-            # Keep compounding — every pair at combined < max improves MGP
-            if combined_price <= self.max_combined_entry:
-                budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.20, self.max_single_trade)
-                cost_per_share = combined_price
-                qty = budget / cost_per_share if cost_per_share > 0 else 0
-                total_cost = qty * cost_per_share
-                # Compound even small amounts — every bit of locked profit helps
-                if qty > 0.3 and total_cost >= self.min_trade_size and total_cost <= self.cash:
-                    # Simulate buying DOWN too
-                    down_cost = down_price * qty
-                    new_qty_down = self.qty_down + qty
-                    new_total = self.cost_up + up_price * qty + self.cost_down + down_cost
-                    new_mgp_full = min(self.qty_up + qty, new_qty_down) - new_total * FEE_MULT
-                    if new_mgp_full > mgp:
-                        ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
-                        if ok_u:
-                            trades_made.append(('UP', ap_u, aq_u))
-                        ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
-                        if ok_d:
-                            trades_made.append(('DOWN', ap_d, aq_d))
-                        print(f"📈 LOCKED COMPOUND: {qty:.1f} shares | MGP ${mgp:.2f}→${new_mgp_full:.2f}")
-
-            self.current_mode = 'arbitrage_locked'
-            self.mode_reason = f'🔒 Profit locked ${mgp:.2f} (invested {invested_pct*100:.0f}%)'
+        if self.paired_buy_count >= self.max_paired_buys:
+            self.current_mode = 'holding'
+            self.mode_reason = f'🔒 {self.paired_buy_count}/{self.max_paired_buys} paired buys done | MGP ${mgp:.2f}'
             if self.qty_up + self.qty_down > 0:
                 self.mgp_history.append(self.calculate_locked_profit())
                 self.pnl_up_history.append(self.calculate_pnl_if_up_wins())
@@ -896,135 +873,48 @@ class ArbitrageStrategy:
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  PAIRED ENTRY — Buy both sides simultaneously
-        #  ALWAYS enter — work to secure profit from inside.
-        #  Larger initial entry to establish a meaningful position.
+        #  PAIRED BUY — Buy both sides simultaneously
+        #  ~$50 per buy, only when combined < max_combined_entry.
+        #  Works for both initial entry and second buy.
         # ════════════════════════════════════════════════════════
-        if self.qty_up == 0 and self.qty_down == 0:
+        if combined_price <= self.max_combined_entry:
             # Time filter: don't start new positions too late
             if time_to_close is not None and time_to_close < self.min_time_to_enter:
                 self.current_mode = 'too_late'
                 self.mode_reason = f'Only {time_to_close:.0f}s left — skipping market'
                 return trades_made
 
-            # CRITICAL: Never enter when combined price > max_combined_entry
-            # Combined > $1.00 means guaranteed loss after fees!
-            if combined_price > self.max_combined_entry:
-                self.current_mode = 'seeking_arb'
-                self.mode_reason = f'⏳ Waiting for spread | combined ${combined_price:.3f} > ${self.max_combined_entry:.3f}'
-                return trades_made
-
-            # Scale initial entry by combined price quality
-            if combined_price < 0.98:
-                entry_pct = 0.15  # Great price — enter bigger
-            elif combined_price < 0.99:
-                entry_pct = 0.12  # Good price
-            else:
-                entry_pct = 0.08  # Marginal — smaller entry
-            budget = min(self.market_budget * entry_pct, self.cash * entry_pct, remaining_budget * 0.25)
+            # Use $50 (or remaining budget/cash, whichever is less)
+            budget = min(self.paired_buy_budget, remaining_budget, self.cash)
             cost_per_share = up_price + down_price
             qty = budget / cost_per_share if cost_per_share > 0 else 0
             total_cost = qty * cost_per_share
 
             if total_cost >= self.min_trade_size and total_cost <= self.cash:
-                print(f"🎯 ENTERING: budget=${budget:.2f} qty={qty:.1f} combined=${combined_price:.3f} cash=${self.cash:.2f}")
-                ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
-                if ok_u:
-                    trades_made.append(('UP', ap_u, aq_u))
-                ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
-                if ok_d:
-                    trades_made.append(('DOWN', ap_d, aq_d))
-                self.current_mode = 'paired_entry'
-                self.mode_reason = f'Paired entry @ combined ${combined_price:.3f}'
-                print(f"🎯 PAIRED ENTRY: {qty:.1f} shares each | combined ${combined_price:.3f}")
+                # Verify it improves MGP (or is first entry)
+                new_qty_up = self.qty_up + qty
+                new_qty_down = self.qty_down + qty
+                new_total_cost = total_invested + total_cost
+                new_mgp = min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
+
+                if new_mgp > mgp or (self.qty_up == 0 and self.qty_down == 0):
+                    buy_num = self.paired_buy_count + 1
+                    print(f"🎯 PAIRED BUY #{buy_num}: budget=${budget:.2f} qty={qty:.1f} combined=${combined_price:.3f} cash=${self.cash:.2f}")
+                    ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                    if ok_u:
+                        trades_made.append(('UP', ap_u, aq_u))
+                    ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
+                    if ok_d:
+                        trades_made.append(('DOWN', ap_d, aq_d))
+                    self.paired_buy_count += 1
+                    self.current_mode = 'paired_entry' if buy_num == 1 else 'paired_growth'
+                    self.mode_reason = f'Paired buy #{buy_num}/{self.max_paired_buys} @ combined ${combined_price:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}'
+                    print(f"🎯 PAIRED BUY #{buy_num}: {qty:.1f} shares each | combined ${combined_price:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}")
             else:
                 print(f"⚠️ ENTRY BLOCKED: budget=${budget:.2f} total_cost=${total_cost:.2f} cash=${self.cash:.2f} min_trade=${self.min_trade_size}")
-            return trades_made
-
-        # ════════════════════════════════════════════════════════
-        #  PAIRED GROWTH — Compound position with paired buys
-        #  Both sides exist. Scale budget by MGP state:
-        #   MGP < 0 → aggressive (up to 20% budget) to recover
-        #   MGP ≥ 0 → moderate (5-8%) to grow locked profit
-        # ════════════════════════════════════════════════════════
-        if self.qty_up > 0 and self.qty_down > 0 and not position_is_locked:
-            avg_pair_cost = (self.cost_up + self.cost_down) / min(self.qty_up, self.qty_down) if min(self.qty_up, self.qty_down) > 0 else 99
-            # Compound at any favorable combined price that improves MGP
-            if combined_price <= self.max_combined_entry:
-                now = time.time()
-                if now - self.last_trade_time >= self.api_rate_limit:
-                    # Scale budget based on MGP state
-                    if mgp < 0:
-                        # AGGRESSIVE: More negative MGP = bigger trades
-                        urgency = min(1.0, abs(mgp) / 3.0)
-                        budget_pct = 0.08 + 0.15 * urgency  # 8%..23% of market budget
-                        budget = min(self.market_budget * budget_pct, self.cash * 0.15, remaining_budget * 0.40)
-                    elif combined_price < avg_pair_cost:
-                        # GOOD DEAL: buying below our average
-                        budget = min(self.market_budget * 0.08, self.cash * 0.08, remaining_budget * 0.20)
-                    else:
-                        budget = min(self.market_budget * 0.05, self.cash * 0.05, remaining_budget * 0.12, self.max_single_trade)
-                    cost_per_share = combined_price
-                    qty = budget / cost_per_share if cost_per_share > 0 else 0
-                    total_cost = qty * cost_per_share
-
-                    if qty > 0.3 and total_cost >= self.min_trade_size and total_cost <= self.cash:
-                        # Verify it actually improves MGP
-                        new_qty_up = self.qty_up + qty
-                        new_qty_down = self.qty_down + qty
-                        new_total_cost = total_invested + total_cost
-                        new_mgp = min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
-                        if new_mgp > mgp:
-                            ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
-                            if ok_u:
-                                trades_made.append(('UP', ap_u, aq_u))
-                            ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
-                            if ok_d:
-                                trades_made.append(('DOWN', ap_d, aq_d))
-                            self.current_mode = 'paired_growth'
-                            self.mode_reason = f'📈 Growing @ combined ${combined_price:.3f} (avg ${avg_pair_cost:.3f}) | MGP ${mgp:.2f}→${new_mgp:.2f}'
-                            print(f"📈 PAIRED GROWTH: {qty:.1f} shares | combined ${combined_price:.3f} < avg ${avg_pair_cost:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}")
-                            # Record and return
-                            if self.qty_up + self.qty_down > 0:
-                                self.mgp_history.append(self.calculate_locked_profit())
-                                self.pnl_up_history.append(self.calculate_pnl_if_up_wins())
-                                self.pnl_down_history.append(self.calculate_pnl_if_down_wins())
-                            return trades_made
-
-        # ════════════════════════════════════════════════════════
-        #  SEQUENTIAL LOGIC (one side at a time)
-        # ════════════════════════════════════════════════════════
-        delta = self.position_delta_pct
-        smaller = self.smaller_side()
-
-        # Determine which side to try first
-        if delta > self.max_allowed_delta_pct:
-            first_side = smaller
-        elif not self.both_scenarios_positive() and self.deficit() > 0.5:
-            first_side = smaller
         else:
-            first_side = 'UP' if up_price <= down_price else 'DOWN'
-
-        # Try first side
-        price_1 = up_price if first_side == 'UP' else down_price
-        other_1 = down_price if first_side == 'UP' else up_price
-        ok, qty, reason = self.should_buy(first_side, price_1, other_1, se_info, time_to_close=time_to_close)
-        if ok and qty > 0:
-            ok_f, ap_f, aq_f = self.execute_buy(first_side, price_1, qty, timestamp)
-            if ok_f:
-                trades_made.append((first_side, ap_f, aq_f))
-                print(f"✅ {reason}")
-
-        # Try other side too — both sides can trade in same tick for faster balancing
-        second_side = 'DOWN' if first_side == 'UP' else 'UP'
-        price_2 = up_price if second_side == 'UP' else down_price
-        other_2 = down_price if second_side == 'UP' else up_price
-        ok2, qty2, reason2 = self.should_buy(second_side, price_2, other_2, se_info, time_to_close=time_to_close)
-        if ok2 and qty2 > 0:
-            ok_s, ap_s, aq_s = self.execute_buy(second_side, price_2, qty2, timestamp)
-            if ok_s:
-                trades_made.append((second_side, ap_s, aq_s))
-                print(f"✅ {reason2}")
+            self.current_mode = 'waiting'
+            self.mode_reason = f'Combined ${combined_price:.3f} > max ${self.max_combined_entry} — waiting'
 
         # Track prices for reactive logic
         self._prev_up_price = up_price
