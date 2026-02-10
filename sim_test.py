@@ -298,7 +298,7 @@ def run_scenario(scenario: dict, market_budget: float = 100.0, starting_balance:
 def main():
     print("=" * 90)
     print("  MARKEDSSIMULERING — 10 Scenarioer")
-    print("  Strategi: Dynamic Delta Neutral v3 (MGP-First, Full Budget Lock)")
+    print("  Strategi: HFT Mean-Reversion + Kelly Criterion")
     print("  Budget: $100/marked, $200 startbalanse")
     print("  Execution: 25ms latency, VWAP orderbook fills, 5% max slippage")
     print("=" * 90)
