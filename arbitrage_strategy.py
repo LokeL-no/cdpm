@@ -321,8 +321,8 @@ class ArbitrageStrategy:
         #  When entering a new market, prefer the likely winner.
         #  If you can't complete the pair, at least you hold the winner.
         self.winner_first_enabled = True
-        self.buy_price_min = 0.57           # Min price to buy (v8.5)
-        self.buy_price_max = 0.62           # Max price to buy (v8.5)
+        self.buy_price_min = 0.68           # Min price to buy (v8.5)
+        self.buy_price_max = 0.73           # Max price to buy (v8.5)
 
         # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
