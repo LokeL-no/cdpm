@@ -203,6 +203,20 @@ class ExecutionSimulator:
         latency_decay_factor = 1.0 - min(0.15, self.latency_ms / 200.0)
         asks[0]['size'] *= latency_decay_factor
 
+        # ── Latency price drift ──
+        # During volatile markets, prices can move during the latency window.
+        # Model this as a small adverse price shift on the first level.
+        # In fast markets, the best ask often moves against you by 1-3 ticks.
+        if self.latency_ms > 10 and best_ask_price < 0.95:
+            # Calculate implied volatility from recent slippage
+            recent_slip = [e.slippage_pct for e in list(self.slippage_log)[-10:]] if self.slippage_log else []
+            avg_recent_slip = sum(recent_slip) / len(recent_slip) if recent_slip else 0.0
+            # If recent trades had positive slippage, market is moving fast
+            if avg_recent_slip > 0.5:
+                # Shift best ask up proportional to latency and volatility
+                drift = best_ask_price * 0.002 * (self.latency_ms / 25.0)
+                asks[0]['price'] = min(asks[0]['price'] + drift, 0.99)
+
         # ── Walk the book ──
         remaining_qty = qty
         total_cost = 0.0

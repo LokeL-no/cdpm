@@ -3686,7 +3686,7 @@ class MultiMarketBot:
         self.trade_log: List[dict] = []
         self.paused = False
         # Shared execution simulator — stats persist across all markets
-        self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=5.0)
+        self.exec_sim = ExecutionSimulator(latency_ms=25.0, max_slippage_pct=2.0)
     
     async def load_manual_markets(self, session: aiohttp.ClientSession):
         """Load manually specified markets"""
@@ -3940,21 +3940,30 @@ class MultiMarketBot:
             return
         
         try:
-            # Get orderbook for both tokens
+            # Get orderbook for both tokens IN PARALLEL for temporal consistency
+            # Sequential fetching causes UP/DOWN prices to be from different moments,
+            # which is dangerous during rapid price swings.
             up_book = {}
             down_book = {}
-            
-            if tracker.up_token_id:
-                url = f"{self.CLOB_API_URL}/book?token_id={tracker.up_token_id}"
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        up_book = await response.json()
-            
-            if tracker.down_token_id:
-                url = f"{self.CLOB_API_URL}/book?token_id={tracker.down_token_id}"
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        down_book = await response.json()
+            fetch_start = time.time()
+
+            async def fetch_book(token_id):
+                if not token_id:
+                    return {}
+                url = f"{self.CLOB_API_URL}/book?token_id={token_id}"
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=0.5)) as response:
+                        if response.status == 200:
+                            return await response.json()
+                except asyncio.TimeoutError:
+                    pass  # Silent — will just use previous prices
+                return {}
+
+            up_book, down_book = await asyncio.gather(
+                fetch_book(tracker.up_token_id),
+                fetch_book(tracker.down_token_id)
+            )
+            fetch_latency_ms = (time.time() - fetch_start) * 1000
             
             # Extract prices
             asks_up = up_book.get('asks', [])
@@ -3981,7 +3990,7 @@ class MultiMarketBot:
                 up_bid = max(float(b.get('price', 0.0)) for b in bids_up if b.get('price'))
             if bids_down:
                 down_bid = max(float(b.get('price', 0.0)) for b in bids_down if b.get('price'))
-            
+
             # Paper trading - calculate time to close for urgency
             if tracker.up_price and tracker.down_price and tracker.paper_trader.market_status == 'open':
                 # Skip trading if paused
@@ -3999,7 +4008,7 @@ class MultiMarketBot:
                 pt = tracker.paper_trader
                 if pt.qty_up == 0 and pt.qty_down == 0:
                     spread = abs(tracker.up_price - tracker.down_price) if tracker.up_price and tracker.down_price else 0
-                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode}")
+                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | {fetch_latency_ms:.0f}ms")
                 
                 trades = tracker.paper_trader.check_and_trade(
                     tracker.up_price, 
@@ -4016,7 +4025,7 @@ class MultiMarketBot:
                     for side, actual_price, actual_qty in trades:
                         pt = tracker.paper_trader
                         urgency_msg = f" [⚠️ {time_to_close:.0f}s left!]" if time_to_close and time_to_close < 300 else ""
-                        print(f"📈 [{tracker.asset.upper()}] BUY {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f}{urgency_msg}")
+                        print(f"📈 [{tracker.asset.upper()}] BUY {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f} | {fetch_latency_ms:.0f}ms{urgency_msg}")
                         
                         # Add to trade log (actual fill data from execution simulator)
                         self.trade_log.append({
@@ -4283,7 +4292,7 @@ class MultiMarketBot:
                     print(f"Error in data loop: {e}")
                     traceback.print_exc()
                 
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.2)  # 200ms polling — near-realtime price tracking
     
     async def index_handler(self, request):
         return web.Response(text=HTML_TEMPLATE, content_type='text/html')

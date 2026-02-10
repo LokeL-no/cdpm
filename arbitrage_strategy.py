@@ -834,7 +834,26 @@ class ArbitrageStrategy:
         qty = min(qty, self.max_shares_per_order, depth_cap)
 
         orderbook = self._pending_orderbooks.get(side, {})
-        fill = self.exec_sim.simulate_fill(side, price, qty, orderbook)
+
+        # ── PRE-TRADE PRICE VERIFICATION ──
+        # Before sending to execution simulator, verify the best ask in the
+        # ── USE LIVE BEST ASK AS TRADE PRICE ──
+        # Instead of trading at the strategy's decision price (which may be
+        # stale by the time we execute), use the actual best ask from the
+        # orderbook. This ensures we always trade at the real current price.
+        live_price = price  # fallback to decision price
+        if orderbook and orderbook.get('asks'):
+            try:
+                asks = orderbook['asks']
+                best_ask = min(float(a.get('price', 99)) for a in asks if a.get('price'))
+                if best_ask < 1.0:  # sanity check
+                    if best_ask != price:
+                        print(f"📡 [{side}] Live price: ${best_ask:.4f} (decision was ${price:.4f})")
+                    live_price = best_ask
+            except (ValueError, TypeError):
+                pass
+
+        fill = self.exec_sim.simulate_fill(side, live_price, qty, orderbook)
 
         if not fill.filled:
             return False, 0.0, 0.0
@@ -892,7 +911,8 @@ class ArbitrageStrategy:
                         up_bid: Optional[float] = None,
                         down_bid: Optional[float] = None,
                         up_orderbook: Optional[dict] = None,
-                        down_orderbook: Optional[dict] = None) -> List[Tuple[str, float, float]]:
+                        down_orderbook: Optional[dict] = None,
+                        ) -> List[Tuple[str, float, float]]:
         trades_made: List[Tuple[str, float, float]] = []
 
         if up_price <= 0 or down_price <= 0:
@@ -1077,12 +1097,14 @@ class ArbitrageStrategy:
                 effective_pivot_count = (self._pivot_count + (1 if is_truly_new else 0))
 
                 # ── EQUALIZE EXIT (v7.0) ──
-                #  Too many pivots OR can't afford next pivot → buy cheap side
-                #  to balance UP ≈ DN and minimize worst-case loss.
-                should_equalize = (effective_pivot_count > self.max_pivot_count or
-                                   actual_cash < required_cost)
+                #  Too many pivots → equalize to minimize worst-case loss.
+                #  Can't afford full pivot → do PARTIAL pivot with remaining budget
+                #  to reduce the loss, then equalize.
+                too_many_pivots = effective_pivot_count > self.max_pivot_count
+                cant_afford_full = actual_cash < required_cost
 
-                if should_equalize:
+                if too_many_pivots:
+                    # Max pivots reached — balance both sides to minimize worst-case
                     weak_side = 'UP' if self.qty_up < self.qty_down else 'DOWN'
                     weak_price = up_price if weak_side == 'UP' else down_price
                     strong_qty = max(self.qty_up, self.qty_down)
@@ -1099,24 +1121,52 @@ class ArbitrageStrategy:
                             self._equalized = True
                             total_final = self.cost_up + self.cost_down
                             mgp_final = self.calculate_locked_profit()
-                            eq_reason = ('max pivots reached' if self._pivot_count >= self.max_pivot_count
-                                         else f'budget (need ${required_cost:.0f}, have ${actual_cash:.0f})')
                             print(f"⚖️ EQUALIZE: {weak_side} {aq:.1f}×${ap:.3f} | "
                                   f"UP={self.qty_up:.1f} DN={self.qty_down:.1f} | "
                                   f"inv=${total_final:.2f} | MGP ${mgp_final:.2f} | "
-                                  f"gave up after {self._pivot_count} pivots ({eq_reason})")
+                                  f"gave up after {self._pivot_count} pivots (max pivots reached)")
                             self.current_mode = 'equalized'
                             self.mode_reason = (f'⚖️ Equalized: {weak_side} {aq:.1f}sh@${ap:.3f} | '
                                                 f'MGP ${mgp_final:.2f} | {self._pivot_count} pivots used')
                             self._record_history()
                             return trades_made
 
-                    # Can't equalize (trade too small or failed) — just hold
-                    self._equalized = True  # Mark as equalized even without trade
+                    # Can't equalize (trade too small or already balanced) — just hold
+                    self._equalized = True
                     self.current_mode = 'equalized'
-                    self.mode_reason = (f'⚖️ Equalized (no trade needed) after {self._pivot_count} pivots')
+                    self.mode_reason = (f'⚖️ Equalized (max pivots) after {self._pivot_count} pivots')
                     self._record_history()
                     return trades_made
+
+                elif cant_afford_full:
+                    # ── PARTIAL PIVOT (v9.0) ──
+                    # Can't afford full pivot to $5 profit, but still have cash.
+                    # Buy as many winner shares as we can afford to REDUCE the loss.
+                    # E.g. need $82 of UP but only have $56 → buy $56 of UP.
+                    # This turns a -$42 loss into a smaller loss (or even profit if winner wins).
+                    max_qty_affordable = actual_cash / new_winner_price if new_winner_price > 0 else 0
+                    partial_qty = min(max_qty_affordable, additional_needed, self.max_shares_per_order)
+
+                    if partial_qty * new_winner_price >= self.min_trade_size:
+                        is_truly_new_for_count = is_truly_new
+                        self._pivot_mode = True
+                        self._pivot_target_qty = partial_qty
+                        self._pending_pivot_side = new_winner
+                        self._pending_pivot_target = qty_new + partial_qty
+                        self._pending_pivot_is_new = is_truly_new_for_count
+                        other_side = 'UP' if new_winner == 'DOWN' else 'DOWN'
+                        shortfall = required_cost - actual_cash
+                        print(f"🔄 PARTIAL PIVOT #{effective_pivot_count}: {other_side}→{new_winner} @ ${new_winner_price:.3f} | "
+                              f"need {additional_needed:.1f}sh (${required_cost:.0f}) but only have ${actual_cash:.0f} | "
+                              f"buying {partial_qty:.1f}sh (${partial_qty*new_winner_price:.0f}) — reduces loss by ~${partial_qty*(1-new_winner_price):.0f}")
+                    else:
+                        # Truly broke — can't even do partial pivot
+                        self._equalized = True
+                        self.current_mode = 'equalized'
+                        self.mode_reason = (f'⚖️ Budget exhausted after {self._pivot_count} pivots | '
+                                            f'cash ${actual_cash:.0f} too low for pivot')
+                        self._record_history()
+                        return trades_made
                 else:
                     # Can afford pivot — execute it
                     self._pivot_mode = True
