@@ -891,25 +891,52 @@ class ArbitrageStrategy:
             total_cost = qty * cost_per_share
 
             if total_cost >= self.min_trade_size and total_cost <= self.cash:
-                # Verify it improves MGP (or is first entry)
-                new_qty_up = self.qty_up + qty
-                new_qty_down = self.qty_down + qty
-                new_total_cost = total_invested + total_cost
-                new_mgp = min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
+                # ── Check book depth on BOTH sides before buying ──
+                # Ensure we buy EQUAL qty on both sides for balanced position.
+                # Cap qty to the minimum available liquidity across both books.
+                up_depth = self._book_depth_cap.get('UP', self.max_shares_per_order)
+                down_depth = self._book_depth_cap.get('DOWN', self.max_shares_per_order)
+                max_balanced_qty = min(up_depth, down_depth, self.max_shares_per_order)
 
-                if new_mgp > mgp or (self.qty_up == 0 and self.qty_down == 0):
-                    buy_num = self.paired_buy_count + 1
-                    print(f"🎯 PAIRED BUY #{buy_num}: budget=${budget:.2f} qty={qty:.1f} combined=${combined_price:.3f} cash=${self.cash:.2f}")
-                    ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
-                    if ok_u:
-                        trades_made.append(('UP', ap_u, aq_u))
-                    ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, qty, timestamp)
-                    if ok_d:
-                        trades_made.append(('DOWN', ap_d, aq_d))
-                    self.paired_buy_count += 1
-                    self.current_mode = 'paired_entry' if buy_num == 1 else 'paired_growth'
-                    self.mode_reason = f'Paired buy #{buy_num}/{self.max_paired_buys} @ combined ${combined_price:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}'
-                    print(f"🎯 PAIRED BUY #{buy_num}: {qty:.1f} shares each | combined ${combined_price:.3f} | MGP ${mgp:.2f}→${new_mgp:.2f}")
+                if qty > max_balanced_qty:
+                    print(f"📏 BALANCED CAP: {qty:.1f} → {max_balanced_qty:.1f} shares (UP depth {up_depth:.0f}, DOWN depth {down_depth:.0f})")
+                    qty = max_balanced_qty
+                    total_cost = qty * cost_per_share
+
+                if qty < self.min_trade_size / cost_per_share:
+                    print(f"⚠️ SKIPPED: insufficient balanced liquidity (UP={up_depth:.0f}, DOWN={down_depth:.0f})")
+                elif total_cost > self.cash:
+                    print(f"⚠️ SKIPPED: balanced qty cost ${total_cost:.2f} > cash ${self.cash:.2f}")
+                else:
+                    # Verify it improves MGP (or is first entry)
+                    new_qty_up = self.qty_up + qty
+                    new_qty_down = self.qty_down + qty
+                    new_total_cost = total_invested + total_cost
+                    new_mgp = min(new_qty_up, new_qty_down) - new_total_cost * FEE_MULT
+
+                    if new_mgp > mgp or (self.qty_up == 0 and self.qty_down == 0):
+                        buy_num = self.paired_buy_count + 1
+                        print(f"🎯 PAIRED BUY #{buy_num}: budget=${budget:.2f} qty={qty:.1f} combined=${combined_price:.3f} cash=${self.cash:.2f}")
+                        ok_u, ap_u, aq_u = self.execute_buy('UP', up_price, qty, timestamp)
+                        if ok_u:
+                            trades_made.append(('UP', ap_u, aq_u))
+                            # Cap DOWN qty to what UP actually filled for perfect balance
+                            balanced_qty = min(qty, aq_u)
+                        else:
+                            balanced_qty = 0
+
+                        if balanced_qty > 0:
+                            ok_d, ap_d, aq_d = self.execute_buy('DOWN', down_price, balanced_qty, timestamp)
+                            if ok_d:
+                                trades_made.append(('DOWN', ap_d, aq_d))
+                        else:
+                            print(f"⚠️ UP fill failed — skipping DOWN to stay balanced")
+
+                        self.paired_buy_count += 1
+                        actual_mgp = self.calculate_locked_profit()
+                        self.current_mode = 'paired_entry' if buy_num == 1 else 'paired_growth'
+                        self.mode_reason = f'Paired buy #{buy_num}/{self.max_paired_buys} @ combined ${combined_price:.3f} | MGP ${actual_mgp:.2f}'
+                        print(f"🎯 PAIRED BUY #{buy_num}: {qty:.1f} shares each | combined ${combined_price:.3f} | MGP ${actual_mgp:.2f}")
             else:
                 print(f"⚠️ ENTRY BLOCKED: budget=${budget:.2f} total_cost=${total_cost:.2f} cash=${self.cash:.2f} min_trade=${self.min_trade_size}")
         else:
