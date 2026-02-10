@@ -20,7 +20,15 @@ from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
 
 # Supported assets
-SUPPORTED_ASSETS = ['btc', 'eth']
+SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
+
+# Per-asset budget (how much $ to allocate per 15-min market)
+ASSET_BUDGETS = {
+    'btc': 100.0,
+    'eth': 100.0,
+    'sol': 50.0,
+    'xrp': 50.0,
+}
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
@@ -3640,7 +3648,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 200.0, per_market_budget: float = 100.0):
+    def __init__(self, starting_balance: float = 300.0, per_market_budget: float = 100.0):
         self.initial_starting_balance = starting_balance
         # Allow overrides via env to match Render/VPS config.
         try:
@@ -3741,7 +3749,8 @@ class MultiMarketBot:
                                     down_token = tokens[0]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget, self.exec_sim)
+                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -3845,7 +3854,8 @@ class MultiMarketBot:
                                         down_token = tokens[i]
                         
                         if up_token and down_token:
-                            tracker = MarketTracker(slug, asset, self.cash_ref, self.per_market_budget, self.exec_sim)
+                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
+                            tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
                             
@@ -3858,7 +3868,7 @@ class MultiMarketBot:
                             
                             tracker.initialized = True
                             self.active_markets[slug] = tracker
-                            print(f"🔍 Auto-discovered: {slug}")
+                            print(f"🔍 Auto-discovered: {slug} (budget ${asset_budget:.0f})")
                             break  # Found one for this asset, move to next asset
                 except Exception as e:
                     pass  # Silently skip failed lookups

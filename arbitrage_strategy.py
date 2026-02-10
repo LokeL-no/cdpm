@@ -126,10 +126,10 @@ class ArbitrageStrategy:
         # (Hedge uses same api_rate_limit — no separate cooldown needed)
 
         # ── Paired buy limit ──
-        # Max 2 paired buys per market, ~$50 each
+        # Max 2 paired buys per market, each uses half the market budget
         self.paired_buy_count = 0
         self.max_paired_buys = 2
-        self.paired_buy_budget = 50.0  # $50 per paired buy
+        self.paired_buy_budget = market_budget / self.max_paired_buys  # Half budget per buy
 
         # ── State ──
         self.market_status = 'open'
