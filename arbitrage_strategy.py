@@ -321,10 +321,8 @@ class ArbitrageStrategy:
         #  When entering a new market, prefer the likely winner.
         #  If you can't complete the pair, at least you hold the winner.
         self.winner_first_enabled = True
-        self.winner_entry_price_max = 0.57  # Entry cap: max $0.57 (v8.0)
-        self.loser_entry_price_max = 0.38   # Only buy loser at $0.38 or below (v8.0)
-        self.arb_lock_max_pair_cost = 0.95  # Arb-lock only when pair cost ≤ $0.95 (v8.0)
-        self.pivot_entry_price_max = 0.62   # Pivot entries: up to $0.62 (v8.4.4 — pivots are defensive)
+        self.buy_price_min = 0.57           # Min price to buy (v8.5)
+        self.buy_price_max = 0.62           # Max price to buy (v8.5)
 
         # ── MARKET-FLIP PIVOT (v7.0) ──
         #  When the market flips, buy enough of the new winner that
@@ -333,7 +331,7 @@ class ArbitrageStrategy:
         self.pivot_enabled = True
         self.pivot_winner_threshold = 0.55  # New winner must be >= 55% probability
         self.pivot_profit_target = 5.0      # Target $5 profit per successful pivot
-        self.max_pivot_count = 4            # After N pivots → equalize and stop (v8.4)
+        self.max_pivot_count = 6            # After N pivots → equalize and stop (v8.5)
         self._pivot_mode = False
         self._pivot_target_qty = 0.0
         self._pivot_failsafe = False  # True when we executed a limited pivot due to budget
@@ -974,15 +972,13 @@ class ArbitrageStrategy:
                 return trades_made
             # else: arb exists or pivoting — skip stop-loss, let bot try to recover
 
-        # Budget exhausted — hold unless arb opportunity exists (can still lock profit)
+        # Budget exhausted — hold
         if remaining_budget < self.min_trade_size and has_position:
-            if not has_arb_opportunity:
-                self.current_mode = 'holding'
-                self.mode_reason = (f'💰 Budget used ${total_invested:.0f}/${self.market_budget:.0f} | '
-                                    f'MGP ${mgp:.2f} | Δ {self.position_delta_pct:.0f}%')
-                self._record_history()
-                return trades_made
-            # else: arb exists — let bot continue to ARB-LOCK even with tiny budget
+            self.current_mode = 'holding'
+            self.mode_reason = (f'💰 Budget used ${total_invested:.0f}/${self.market_budget:.0f} | '
+                                f'MGP ${mgp:.2f} | Δ {self.position_delta_pct:.0f}%')
+            self._record_history()
+            return trades_made
 
         if time_to_close is not None and time_to_close < self.min_time_to_enter and not has_position:
             self.current_mode = 'too_late'
@@ -1148,9 +1144,9 @@ class ArbitrageStrategy:
                           f"target ${self.pivot_profit_target:.0f} profit | "
                           f"current {new_winner} pnl=${pnl_if_winner:.2f}")
             else:
-                self.current_mode = 'waiting_for_dip'
+                self.current_mode = 'holding'
                 self.mode_reason = (f'⏳ Holding {self.qty_up:.1f}UP+{self.qty_down:.1f}DN | '
-                                    f'combined ${combined:.3f} | need <${BREAK_EVEN:.3f} to hedge')
+                                    f'MGP ${mgp:.2f} | waiting for flip')
                 self._record_history()
                 return trades_made
 
@@ -1161,134 +1157,16 @@ class ArbitrageStrategy:
             self._record_history()
             return trades_made
 
-        # When pivoting, override priority to NEUTRAL
-        # so hedge sections don't intercept — pivot handles its own sizing.
-        if self._pivot_mode:
-            priority = 'NEUTRAL'
-
-        # ════════════════════════════════════════════════════════
-        #  ARB-LOCK (v8.0) — Lock profit when pair cost ≤ $0.95
-        #  Only triggers when the opposite side is cheap enough
-        #  (pair cost ≤ arb_lock_max_pair_cost) AND we can lock
-        #  guaranteed profit with remaining budget.
-        #  Buys all at once to lock immediately.
-        # ════════════════════════════════════════════════════════
-
-        if not self._pivot_mode and has_position and combined <= self.arb_lock_max_pair_cost:
-            # Pick the cheap side (smaller qty if deficit, else cheaper price)
-            lock_side = self.smaller_side() if self.deficit() >= 0.5 else ('UP' if up_price <= down_price else 'DOWN')
-            lock_price = up_price if lock_side == 'UP' else down_price
-
-            qty_strong = max(self.qty_up, self.qty_down)
-            qty_weak = min(self.qty_up, self.qty_down)
-            cost_total = self.cost_up + self.cost_down
-            actual_cash = max(0, self.starting_balance - cost_total)
-
-            # Calculate minimum shares to lock profit if WEAK side wins:
-            #   (qty_weak + q) >= (cost_total + q × lock_price) × FEE_MULT
-            #   q ≥ (cost_total × FEE_MULT - qty_weak) / (1 - lock_price × FEE_MULT)
-            denom_lock = 1.0 - lock_price * FEE_MULT
-            if denom_lock > 0.01:
-                q_min_lock = max(0, (cost_total * FEE_MULT - qty_weak) / denom_lock)
-            else:
-                q_min_lock = float('inf')
-
-            # Max shares before STRONG side goes negative:
-            #   qty_strong ≥ (cost_total + q × lock_price) × FEE_MULT
-            #   q ≤ (qty_strong - cost_total × FEE_MULT) / (lock_price × FEE_MULT)
-            q_max_lock = ((qty_strong - cost_total * FEE_MULT) / (lock_price * FEE_MULT)
-                          if lock_price > 0 else 0)
-
-            # Target: at least enough to lock, ideally balanced
-            deficit = qty_strong - qty_weak
-            q_target = max(q_min_lock, deficit)
-
-            # Can we lock profit with remaining budget?
-            can_lock = (q_min_lock <= q_max_lock and
-                        q_target <= q_max_lock and
-                        q_target * lock_price <= actual_cash and
-                        q_target * lock_price >= self.min_trade_size)
-
-            if can_lock:
-                qty = min(q_target, actual_cash / lock_price, self.max_shares_per_order)
-                ok, ap, aq = self.execute_buy(lock_side, lock_price, qty, timestamp)
-                if ok:
-                    trades_made.append((lock_side, ap, aq))
-                    actual_mgp = self.calculate_locked_profit()
-                    lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-                    self.current_mode = 'arb_lock'
-                    self.mode_reason = (f'💰 ARB-LOCK {lock_side} {aq:.1f}sh@${ap:.3f} | '
-                                        f'pair=${combined:.3f} | MGP ${actual_mgp:.2f}{lock_tag}')
-                    print(f"💰 ARB-LOCK: {lock_side} {aq:.1f}×${ap:.3f} | "
-                          f"pair=${combined:.3f} | MGP ${actual_mgp:.2f}{lock_tag}")
-                    self._record_history()
-                    return trades_made
-
-        # ── EQUALIZED: block all further entries/hedges (v7.0) ──
-        #  After equalize, only arb-lock (above) and recovery-buy can trade.
+        # ── EQUALIZED: block all further trading (v8.5) ──
         if self._equalized:
-            # ── RECOVERY BUY (v8.2) ──
-            #  When equalized + underwater + arb exists: buy BALANCED pairs
-            #  at cheap pair cost to reduce average pair cost and recover losses.
-            #  Each pair at combined < BE earns (1 - combined × FEE_MULT).
-            #  Buys both sides in one tick to stay balanced.
-            if has_arb_opportunity and mgp < -0.10:
-                cheap_side = 'UP' if up_price <= down_price else 'DOWN'
-                expensive_side = 'DOWN' if cheap_side == 'UP' else 'UP'
-                cheap_price = min(up_price, down_price)
-                expensive_price = max(up_price, down_price)
-                pair_cost = cheap_price + expensive_price
-
-                actual_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
-                # How many balanced pairs can we afford?
-                max_pairs = actual_cash / pair_cost if pair_cost > 0 else 0
-                # Buy up to 10 pairs at a time
-                rec_pairs = min(10.0, max_pairs)
-
-                if rec_pairs * pair_cost >= self.min_trade_size * 2:
-                    # Verify both sides improve MGP together
-                    cost_total = self.cost_up + self.cost_down
-                    new_cost = cost_total + rec_pairs * pair_cost
-                    new_qty = min(self.qty_up, self.qty_down) + rec_pairs
-                    # Both scenarios identical for balanced position:
-                    new_pnl = new_qty - new_cost * FEE_MULT
-                    old_pnl = min(self.qty_up, self.qty_down) - cost_total * FEE_MULT
-
-                    if new_pnl > old_pnl + 0.01:  # Must improve
-                        # Buy cheap side first, then expensive side
-                        ok1, ap1, aq1 = self.execute_buy(cheap_side, cheap_price, rec_pairs, timestamp)
-                        if ok1:
-                            trades_made.append((cheap_side, ap1, aq1))
-                            # Verify we can still afford the expensive side
-                            remaining_cash = max(0, self.starting_balance - (self.cost_up + self.cost_down))
-                            expensive_qty = min(aq1, remaining_cash / expensive_price if expensive_price > 0 else 0)
-                            if expensive_qty * expensive_price >= self.min_trade_size:
-                                self.last_trade_time = 0  # Allow immediate second buy
-                                ok2, ap2, aq2 = self.execute_buy(expensive_side, expensive_price, expensive_qty, timestamp)
-                                if ok2:
-                                    trades_made.append((expensive_side, ap2, aq2))
-                            actual_mgp = self.calculate_locked_profit()
-                            arb_edge = BREAK_EVEN - pair_cost
-                            lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-                            self.current_mode = 'recovery'
-                            self.mode_reason = (f'🔧 RECOVERY +{aq1:.1f}pairs@${pair_cost:.3f} | '
-                                                f'edge=${arb_edge:.3f} | '
-                                                f'MGP ${actual_mgp:.2f}{lock_tag}')
-                            print(f"🔧 RECOVERY: +{aq1:.1f}×${pair_cost:.3f} | "
-                                  f"edge=${arb_edge:.3f} | "
-                                  f"MGP ${actual_mgp:.2f}{lock_tag}")
-                            self._record_history()
-                            return trades_made
-
             self.current_mode = 'equalized'
             self.mode_reason = (f'⚖️ Equalized — holding ({self._pivot_count} pivots used)')
             self._record_history()
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  HOLD GATE (v8.0) — After initial entry, only arb-lock
-        #  and pivot can buy. No hedging, no incremental entries.
-        #  This keeps the strategy clean: entry → wait → lock or pivot.
+        #  HOLD GATE (v8.5) — After initial entry, only pivot can buy.
+        #  No hedging, no pair trades, no incremental entries.
         # ════════════════════════════════════════════════════════
 
         if has_position and not self._pivot_mode:
@@ -1300,347 +1178,62 @@ class ArbitrageStrategy:
             return trades_made
 
         # ════════════════════════════════════════════════════════
-        #  PRE-EMPTIVE HEDGE — Balance early at small deltas
-        #  Only hedges if price won't destroy MGP
-        #  SKIP when pivoting (v6.3b) — pivot handles its own sizing
-        # ════════════════════════════════════════════════════════
-
-        if (not self._pivot_mode and priority == 'NEUTRAL' and has_position and
-                self.preemptive_hedge_enabled and
-                self.position_delta_pct >= self.preemptive_hedge_threshold):
-
-            ph_side = self.smaller_side()
-            ph_price = up_price if ph_side == 'UP' else down_price
-            ph_fair = fair_up if ph_side == 'UP' else fair_down
-            ph_z = z_up if ph_side == 'UP' else z_down
-            ph_tracker = self.up_tracker if ph_side == 'UP' else self.down_tracker
-
-            max_hedge_price = self.max_price_for_positive_mgp()
-
-            # Only pre-hedge if price is reasonable
-            if (ph_price <= max_hedge_price and
-                    ph_price <= self.max_individual_price and
-                    not ph_tracker.is_falling_knife):
-
-                deficit = self.deficit()
-                target_qty = deficit * self.preemptive_hedge_fraction
-
-                if target_qty * ph_price >= self.min_trade_size:
-                    qty = self._calculate_trade_size(ph_side, ph_price, ph_fair, 1.0, is_hedge=True)
-                    qty = min(qty, target_qty)
-
-                    if qty * ph_price >= self.min_trade_size:
-                        projected_mgp = self.mgp_after_buy(ph_side, ph_price, qty)
-                        if projected_mgp > mgp:
-                            ok, ap, aq = self.execute_buy(ph_side, ph_price, qty, timestamp)
-                            if ok:
-                                trades_made.append((ph_side, ap, aq))
-                                actual_mgp = self.calculate_locked_profit()
-                                self.current_mode = 'pre_hedge'
-                                self.mode_reason = (f'🔄 PRE-HEDGE {ph_side} {aq:.1f}sh@${ap:.3f} | '
-                                                    f'Δ {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}')
-                                print(f"🔄 PRE-HEDGE: {ph_side} {aq:.1f}×${ap:.3f} | "
-                                      f"Δ {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}")
-                                self._record_history()
-                                return trades_made
-
-        # ════════════════════════════════════════════════════════
-        #  HEDGE MODE — Position is unbalanced, prioritize hedging
-        #  v6.2: Only hedge when arb exists (combined < BE) or forced
-        #  Without arb, hedging worsens MGP → just wait for dip
-        # ════════════════════════════════════════════════════════
-
-        if priority != 'NEUTRAL':
-            hedge_side = 'UP' if priority == 'PRIORITIZE_UP' else 'DOWN'
-            hedge_price = up_price if hedge_side == 'UP' else down_price
-            hedge_fair = fair_up if hedge_side == 'UP' else fair_down
-            hedge_z = z_up if hedge_side == 'UP' else z_down
-            hedge_tracker = self.up_tracker if hedge_side == 'UP' else self.down_tracker
-            z_threshold = self._get_hedge_z_threshold()
-
-            # v6.2: Use arb-adjusted fair for hedge sizing
-            other_price = down_price if hedge_side == 'UP' else up_price
-            hedge_fair = self._arb_adjusted_fair(hedge_side, hedge_price, other_price, hedge_fair)
-
-            delta = self.position_delta_pct
-            pnl_up = self.calculate_pnl_if_up_wins()
-            pnl_down = self.calculate_pnl_if_down_wins()
-            worst_pnl = min(pnl_up, pnl_down)
-
-            max_hedge_price = self.max_price_for_positive_mgp()
-
-            # Forced hedge: delta is critical — buy at market if price OK
-            if delta >= self.forced_hedge_delta:
-                urgency = 2.0
-                adjusted_fair = max(hedge_fair, hedge_price * 1.05)
-                qty = self._calculate_trade_size(hedge_side, hedge_price, adjusted_fair, urgency, is_hedge=True)
-
-                # Accept if price reasonable OR if buying improves MGP
-                projected = self.mgp_after_buy(hedge_side, hedge_price, max(qty, 1.0))
-                price_ok = (hedge_price <= min(max_hedge_price * 1.10, 0.80) or
-                            projected > mgp)
-
-                if qty * hedge_price >= self.min_trade_size and price_ok:
-                    ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
-                    if ok:
-                        trades_made.append((hedge_side, ap, aq))
-                        new_mgp = self.calculate_locked_profit()
-                        self.current_mode = 'forced_hedge'
-                        self.mode_reason = (f'🚨 FORCED HEDGE {hedge_side} {aq:.1f}sh@${ap:.3f} | '
-                                            f'Δ {self.position_delta_pct:.0f}% | MGP ${new_mgp:.2f}')
-                        print(f"🚨 FORCED HEDGE: {hedge_side} {aq:.1f}×${ap:.3f} | "
-                              f"delta {delta:.0f}%→{self.position_delta_pct:.0f}% | MGP ${new_mgp:.2f}")
-                        self._record_history()
-                        return trades_made
-                elif not price_ok:
-                    self.current_mode = 'hedge_too_expensive'
-                    self.mode_reason = (f'💸 {hedge_side} @${hedge_price:.3f} too expensive '
-                                        f'(max ${max_hedge_price:.3f}) | Δ {delta:.0f}% | MGP ${mgp:.2f}')
-                    self._record_history()
-                    return trades_made
-
-            # Normal hedge: check z-threshold and price cap
-            hedge_is_reversing = hedge_tracker.is_reversing or hedge_tracker.reversal_score > 30
-            if hedge_is_reversing:
-                z_threshold = max(z_threshold, 0.0)
-                hedge_urgency_boost = 1.3
-            else:
-                hedge_urgency_boost = 1.0
-
-            if hedge_z <= z_threshold and hedge_price <= self.max_individual_price:
-                # Price cap: use mgp_after_buy to check if this hedge IMPROVES our position
-                # Don't require positive MGP — just require improvement or acceptable loss
-                max_hedge_price = self.max_price_for_positive_mgp()
-                projected_mgp = self.mgp_after_buy(hedge_side, hedge_price, 1.0)
-                hedge_improves = projected_mgp > mgp  # Does buying 1 share improve MGP?
-                price_acceptable = hedge_price <= max_hedge_price * 1.05 or hedge_improves
-
-                if price_acceptable:
-                    urgency = (1.5 if delta > self.urgent_hedge_delta else 1.2) * hedge_urgency_boost
-                    qty = self._calculate_trade_size(hedge_side, hedge_price, hedge_fair, urgency, is_hedge=True)
-
-                    if qty * hedge_price >= self.min_trade_size:
-                        new_mgp = self.mgp_after_buy(hedge_side, hedge_price, qty)
-
-                        ok, ap, aq = self.execute_buy(hedge_side, hedge_price, qty, timestamp)
-                        if ok:
-                            trades_made.append((hedge_side, ap, aq))
-                            actual_mgp = self.calculate_locked_profit()
-                            lock_tag = " 🔒" if self.both_scenarios_positive() else ""
-                            rev_tag = " 🔄" if hedge_is_reversing else ""
-                            self.current_mode = 'hedging'
-                            self.mode_reason = (f'⚖️ HEDGE {hedge_side} {aq:.1f}sh@${ap:.3f} | '
-                                                f'z={hedge_z:+.1f} | Δ {self.position_delta_pct:.0f}% | '
-                                                f'MGP ${actual_mgp:.2f}{lock_tag}{rev_tag}')
-                            print(f"⚖️ HEDGE: {hedge_side} {aq:.1f}×${ap:.3f} | z={hedge_z:+.1f} | "
-                                  f"delta {self.position_delta_pct:.0f}% | MGP ${actual_mgp:.2f}{lock_tag}{rev_tag}")
-                            self._record_history()
-                            return trades_made
-
-            rev_info = f" | rev={hedge_tracker.reversal_score:.0f}" if hedge_tracker.reversal_score > 0 else ""
-            hmax = f" | maxP=${max_hedge_price:.2f}" if max_hedge_price < 0.9 else ""
-            self.current_mode = 'waiting_hedge'
-            self.mode_reason = (f'⏳ Need {hedge_side} hedge | z={hedge_z:+.1f} (need <{z_threshold:+.1f}) | '
-                                f'Δ {self.position_delta_pct:.0f}% | PnL worst ${worst_pnl:.2f}{rev_info}{hmax}')
-            self._record_history()
-            return trades_made
-
-        # ════════════════════════════════════════════════════════
-        #  ENTRY MODE v6.2 — Enter-and-Work Strategy
+        #  ENTRY MODE v8.5 — Price-Range Only
         #
-        #  KEY CHANGE: Don't wait for arb — enter the market NOW.
-        #  Buy the likely winner, then hedge when the other side dips.
-        #
-        #  Rules:
-        #  1. ENTER IMMEDIATELY: Buy winner side on first opportunity
-        #  2. WAIT FOR HEDGE: Watch for combined dip to pair up
-        #  3. QTY RATIO CAP: Never let one side exceed 1.5× the other
-        #  4. MGP CHECK: Every trade must improve or maintain MGP
-        #  5. ARB GATE ON SECOND LEG: Only add to position when arb exists
+        #  SIMPLE RULE: Only buy the winner when price is $0.57-$0.62.
+        #  No pair trades, no hedging, no loser buys.
+        #  Entry → Hold → Pivot on flip → Equalize after 6 pivots.
         # ════════════════════════════════════════════════════════
 
-        # ── Step 1: (No arb check already done above) ──
-
-        # ── Step 2: Determine likely winner and roles ──
+        # ── Determine likely winner ──
         likely_winner = 'DOWN' if down_price > up_price else 'UP'
-        likely_loser = 'UP' if likely_winner == 'DOWN' else 'DOWN'
         winner_price = down_price if likely_winner == 'DOWN' else up_price
-        loser_price = up_price if likely_winner == 'DOWN' else down_price
         winner_z = z_down if likely_winner == 'DOWN' else z_up
-        loser_z = z_up if likely_winner == 'DOWN' else z_down
         winner_fair = fair_down if likely_winner == 'DOWN' else fair_up
-        loser_fair = fair_up if likely_winner == 'DOWN' else fair_down
         winner_tracker = self.down_tracker if likely_winner == 'DOWN' else self.up_tracker
-        loser_tracker = self.up_tracker if likely_winner == 'DOWN' else self.down_tracker
 
-        # ── Arb-adjusted fair values (v6.1) ──
-        #  Use pair-aware fair value instead of raw EMA.
-        #  This ensures Kelly sees the arb edge, not just the EMA lag.
-        winner_fair = self._arb_adjusted_fair(likely_winner, winner_price, loser_price, winner_fair)
-        loser_fair = self._arb_adjusted_fair(likely_loser, loser_price, winner_price, loser_fair)
+        # ── v8.5 PRICE GATE: Only buy if winner price is $0.57-$0.62 ──
+        price_in_range = self.buy_price_min <= winner_price <= self.buy_price_max
 
-        # ── Step 3: Calculate qty ratio constraint ──
-        qty_winner = self.qty_down if likely_winner == 'DOWN' else self.qty_up
-        qty_loser = self.qty_up if likely_winner == 'DOWN' else self.qty_down
-
-        can_buy_loser = True
-        can_buy_winner = True
-
-        # ── WINNER-FIRST RULE: No position → ONLY consider winner ──
-        #  In prediction markets, cheap = likely to lose.
-        #  Starting with the loser is catastrophic (the old bug).
-        #  Starting with the winner is safe even if we can't hedge.
-        if not has_position:
-            can_buy_loser = False  # Force winner-first entry
-
-        # ── With position: prefer the SMALLER side to balance ──
-        #  When arb exists, prioritize buying the side we have less of.
-        #  When market flipped (pivot), only buy the new winner.
-        if has_position and (has_arb_opportunity or self._pivot_mode):
-            if self._pivot_mode:
-                # Pivot: ONLY buy the new winner to rebalance
-                can_buy_winner = True
-                can_buy_loser = False
-            else:
-                smaller = self.smaller_side()
-                if smaller == likely_loser:
-                    # Need more loser to balance → allow it
-                    can_buy_loser = True
-                    can_buy_winner = False  # Focus on balancing
-
-        if has_position:
-            # Don't let the loser side get ahead of winner
-            if qty_loser > 0 and qty_winner > 0:
-                ratio = qty_loser / qty_winner
-                if ratio >= self.max_qty_ratio:
-                    can_buy_loser = False  # Already have too much loser side
-            elif qty_loser > 0 and qty_winner == 0:
-                # We somehow have loser side but no winner — ONLY buy winner
-                can_buy_loser = False
-            # Winner side can always be ahead (it's more likely to pay out)
-
-        # ── Step 4: Price caps per role ──
-        if winner_price > self.winner_entry_price_max:
-            can_buy_winner = False
-        if loser_price > self.loser_entry_price_max:
-            can_buy_loser = False
-
-        # ── Step 5: Build candidate list with pair-aware scoring ──
         candidates = []
 
-        # Evaluate winner side — RELAXED z threshold (winner naturally trends up)
-        winner_z_threshold = self.z_entry_winner  # +0.5 (allow buying even slightly above EMA)
-        if can_buy_winner and winner_z <= winner_z_threshold:
-            if not (self.require_momentum_confirm and winner_tracker.is_falling_knife and
-                    winner_z > self.falling_knife_override_z):
-                quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
-                                               winner_fair, winner_tracker, arb_margin,
-                                               is_likely_winner=True)
+        if price_in_range:
+            if not has_position:
+                # Initial entry — buy winner
+                quality = 65.0
+                candidates.append((likely_winner, winner_z, winner_price, winner_fair,
+                                   winner_tracker, quality))
+            elif self._pivot_mode:
+                # Pivot entry — buy new winner to rebalance
+                quality = 75.0
                 candidates.append((likely_winner, winner_z, winner_price, winner_fair,
                                    winner_tracker, quality))
 
-        # Evaluate loser side — STRICT z threshold (cheap ≠ oversold in prediction markets!)
-        loser_z_threshold = self.z_entry_loser  # -1.5 (must be genuinely distressed)
-        if can_buy_loser and loser_z <= loser_z_threshold:
-            if not (self.require_momentum_confirm and loser_tracker.is_falling_knife and
-                    loser_z > self.falling_knife_override_z):
-                quality = self._score_entry_v6(likely_loser, loser_z, loser_price,
-                                               loser_fair, loser_tracker, arb_margin,
-                                               is_likely_winner=False)
-                # Loser needs higher threshold AND reversal hint
-                if quality >= 35:
-                    candidates.append((likely_loser, loser_z, loser_price, loser_fair,
-                                       loser_tracker, quality))
-
-        # ── WINNER-FIRST: If no position, buy winner WITHOUT z requirement ──
-        #  Enter the market immediately. Don't wait for arb or z-score.
-        #  Winner naturally trends up → high z is NORMAL, not a reason to skip.
-        #  We enter now and hedge later when the loser side dips.
-        if self.winner_first_enabled and not has_position:
-            if winner_price <= self.winner_entry_price_max:
-                # Winner side doesn't need to be oversold for first entry
-                already_in = any(c[0] == likely_winner for c in candidates)
-                if not already_in:
-                    quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
-                                                   winner_fair, winner_tracker, arb_margin,
-                                                   is_likely_winner=True)
-                    quality += 15  # Bonus for being our first trade on the winner
-                    candidates.append((likely_winner, winner_z, winner_price, winner_fair,
-                                       winner_tracker, quality))
-
-        # ── PIVOT ENTRY (v6.3): Market flipped → buy new winner to rebalance ──
-        #  Skip z-score requirement — this is a risk-reduction trade.
-        #  The market has decided our side is losing. Buy the new winner.
-        if self._pivot_mode and has_position:
-            if winner_price <= self.pivot_entry_price_max:
-                already_in = any(c[0] == likely_winner for c in candidates)
-                if not already_in:
-                    quality = self._score_entry_v6(likely_winner, winner_z, winner_price,
-                                                   winner_fair, winner_tracker, arb_margin,
-                                                   is_likely_winner=True)
-                    quality += 25  # High priority — pivoting to reduce risk
-                    candidates.append((likely_winner, winner_z, winner_price, winner_fair,
-                                       winner_tracker, quality))
-
-        # Time pressure: relax thresholds in final quarter
-        if time_to_close is not None and time_to_close < 225 and not candidates:
-            relaxed_z = self.z_entry + 0.3
-            for side, z, price, fair, tracker in [
-                (likely_winner, winner_z, winner_price, winner_fair, winner_tracker),
-                (likely_loser, loser_z, loser_price, loser_fair, loser_tracker),
-            ]:
-                if z <= relaxed_z and price <= self.max_individual_price:
-                    quality = self._score_entry_v6(side, z, price, fair, tracker,
-                                                   arb_margin, side == likely_winner)
-                    candidates.append((side, z, price, fair, tracker, quality))
-
         if not candidates:
-            up_knife = "🔪" if self.up_tracker.is_falling_knife else ""
-            dn_knife = "🔪" if self.down_tracker.is_falling_knife else ""
-            ratio_tag = f" | ratio={qty_loser:.0f}:{qty_winner:.0f}" if has_position else ""
-            # Reset pivot state if we were pivoting but couldn't find candidate
+            # Reset pivot state if we were pivoting but price not in range
             if self._pivot_mode:
                 self.current_mode = 'pivot_blocked'
-                self.mode_reason = (f'🚫 Pivot blocked: winner price too high | '
-                                    f'UP ${up_price:.2f} DN ${down_price:.2f}{ratio_tag}')
+                self.mode_reason = (f'🚫 Pivot blocked: price ${winner_price:.2f} not in '
+                                    f'${self.buy_price_min:.2f}-${self.buy_price_max:.2f} | '
+                                    f'UP ${up_price:.2f} DN ${down_price:.2f}')
                 self._pivot_mode = False
                 self._pending_pivot_is_new = False
-                # Clear pending pivot so next attempt counts as NEW pivot
                 self._pending_pivot_side = None
                 self._pending_pivot_target = 0.0
             else:
                 self.current_mode = 'scanning'
-                self.mode_reason = (f'👁 Scanning | UP ${up_price:.2f}{up_knife} DOWN ${down_price:.2f}{dn_knife} | '
-                                    f'margin ${arb_margin:.3f}{ratio_tag}')
+                self.mode_reason = (f'👁 Scanning | UP ${up_price:.2f} DN ${down_price:.2f} | '
+                                    f'need ${self.buy_price_min:.2f}-${self.buy_price_max:.2f}')
             self._record_history()
             return trades_made
 
-        # ── Step 6: Select best candidate ──
+        # ── Select best candidate ──
         candidates.sort(key=lambda c: c[5], reverse=True)
         buy_side, buy_z, buy_price, buy_fair, buy_tracker, quality = candidates[0]
 
-        # ── Step 7: Calculate size with pair-aware urgency ──
-        urgency = 1.0
+        # ── Calculate trade size (v8.5) ──
 
-        # Strong oversold + arb margin → bigger trade
-        if buy_z <= self.z_strong_entry:
-            urgency *= 1.2
-        if arb_margin > 0.02:  # > 2 cent margin
-            urgency *= 1.2
-
-        # Reversal confirmation → boost
-        if buy_tracker.is_reversing or buy_tracker.reversal_score > self.reversal_score_min:
-            urgency *= self.reversal_boost_multiplier
-
-        # Buying the larger side → reduce size (worsens balance)
-        if has_position:
-            if ((buy_side == 'UP' and self.qty_up > self.qty_down * 1.1) or
-                    (buy_side == 'DOWN' and self.qty_down > self.qty_up * 1.1)):
-                urgency *= 0.5
-
-        qty = self._calculate_trade_size(buy_side, buy_price, buy_fair, urgency)
-
-        # ── INITIAL BUY: force exactly $5 (v6.5) ──
+        # ── INITIAL BUY: force exactly $5 ──
         if not has_position and not self._pivot_mode:
             qty = self.initial_buy_dollars / buy_price if buy_price > 0 else 0
             qty = min(qty, self.max_shares_per_order)
@@ -1683,40 +1276,10 @@ class ArbitrageStrategy:
             self._record_history()
             return trades_made
 
-        # ── Step 7b: Post-trade ratio check (NEW v6.1) ──
-        #  Prevent trades that would create excessive imbalance.
-        #  Skip for pivots — pivot IS the intentional rebalancing.
-        if has_position and not self._pivot_mode:
-            post_qty_this = (self.qty_up if buy_side == 'UP' else self.qty_down) + qty
-            post_qty_other = self.qty_down if buy_side == 'UP' else self.qty_up
-            if post_qty_other > 0 and buy_side == likely_loser:
-                post_ratio = post_qty_this / post_qty_other
-                if post_ratio > self.max_qty_ratio:
-                    # Cap qty to stay within ratio
-                    max_allowed = post_qty_other * self.max_qty_ratio - (post_qty_this - qty)
-                    if max_allowed < self.min_trade_size / buy_price:
-                        self.current_mode = 'scanning'
-                        self.mode_reason = (f'⚠️ Ratio cap: {buy_side} would exceed '
-                                            f'{self.max_qty_ratio:.1f}:1 ratio')
-                        self._record_history()
-                        return trades_made
-                    qty = max_allowed
-
-        # ── Step 8: MGP protection (skip for pivots — we accept cost to follow market) ──
-        if has_position and not self._pivot_mode:
-            projected_mgp = self.mgp_after_buy(buy_side, buy_price, qty)
-            if projected_mgp < mgp - 2.0:
-                self.current_mode = 'scanning'
-                self.mode_reason = (f'⚠️ Skipped {buy_side} — would drop MGP by ${mgp - projected_mgp:.2f}')
-                self._record_history()
-                return trades_made
-
-        # ── Step 9: Execute ──
-        kelly_f = self._kelly_fraction(buy_price, buy_fair)
-        role_tag = "👑" if buy_side == likely_winner else "🎲"
-        rev_tag = f" REV={buy_tracker.reversal_score:.0f}" if buy_tracker.reversal_score > 15 else ""
+        # ── Execute ──
+        role_tag = "👑"
         print(f"📊 SIGNAL: {role_tag} {buy_side} z={buy_z:+.2f} | ${buy_price:.3f} | "
-              f"margin=${arb_margin:.3f} | Kelly={kelly_f:.3f} | qty={qty:.1f} | Q={quality:.0f}{rev_tag}")
+              f"qty={qty:.1f} | Q={quality:.0f}")
 
         ok, ap, aq = self.execute_buy(buy_side, buy_price, qty, timestamp)
         if ok:
@@ -1736,11 +1299,11 @@ class ArbitrageStrategy:
             mgp_new = self.calculate_locked_profit()
             lock_tag = " 🔒" if self.both_scenarios_positive() else ""
             pivot_tag = f" 🔄PIVOT#{self._pivot_count}" if self._pivot_mode else ""
-            self.current_mode = 'pivoting' if self._pivot_mode else 'pair_building'
+            self.current_mode = 'pivoting' if self._pivot_mode else 'entry'
             self.mode_reason = (f'{role_tag} BUY {buy_side} {aq:.1f}sh@${ap:.3f} | '
-                                f'margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}')
+                                f'MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}')
             print(f"🎯 TRADE #{self.trade_count}: {role_tag} {buy_side} {aq:.1f}×${ap:.3f} | "
-                  f"margin=${arb_margin:.3f} | MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}")
+                  f"MGP ${mgp_new:.2f} | Q={quality:.0f}{lock_tag}{pivot_tag}")
 
             # ── POST-PIVOT EQUALIZE (v7.0) ──
             #  After the Nth pivot, immediately buy the weak side at the CHEAP
