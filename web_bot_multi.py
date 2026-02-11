@@ -105,6 +105,7 @@ HTML_TEMPLATE = """
         
         .profit { color: #22c55e; }
         .loss { color: #ef4444; }
+        .neutral { color: #9ca3af; }
         .neutral { color: #3b82f6; }
         
         .markets-grid {
@@ -235,16 +236,53 @@ HTML_TEMPLATE = """
             margin-top: 20px;
         }
         
-        .history-section h2 {
-            color: #3b82f6;
-            margin-bottom: 10px;
-            font-size: 18px;
+        .history-section {
+            margin-top: 30px;
+            background: #111827;
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #1f2937;
         }
-        
-        .history-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
+        .history-section h2 {
+            margin-top: 0;
+            color: #f59e0b;
+        }
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .collapse-btn {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #374151;
+            background: #0b1220;
+            color: #9ca3af;
+            cursor: pointer;
+        }
+        .collapse-btn:hover {
+            color: #e5e7eb;
+            border-color: #4b5563;
+        }
+        .history-section.collapsed table {
+            display: none;
+        }
+        .sell-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            margin-left: 6px;
+        }
+        .sell-badge-active {
+            background: #b91c1c;
+            color: #fff;
+        }
+        .sell-badge-none {
+            background: #0f172a;
+            color: #94a3b8;
         }
         
         .history-table th,
@@ -511,9 +549,12 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
-        <div class="history-section">
-            <h2>📜 Resolved Markets History</h2>
-            <table class="history-table">
+        <div class="history-section" id="resolved-history-section">
+            <div class="section-header">
+                <h2>📜 Resolved Markets History</h2>
+                <button class="collapse-btn" id="resolved-toggle" onclick="toggleResolvedHistory()">Hide</button>
+            </div>
+            <table class="history-table" id="resolved-history-table">
                 <thead>
                     <tr>
                         <th>Time</th>
@@ -542,6 +583,7 @@ HTML_TEMPLATE = """
                     <tr>
                         <th>Time</th>
                         <th>Asset</th>
+                        <th>Action</th>
                         <th>Side</th>
                         <th>Price</th>
                         <th>Qty</th>
@@ -551,7 +593,7 @@ HTML_TEMPLATE = """
                 </thead>
                 <tbody id="trade-log-body">
                     <tr>
-                        <td colspan="7" style="text-align: center; color: #888;">No trades yet</td>
+                        <td colspan="8" style="text-align: center; color: #888;">No trades yet</td>
                     </tr>
                 </tbody>
             </table>
@@ -574,6 +616,14 @@ HTML_TEMPLATE = """
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
             }
+        }
+
+        function toggleResolvedHistory() {
+            const section = document.getElementById('resolved-history-section');
+            const btn = document.getElementById('resolved-toggle');
+            if (!section || !btn) return;
+            const isCollapsed = section.classList.toggle('collapsed');
+            btn.textContent = isCollapsed ? 'Show' : 'Hide';
         }
         
         function connect() {
@@ -919,12 +969,24 @@ HTML_TEMPLATE = """
                     const finalPnl = pt.final_pnl ?? 0;
                     const finalGross = pt.final_pnl_gross ?? finalPnl;
                     const feesPaid = pt.fees_paid ?? 0;
+                    const activeSells = pt.active_sells || [];
+                    const filledSells = pt.filled_sells || [];
+                    const activeSellText = activeSells.length
+                        ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
+                        : 'none';
+                    const filledSellText = filledSells.length
+                        ? filledSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.fill_price.toFixed(3)}`).join(' | ')
+                        : 'none';
+                    const sellBadge = activeSells.length
+                        ? `<span class="sell-badge sell-badge-active">SELLS ${activeSells.length}</span>`
+                        : `<span class="sell-badge sell-badge-none">SELLS 0</span>`;
                     
                     html += `
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
                             <div class="market-header">
                                 <span class="asset-badge asset-${market.asset}">${asset}</span>
                                 <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
+                                ${sellBadge}
                             </div>
                             <div style="font-size: 11px; color: #888; margin-bottom: 6px;">
                                 ${market.window_time || slug}
@@ -977,6 +1039,12 @@ HTML_TEMPLATE = """
                                 <div class="holding-item">
                                     <div class="holding-label">Pivots</div>
                                     <div class="holding-value" style="color: ${pt.pivot_count === 0 ? '#888' : pt.equalized ? '#ef4444' : '#3b82f6'};">🔄 ${pt.pivot_count || 0}/${pt.max_pivots || 4}${pt.equalized ? ' ⚖️' : ''}</div>
+                                </div>
+                                <div class="holding-item" style="grid-column: span 2;">
+                                    <div class="holding-label">Active Sells</div>
+                                    <div class="holding-label" style="color: #9ca3af;">${activeSellText}</div>
+                                    <div class="holding-label" style="margin-top: 4px;">Filled Sells</div>
+                                    <div class="holding-label" style="color: #22c55e;">${filledSellText}</div>
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Trades</div>
@@ -1195,19 +1263,23 @@ HTML_TEMPLATE = """
             // Update trade log
             const tradeLogBody = document.getElementById('trade-log-body');
             if (!data.trade_log || data.trade_log.length === 0) {
-                tradeLogBody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #888;">No trades yet</td></tr>';
+                tradeLogBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #888;">No trades yet</td></tr>';
             } else {
                 let html = '';
                 for (const t of data.trade_log.slice().reverse()) {
+                    const action = t.action || 'BUY';
+                    const actionClass = action === 'SELL' ? 'loss' : action === 'SELL_PLACED' ? 'neutral' : 'profit';
                     const sideClass = t.side === 'UP' ? 'profit' : 'loss';
+                    const costCell = (action === 'SELL_PLACED') ? '-' : `$${t.cost.toFixed(2)}`;
                     html += `
                         <tr>
                             <td>${t.time}</td>
                             <td><span class="asset-badge asset-${t.asset.toLowerCase()}" style="font-size: 10px;">${t.asset}</span></td>
+                            <td class="${actionClass}">${action}</td>
                             <td class="${sideClass}">${t.side}</td>
                             <td>$${t.price.toFixed(3)}</td>
                             <td>${t.qty.toFixed(1)}</td>
-                            <td>$${t.cost.toFixed(2)}</td>
+                            <td>${costCell}</td>
                             <td>$${t.pair_cost.toFixed(3)}</td>
                         </tr>
                     `;
@@ -4022,26 +4094,33 @@ class MultiMarketBot:
                 )
                 
                 if trades:
-                    for side, actual_price, actual_qty in trades:
+                    for trade in trades:
+                        if len(trade) == 4:
+                            action, side, actual_price, actual_qty = trade
+                        else:
+                            side, actual_price, actual_qty = trade
+                            action = 'BUY'
                         pt = tracker.paper_trader
                         urgency_msg = f" [⚠️ {time_to_close:.0f}s left!]" if time_to_close and time_to_close < 300 else ""
-                        print(f"📈 [{tracker.asset.upper()}] BUY {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f} | {fetch_latency_ms:.0f}ms{urgency_msg}")
+                        print(f"📈 [{tracker.asset.upper()}] {action} {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f} | {fetch_latency_ms:.0f}ms{urgency_msg}")
                         
-                        # Add to trade log (actual fill data from execution simulator)
+                        # Add to trade log
+                        cost_value = actual_price * actual_qty if action in ('BUY', 'SELL') else 0.0
                         self.trade_log.append({
                             'time': timestamp,
                             'asset': tracker.asset.upper(),
                             'market': tracker.slug,
+                            'action': action,
                             'side': side,
                             'price': actual_price,
                             'qty': actual_qty,
-                            'cost': actual_price * actual_qty,
+                            'cost': cost_value,
                             'pair_cost': pt.pair_cost
                         })
                         
-                        # Keep only last 50 trades
-                        if len(self.trade_log) > 50:
-                            self.trade_log = self.trade_log[-50:]
+                        # Keep only last 1000 trades
+                        if len(self.trade_log) > 1000:
+                            self.trade_log = self.trade_log[-1000:]
             
             tracker.last_update = time.time()
             
@@ -4269,8 +4348,8 @@ class MultiMarketBot:
                         'total_locked_profit': total_locked_profit,
                         'active_markets': active_data,
                         'history': self.history,
-                        # Only show trades from currently active (non-resolved) markets
-                        'trade_log': [t for t in self.trade_log if t.get('market') in newest_slugs],
+                        # Show full trade log across all markets
+                        'trade_log': self.trade_log,
                         'paused': self.paused,
                         'asset_wdl': asset_wdl,
                         'supported_assets': SUPPORTED_ASSETS,

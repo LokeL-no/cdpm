@@ -387,6 +387,232 @@ class ExecutionSimulator:
         )
 
     # ══════════════════════════════════════════════════════════════
+    #  CORE: Simulate a SELL (limit) against the order book
+    # ══════════════════════════════════════════════════════════════
+
+    def simulate_sell(
+        self,
+        side: str,
+        min_price: float,
+        qty: float,
+        orderbook: Optional[dict],
+    ) -> FillResult:
+        """
+        Simulate executing a SELL order of `qty` shares at >= `min_price`
+        against the provided order book.
+
+        We walk the BID side of the book (highest bid first).
+        Only fills at prices >= min_price (limit sell behavior).
+
+        Args:
+            side: 'UP' or 'DOWN'
+            min_price: Minimum acceptable sell price (limit price)
+            qty: Number of shares to sell
+            orderbook: Dict with 'asks' and 'bids' lists from Polymarket CLOB
+
+        Returns:
+            FillResult with all execution details
+        """
+        timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+        latency_applied = self.latency_ms
+
+        # ── No order book data → reject ──
+        if not orderbook or not orderbook.get('bids'):
+            self.total_rejections += 1
+            self._side_stats[side]['rejections'] += 1
+            return FillResult(
+                filled=False,
+                desired_price=min_price,
+                fill_price=0.0,
+                desired_qty=qty,
+                filled_qty=0.0,
+                partial=False,
+                slippage=0.0,
+                slippage_pct=0.0,
+                slippage_cost=0.0,
+                total_cost=0.0,
+                theoretical_cost=min_price * qty,
+                latency_ms=latency_applied,
+                book_depth_at_best=0.0,
+                levels_consumed=0,
+                fill_details=[],
+                reason="No bids in order book – cannot sell",
+                timestamp=timestamp,
+            )
+
+        # ── Parse and sort bids (descending by price — best bid first) ──
+        bids = self._parse_book_side(orderbook.get('bids', []))
+        if not bids:
+            self.total_rejections += 1
+            self._side_stats[side]['rejections'] += 1
+            return FillResult(
+                filled=False,
+                desired_price=min_price,
+                fill_price=0.0,
+                desired_qty=qty,
+                filled_qty=0.0,
+                partial=False,
+                slippage=0.0,
+                slippage_pct=0.0,
+                slippage_cost=0.0,
+                total_cost=0.0,
+                theoretical_cost=min_price * qty,
+                latency_ms=latency_applied,
+                book_depth_at_best=0.0,
+                levels_consumed=0,
+                fill_details=[],
+                reason="Could not parse order book bids",
+                timestamp=timestamp,
+            )
+
+        # Sort bids descending (highest bidder first)
+        bids.sort(key=lambda x: x['price'], reverse=True)
+
+        best_bid_price = bids[0]['price']
+        book_depth_at_best = bids[0]['size']
+
+        # ── Latency penalty: some top-of-book bids may get consumed ──
+        latency_decay_factor = 1.0 - min(0.15, self.latency_ms / 200.0)
+        bids[0]['size'] *= latency_decay_factor
+
+        # ── Walk the book (only fill at prices >= min_price) ──
+        remaining_qty = qty
+        total_proceeds = 0.0
+        fill_details = []
+        levels_consumed = 0
+
+        for level in bids:
+            if remaining_qty <= 0:
+                break
+
+            level_price = level['price']
+            level_size = level['size']
+
+            # Limit sell: skip bids below our minimum price
+            if level_price < min_price:
+                break
+
+            if level_size <= 0:
+                continue
+
+            fill_at_level = min(remaining_qty, level_size)
+            proceeds_at_level = fill_at_level * level_price
+
+            fill_details.append({
+                'price': level_price,
+                'qty': fill_at_level,
+                'cost': proceeds_at_level,
+            })
+
+            total_proceeds += proceeds_at_level
+            remaining_qty -= fill_at_level
+            levels_consumed += 1
+
+        filled_qty = qty - remaining_qty
+        partial = remaining_qty > 0 and filled_qty > 0
+
+        if filled_qty <= 0:
+            self.total_rejections += 1
+            self._side_stats[side]['rejections'] += 1
+            return FillResult(
+                filled=False,
+                desired_price=min_price,
+                fill_price=best_bid_price,
+                desired_qty=qty,
+                filled_qty=0.0,
+                partial=False,
+                slippage=0.0,
+                slippage_pct=0.0,
+                slippage_cost=0.0,
+                total_cost=0.0,
+                theoretical_cost=min_price * qty,
+                latency_ms=latency_applied,
+                book_depth_at_best=book_depth_at_best,
+                levels_consumed=0,
+                fill_details=[],
+                reason=f"Best bid ${best_bid_price:.4f} below min sell ${min_price:.4f}",
+                timestamp=timestamp,
+            )
+
+        # ── Calculate fill metrics ──
+        vwap_fill_price = total_proceeds / filled_qty
+        theoretical_proceeds = min_price * filled_qty
+        # For sells, positive slippage = we got MORE than min_price (good)
+        slippage = vwap_fill_price - min_price
+        slippage_pct = (slippage / min_price * 100) if min_price > 0 else 0.0
+        slippage_cost = slippage * filled_qty  # Positive = bonus proceeds
+
+        # ── Build reason string ──
+        if partial:
+            reason = (
+                f"PARTIAL SELL: {filled_qty:.1f}/{qty:.1f} shares "
+                f"@ ${vwap_fill_price:.4f} (min ${min_price:.4f}, "
+                f"{levels_consumed} level(s))"
+            )
+        elif abs(slippage) > 0.0001:
+            reason = (
+                f"Sell filled @ ${vwap_fill_price:.4f} "
+                f"(min ${min_price:.4f}, slip {slippage_pct:+.3f}%, "
+                f"{levels_consumed} level(s))"
+            )
+        else:
+            reason = f"Clean sell @ ${vwap_fill_price:.4f}"
+
+        # ── Update stats ──
+        self.total_fills += 1
+        self.total_filled_volume += filled_qty
+        self.total_theoretical_cost += theoretical_proceeds
+        self.total_actual_cost += total_proceeds
+
+        if partial:
+            self.total_partial_fills += 1
+            self._side_stats[side]['partials'] += 1
+
+        self._side_stats[side]['fills'] += 1
+        self._side_stats[side]['volume'] += filled_qty
+
+        # ── Log slippage event ──
+        if abs(slippage) > 0.00001 or partial:
+            event = SlippageEvent(
+                timestamp=timestamp,
+                side=side,
+                desired_price=min_price,
+                fill_price=vwap_fill_price,
+                desired_qty=qty,
+                filled_qty=filled_qty,
+                slippage=slippage,
+                slippage_pct=slippage_pct,
+                slippage_cost=slippage_cost,
+                levels_consumed=levels_consumed,
+                book_depth_at_best=book_depth_at_best,
+                partial=partial,
+                reason=reason,
+            )
+            self.slippage_log.append(event)
+
+        self._last_fill_time = time.time()
+
+        return FillResult(
+            filled=True,
+            desired_price=min_price,
+            fill_price=vwap_fill_price,
+            desired_qty=qty,
+            filled_qty=filled_qty,
+            partial=partial,
+            slippage=slippage,
+            slippage_pct=slippage_pct,
+            slippage_cost=slippage_cost,
+            total_cost=total_proceeds,
+            theoretical_cost=theoretical_proceeds,
+            latency_ms=latency_applied,
+            book_depth_at_best=book_depth_at_best,
+            levels_consumed=levels_consumed,
+            fill_details=fill_details,
+            reason=reason,
+            timestamp=timestamp,
+        )
+
+    # ══════════════════════════════════════════════════════════════
     #  CHECK FILLABILITY (without executing)
     # ══════════════════════════════════════════════════════════════
 
