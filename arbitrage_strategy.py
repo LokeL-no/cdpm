@@ -193,7 +193,7 @@ class ArbitrageStrategy:
     PIVOT_NET_PROFIT = 3.0
     MAX_PIVOTS = 5
     LOSS_PER_SHARE_ON_PIVOT = 0.10
-    CUTOFF_SECONDS = 720
+    CUTOFF_SECONDS = 180
     MIN_ENTRY_PRICE = 0.53
     MAX_ENTRY_PRICE = 0.58
 
@@ -602,7 +602,7 @@ class ArbitrageStrategy:
                                     f'Sold {sides_filled}')
 
                 for f in sell_fills:
-                    trades_made.append(('SELL', f['side'], f['price'], f['qty']))
+                    trades_made.append(('SELL', f['side'], f['price'], f['qty'], f['profit']))
 
                 self._record_history()
                 return trades_made

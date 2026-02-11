@@ -588,12 +588,13 @@ HTML_TEMPLATE = """
                         <th>Price</th>
                         <th>Qty</th>
                         <th>Cost</th>
+                        <th>Profit</th>
                         <th>Pair Cost</th>
                     </tr>
                 </thead>
                 <tbody id="trade-log-body">
                     <tr>
-                        <td colspan="8" style="text-align: center; color: #888;">No trades yet</td>
+                        <td colspan="9" style="text-align: center; color: #888;">No trades yet</td>
                     </tr>
                 </tbody>
             </table>
@@ -928,6 +929,7 @@ HTML_TEMPLATE = """
                     const drawPct = stats.total > 0 ? ((stats.draws / stats.total) * 100).toFixed(0) : '--';
                     const lossPct = stats.total > 0 ? ((stats.losses / stats.total) * 100).toFixed(0) : '--';
                     const pnl = stats.total_pnl || 0;
+                    const realized = stats.realized_profit || 0;
                     const pnlClass = pnl >= 0 ? 'profit' : 'loss';
                     const pnlSign = pnl >= 0 ? '+' : '';
                     
@@ -944,6 +946,9 @@ HTML_TEMPLATE = """
                             </div>
                             <div style="margin-top: 6px; font-size: 14px; font-weight: bold;" class="${pnlClass}">
                                 ${pnlSign}$${pnl.toFixed(2)}
+                            </div>
+                            <div style="margin-top: 4px; font-size: 11px; color: ${realized >= 0 ? '#22c55e' : '#ef4444'};">
+                                Locked profit: ${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}
                             </div>
                         </div>
                     `;
@@ -963,14 +968,16 @@ HTML_TEMPLATE = """
                     const statusClass = pt.market_status === 'open' ? 'status-open' : 
                                        pt.market_status === 'resolved' ? 'status-resolved' : 'status-closed';
                     
-                    const lockedPnl = typeof pt.locked_profit === 'number'
-                        ? pt.locked_profit
-                        : Math.min(pt.qty_up, pt.qty_down) - (pt.cost_up + pt.cost_down);
+                    const markUp = typeof market.up_price === 'number' ? market.up_price : 0;
+                    const markDown = typeof market.down_price === 'number' ? market.down_price : 0;
+                    const livePnl = (pt.qty_up * markUp) + (pt.qty_down * markDown)
+                        + (pt.total_sell_proceeds || 0) - (pt.cost_up + pt.cost_down);
                     const finalPnl = pt.final_pnl ?? 0;
                     const finalGross = pt.final_pnl_gross ?? finalPnl;
                     const feesPaid = pt.fees_paid ?? 0;
                     const activeSells = pt.active_sells || [];
                     const filledSells = pt.filled_sells || [];
+                    const lockedProfit = filledSells.reduce((sum, s) => sum + (s.profit || 0), 0);
                     const activeSellText = activeSells.length
                         ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
                         : 'none';
@@ -1105,11 +1112,11 @@ HTML_TEMPLATE = """
                             </div>
                             ` : ''}
                             <div class="market-pnl">
-                                ${pt.arb_locked ? `<div style="margin-bottom: 6px; padding: 4px 8px; background: rgba(34, 197, 94, 0.15); border: 1px solid #22c55e; border-radius: 4px; display: inline-block;"><span style="color: #22c55e; font-weight: bold; font-size: 12px;">🔒 ARBITRAGE LOCKED</span></div>` : (pt.deficit !== undefined && pt.deficit > 0 ? `<div style="margin-bottom: 6px; font-size: 10px; color: #f59e0b;">Deficit: ${pt.deficit.toFixed(1)} shares | Max lock price: $${(pt.max_price_for_lock || 0).toFixed(3)}</div>` : '')}
-                                <span style="color: #888;">MGP (Floor): </span>
-                                <span class="${lockedPnl >= 0 ? 'profit' : 'loss'}" style="font-weight: bold;">
-                                    ${lockedPnl >= 0 ? '+' : ''}$${lockedPnl.toFixed(2)}
+                                <span style="color: #888;">Live PnL: </span>
+                                <span class="${livePnl >= 0 ? 'profit' : 'loss'}" style="font-weight: bold;">
+                                    ${livePnl >= 0 ? '+' : ''}$${livePnl.toFixed(2)}
                                 </span>
+                                ${lockedProfit > 0.001 ? `<br><span style="color: #888;">Locked profit: </span><span class="profit" style="font-weight: bold;">+$${lockedProfit.toFixed(2)}</span>` : ''}
                                 ${pt.market_status === 'resolved' ? 
                                     `<br><span style="color: #3b82f6;">Outcome: ${pt.resolution_outcome} | Final: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}${Math.abs(finalGross - finalPnl) > 0.005 || feesPaid > 0 ? ` <span style="color:#888;">(gross $${finalGross.toFixed(2)} | fees $${feesPaid.toFixed(2)})</span>` : ''}</span>` 
                                     : ''}
@@ -1263,7 +1270,7 @@ HTML_TEMPLATE = """
             // Update trade log
             const tradeLogBody = document.getElementById('trade-log-body');
             if (!data.trade_log || data.trade_log.length === 0) {
-                tradeLogBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #888;">No trades yet</td></tr>';
+                tradeLogBody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: #888;">No trades yet</td></tr>';
             } else {
                 let html = '';
                 for (const t of data.trade_log.slice().reverse()) {
@@ -1271,6 +1278,12 @@ HTML_TEMPLATE = """
                     const actionClass = action === 'SELL' ? 'loss' : action === 'SELL_PLACED' ? 'neutral' : 'profit';
                     const sideClass = t.side === 'UP' ? 'profit' : 'loss';
                     const costCell = (action === 'SELL_PLACED') ? '-' : `$${t.cost.toFixed(2)}`;
+                    const profitCell = (action === 'SELL' && typeof t.profit === 'number')
+                        ? `${t.profit >= 0 ? '+' : ''}$${t.profit.toFixed(2)}`
+                        : '-';
+                    const profitClass = (action === 'SELL' && typeof t.profit === 'number')
+                        ? (t.profit >= 0 ? 'profit' : 'loss')
+                        : 'neutral';
                     html += `
                         <tr>
                             <td>${t.time}</td>
@@ -1280,6 +1293,7 @@ HTML_TEMPLATE = """
                             <td>$${t.price.toFixed(3)}</td>
                             <td>${t.qty.toFixed(1)}</td>
                             <td>${costCell}</td>
+                            <td class="${profitClass}">${profitCell}</td>
                             <td>$${t.pair_cost.toFixed(3)}</td>
                         </tr>
                     `;
@@ -4445,6 +4459,12 @@ class MultiMarketBot:
 
 
 if __name__ == '__main__':
+    bot = MultiMarketBot()
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped")
+        print("\n👋 Bot stopped")
     bot = MultiMarketBot()
     try:
         asyncio.run(bot.start())
