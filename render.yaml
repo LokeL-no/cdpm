@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: polymarket-multi-bot
+    runtime: python
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python web_bot_multi.py
+    envVars:
+      - key: STARTING_BALANCE
+        value: "800"
+      - key: PER_MARKET_BUDGET
+        value: "200"

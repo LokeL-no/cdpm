@@ -4870,12 +4870,16 @@ class MultiMarketBot:
         app = self.create_app()
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 8080)
+        try:
+            port = int(os.environ.get('PORT', '8080'))
+        except ValueError:
+            port = 8080
+        site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         
         print("🤖 Multi-Market Bot starting...")
         print(f"📊 Tracking: {', '.join(a.upper() for a in SUPPORTED_ASSETS)}")
-        print("🌐 Open http://localhost:8080 in your browser")
+        print(f"🌐 Open http://localhost:{port} in your browser")
         print("Press Ctrl+C to stop\n")
         
         await self.data_loop()

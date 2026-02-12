@@ -72,6 +72,16 @@ Dette er nyttig for å teste interface-et.
 
 Trykk `Ctrl+C` for å stoppe boten.
 
+## Deploy til Render
+
+Repoet inneholder nå en ferdig [render.yaml](render.yaml) som konfigurerer en Python-webtjeneste:
+
+1. Push endringene til GitHub og velg **New ➜ Blueprint** i Render-dashbordet (eller bruk `render blueprint launch`).
+2. Pek til repoet og branch `main`. Render leser `render.yaml`, kjører `pip install -r requirements.txt` og starter `python web_bot_multi.py`.
+3. Eventuelle miljøvariabler kan justeres i Render etter opprettelsen (for eksempel `STARTING_BALANCE` eller `PER_MARKET_BUDGET`).
+
+`web_bot_multi.py` lytter automatisk på porten som Render eksponerer via `PORT`, så ingen ekstra konfigurasjon er nødvendig.
+
 ## Lisens
 
 MIT
