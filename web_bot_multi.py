@@ -584,6 +584,41 @@ HTML_TEMPLATE = """
             color: #f9fafb;
             font-weight: 600;
         }
+        .fill-history {
+            margin-top: 10px;
+            padding: 10px;
+            background: #0f172a;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+        }
+        .fill-history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: #94a3af;
+            margin-bottom: 6px;
+        }
+        .fill-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 11px;
+            padding: 4px 0;
+            border-top: 1px solid rgba(148, 163, 184, 0.12);
+        }
+        .fill-row:first-child {
+            border-top: none;
+        }
+        .fill-left {
+            color: #e2e8f0;
+        }
+        .fill-right {
+            text-align: right;
+            color: #9ca3af;
+        }
+        .fill-action-buy { color: #60a5fa; }
+        .fill-action-sell { color: #22c55e; }
     </style>
 </head>
 <body>
@@ -880,6 +915,12 @@ HTML_TEMPLATE = """
                     const pillClass = state === 'PLACED' ? 'placed' : state === 'FILLED' ? 'filled' : state === 'CANCELLED' ? 'cancelled' : 'idle';
                     const basePrice = (info && typeof info.price === 'number') ? `$${Number(info.price).toFixed(3)}` : '--';
                     const baseQty = (info && typeof info.qty === 'number') ? `${Number(info.qty).toFixed(1)} sh` : '--';
+                    const displayPrice = (state === 'FILLED' && info && typeof info.fill_price === 'number')
+                        ? `$${Number(info.fill_price).toFixed(3)}`
+                        : basePrice;
+                    const displayQty = (state === 'FILLED' && info && typeof info.fill_qty === 'number')
+                        ? `${Number(info.fill_qty).toFixed(1)} sh`
+                        : baseQty;
                     let statusLine = 'Idle';
                     let detailLine = 'No resting order';
                     if (state === 'PLACED') {
@@ -901,7 +942,7 @@ HTML_TEMPLATE = """
                                 <span>${token} ${side === 'bid' ? 'BID' : 'ASK'}</span>
                                 ${badge}
                             </div>
-                            <div class="order-price">${basePrice}</div>
+                            <div class="order-price">${displayPrice}</div>
                             <div class="order-status">${statusLine}</div>
                             <div class="order-status" style="font-size:9px;">${detailLine}</div>
                         </div>
@@ -985,6 +1026,54 @@ HTML_TEMPLATE = """
                     <div class="order-event-feed">
                         ${eventRows}
                     </div>
+                </div>
+            `;
+        }
+
+        function renderFillHistory(fillHistory) {
+            const history = Array.isArray(fillHistory) ? fillHistory.slice(-6).reverse() : [];
+            if (!history.length) {
+                return `
+                    <div class="fill-history">
+                        <div class="fill-history-header">
+                            <span>🧾 Fill History</span>
+                            <span style="opacity:0.7;">No fills yet</span>
+                        </div>
+                        <div class="fill-row" style="opacity:0.6;">
+                            <div class="fill-left">Waiting for fills...</div>
+                            <div class="fill-right">--</div>
+                        </div>
+                    </div>
+                `;
+            }
+            const rows = history.map((fill) => {
+                const action = (fill.action || '').toUpperCase();
+                const actionClass = action === 'SELL' ? 'fill-action-sell' : 'fill-action-buy';
+                const time = fill.time || '--';
+                const token = fill.token || '--';
+                const qty = typeof fill.qty === 'number' ? fill.qty.toFixed(1) : '--';
+                const price = typeof fill.price === 'number' ? fill.price.toFixed(3) : '--';
+                const realized = typeof fill.realized_pnl === 'number' ? fill.realized_pnl : null;
+                const realizedText = realized !== null ? `${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}` : '';
+                const reason = fill.reason ? ` · ${String(fill.reason).replace(/_/g, ' ')}` : '';
+                return `
+                    <div class="fill-row">
+                        <div class="fill-left">
+                            <span class="${actionClass}">${action}</span>
+                            <span> ${token} ${qty}sh @ $${price}</span>
+                            <span style="color:#64748b;">${reason}</span>
+                        </div>
+                        <div class="fill-right">${realizedText || time}</div>
+                    </div>
+                `;
+            }).join('');
+            return `
+                <div class="fill-history">
+                    <div class="fill-history-header">
+                        <span>🧾 Fill History (last ${history.length})</span>
+                        <span>Newest first</span>
+                    </div>
+                    ${rows}
                 </div>
             `;
         }
@@ -1359,6 +1448,7 @@ HTML_TEMPLATE = """
                     const upOrderbookHtml = renderOrderbookTable(slug, 'UP', upOrderbook);
                     const downOrderbookHtml = renderOrderbookTable(slug, 'DOWN', downOrderbook);
                     const orderActivityHtml = renderOrderActivity(pt.order_activity, pt.recent_order_events);
+                    const fillHistoryHtml = renderFillHistory(pt.fill_history);
                     const activeSellText = activeSells.length
                         ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
                         : 'none';
@@ -1394,6 +1484,7 @@ HTML_TEMPLATE = """
                                 ${downOrderbookHtml}
                             </div>
                             ${orderActivityHtml}
+                            ${fillHistoryHtml}
                             <div class="holdings-row">
                                 <div class="holding-item">
                                     <div class="holding-label">Qty UP</div>
@@ -1416,8 +1507,9 @@ HTML_TEMPLATE = """
                             </div>
                             <div class="holdings-row-2">
                                 <div class="holding-item">
-                                    <div class="holding-label">Total Spent</div>
+                                    <div class="holding-label">Total Cost (Open)</div>
                                     <div class="holding-value" style="color: #f59e0b;">$${(pt.cost_up + pt.cost_down).toFixed(2)}</div>
+                                    <div class="holding-label" style="margin-top: 4px; color: #9ca3af;">Net invested: $${(pt.net_invested || 0).toFixed(2)}</div>
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Pair Cost</div>

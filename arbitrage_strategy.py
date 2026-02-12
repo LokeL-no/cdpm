@@ -395,9 +395,10 @@ class ArbitrageStrategy:
             self.current_mode = 'standby'
             self.mode_reason = self.quotes_paused_reason or 'Conditions not met'
 
-        trades.extend(
-            self._rebalance_if_needed(metrics_map, up_orderbook, down_orderbook, timestamp)
-        )
+        if time_to_close is None or time_to_close >= self.min_time_to_quote:
+            trades.extend(
+                self._rebalance_if_needed(metrics_map, up_orderbook, down_orderbook, timestamp)
+            )
 
         if time_to_close is not None and time_to_close < self.exit_time:
             trades.extend(
@@ -707,6 +708,8 @@ class ArbitrageStrategy:
             'price': fill.fill_price,
             'qty': fill.filled_qty,
             'reason': reason,
+            'fee': fee,
+            'total_cost': total_with_fee,
         })
 
         if token == 'UP':
@@ -739,6 +742,9 @@ class ArbitrageStrategy:
         proceeds = fill.total_cost
         fee = proceeds * FEE_RATE
         net_proceeds = proceeds - fee
+        avg_cost = self.avg_up if token == 'UP' else self.avg_down
+        cost_removed = avg_cost * fill.filled_qty
+        realized_pnl = net_proceeds - cost_removed
         self.cash += net_proceeds
         self.cash_in += net_proceeds
         self.total_sell_proceeds += net_proceeds
@@ -760,18 +766,20 @@ class ArbitrageStrategy:
             'price': fill.fill_price,
             'qty': fill.filled_qty,
             'reason': reason,
+            'fee': fee,
+            'gross_proceeds': proceeds,
+            'net_proceeds': net_proceeds,
+            'avg_cost': avg_cost,
+            'cost_removed': cost_removed,
+            'realized_pnl': realized_pnl,
         })
 
         if token == 'UP':
             if self.qty_up > 0:
-                avg_cost = self.cost_up / self.qty_up if self.qty_up > 0 else 0.0
-                cost_removed = avg_cost * fill.filled_qty
                 self.cost_up = max(0.0, self.cost_up - cost_removed)
             self.qty_up = max(0.0, self.qty_up - fill.filled_qty)
         else:
             if self.qty_down > 0:
-                avg_cost = self.cost_down / self.qty_down if self.qty_down > 0 else 0.0
-                cost_removed = avg_cost * fill.filled_qty
                 self.cost_down = max(0.0, self.cost_down - cost_removed)
             self.qty_down = max(0.0, self.qty_down - fill.filled_qty)
 
