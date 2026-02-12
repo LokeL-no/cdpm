@@ -96,6 +96,9 @@ class ArbitrageStrategy:
         }
         self.last_quote_refresh = 0.0
         self.last_fill_time = 0.0
+        self.last_buy_fill: Optional[dict] = None
+        self.last_sell_fill: Optional[dict] = None
+        self.fill_history = deque(maxlen=240)
         self.quotes_paused_reason = ''
 
         # Strategy tuning
@@ -431,7 +434,15 @@ class ArbitrageStrategy:
         self.market_status = 'closed'
 
     def set_market_start_time(self, start_time: Optional[datetime]):
+        if start_time != self.window_start:
+            self._reset_fill_history()
         self.window_start = start_time
+
+    def _reset_fill_history(self) -> None:
+        self.fill_history.clear()
+        self.last_buy_fill = None
+        self.last_sell_fill = None
+        self.last_fill_time = 0.0
 
     # ------------------------------------------------------------------
     # Quote management
@@ -682,6 +693,21 @@ class ArbitrageStrategy:
         self.net_invested = self.cash_out - self.cash_in  # compat
         self.trade_count += 1
         self.last_fill_time = time.time()
+        self.last_buy_fill = {
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'token': token,
+            'price': fill.fill_price,
+            'qty': fill.filled_qty,
+            'reason': reason,
+        }
+        self.fill_history.append({
+            'time': self.last_buy_fill['time'],
+            'action': 'BUY',
+            'token': token,
+            'price': fill.fill_price,
+            'qty': fill.filled_qty,
+            'reason': reason,
+        })
 
         if token == 'UP':
             self.qty_up += fill.filled_qty
@@ -720,6 +746,21 @@ class ArbitrageStrategy:
         self.net_invested = self.cash_out - self.cash_in  # compat
         self.trade_count += 1
         self.last_fill_time = time.time()
+        self.last_sell_fill = {
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'token': token,
+            'price': fill.fill_price,
+            'qty': fill.filled_qty,
+            'reason': reason,
+        }
+        self.fill_history.append({
+            'time': self.last_sell_fill['time'],
+            'action': 'SELL',
+            'token': token,
+            'price': fill.fill_price,
+            'qty': fill.filled_qty,
+            'reason': reason,
+        })
 
         if token == 'UP':
             if self.qty_up > 0:
@@ -919,6 +960,10 @@ class ArbitrageStrategy:
                 'entry': self.entry_spread,
                 'maintain': self.maintain_spread,
             },
+            'last_buy_fill': dict(self.last_buy_fill) if self.last_buy_fill else None,
+            'last_sell_fill': dict(self.last_sell_fill) if self.last_sell_fill else None,
+            'last_fill_time': self.last_fill_time,
+            'fill_history': list(self.fill_history),
         }
         return state
 
@@ -962,6 +1007,9 @@ class ArbitrageStrategy:
             'pivot_count': 0,
             'max_pivots': 0,
             'active_sells': len(self.active_sells),
+            'last_buy_fill': dict(self.last_buy_fill) if self.last_buy_fill else None,
+            'last_sell_fill': dict(self.last_sell_fill) if self.last_sell_fill else None,
+            'last_fill_time': self.last_fill_time,
         }
 
     # ------------------------------------------------------------------
