@@ -386,6 +386,16 @@ class ExecutionSimulator:
             timestamp=timestamp,
         )
 
+    def simulate_buy(
+        self,
+        side: str,
+        desired_price: float,
+        qty: float,
+        orderbook: Optional[dict],
+    ) -> FillResult:
+        """Backward-compatible alias kept for callers expecting simulate_buy."""
+        return self.simulate_fill(side, desired_price, qty, orderbook)
+
     # ══════════════════════════════════════════════════════════════
     #  CORE: Simulate a SELL (limit) against the order book
     # ══════════════════════════════════════════════════════════════

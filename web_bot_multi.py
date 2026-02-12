@@ -11,7 +11,7 @@ import json
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from aiohttp import web
 import os
 
@@ -107,6 +107,7 @@ HTML_TEMPLATE = """
         .loss { color: #ef4444; }
         .neutral { color: #9ca3af; }
         .neutral { color: #3b82f6; }
+        .quote-action { color: #60a5fa; font-weight: 600; }
         
         .markets-grid {
             display: grid;
@@ -417,6 +418,172 @@ HTML_TEMPLATE = """
             font-size: 12px;
             margin-top: 2px;
         }
+        .orderbook-grid {
+            margin-top: 12px;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+        .orderbook-panel {
+            background: #0d0d1a;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+            padding: 8px;
+            min-height: 120px;
+        }
+        .orderbook-panel h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 6px;
+            color: #9ca3af;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .orderbook-heading {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .orderbook-heading .orderbook-title-text {
+            font-weight: bold;
+        }
+        .orderbook-heading .orderbook-side-label {
+            font-size: 10px;
+            color: #4b5563;
+            font-weight: normal;
+        }
+        .orderbook-toggle {
+            background: transparent;
+            border: 1px solid #374151;
+            color: #9ca3af;
+            font-size: 9px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            text-transform: none;
+        }
+        .orderbook-toggle:hover {
+            color: #f9fafb;
+            border-color: #6b7280;
+        }
+        .orderbook-panel.up h3 {
+            color: #22c55e;
+        }
+        .orderbook-panel.down h3 {
+            color: #ef4444;
+        }
+        .orderbook-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+        .orderbook-table th,
+        .orderbook-table td {
+            padding: 3px 4px;
+            text-align: right;
+        }
+        .orderbook-table th {
+            color: #6b7280;
+            font-size: 9px;
+            border-bottom: 1px solid #1f2937;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .orderbook-table td {
+            color: #e5e7eb;
+        }
+        .orderbook-table .bid {
+            color: #22c55e;
+        }
+        .orderbook-table .ask {
+            color: #ef4444;
+        }
+        .orderbook-empty {
+            color: #4b5563;
+            text-align: center;
+            padding: 12px 0;
+        }
+        .order-activity {
+            margin-top: 12px;
+            background: #0b1220;
+            border: 1px solid #1f2a44;
+            border-radius: 8px;
+            padding: 10px 12px;
+        }
+        .order-activity-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            color: #60a5fa;
+            text-transform: uppercase;
+        }
+        .order-activity-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .order-pill {
+            border-radius: 8px;
+            padding: 8px;
+            background: #101828;
+            border: 1px solid #1f2a44;
+            min-height: 68px;
+        }
+        .order-pill .order-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #94a3b8;
+            letter-spacing: 0.4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .order-pill .order-price {
+            font-weight: bold;
+            font-size: 14px;
+            margin-top: 6px;
+        }
+        .order-pill .order-status {
+            font-size: 10px;
+            margin-top: 4px;
+            color: #9ca3af;
+        }
+        .order-pill.idle {
+            opacity: 0.45;
+        }
+        .order-pill.placed {
+            border-color: #3b82f6;
+            background: rgba(59, 130, 246, 0.12);
+        }
+        .order-pill.filled {
+            border-color: #22c55e;
+            background: rgba(34, 197, 94, 0.12);
+        }
+        .order-pill.cancelled {
+            border-color: #f59e0b;
+            background: rgba(245, 158, 11, 0.12);
+        }
+        .order-event-feed {
+            margin-top: 12px;
+            border-top: 1px dashed #1f2937;
+            padding-top: 8px;
+            font-size: 10px;
+            color: #9ca3af;
+        }
+        .order-event {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+        .order-event strong {
+            color: #f9fafb;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -604,6 +771,8 @@ HTML_TEMPLATE = """
     <script>
         let ws;
         let reconnectTimeout;
+        let latestSnapshot = null;
+        const orderbookCollapseState = {};
         
         function togglePause() {
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -625,6 +794,210 @@ HTML_TEMPLATE = """
             if (!section || !btn) return;
             const isCollapsed = section.classList.toggle('collapsed');
             btn.textContent = isCollapsed ? 'Show' : 'Hide';
+        }
+
+        function formatBookSize(size) {
+            if (!size || size <= 0) return '--';
+            if (size >= 1000) {
+                const val = (size / 1000).toFixed(1);
+                return val.replace(/\.0$/, '') + 'k';
+            }
+            return size >= 100 ? size.toFixed(0) : size.toFixed(1);
+        }
+
+        function renderOrderbookTable(slug, side, book) {
+            const title = side === 'UP' ? 'UP Token Orderbook' : 'DOWN Token Orderbook';
+            const label = side === 'UP' ? 'Long' : 'Short';
+            const panelClass = side === 'UP' ? 'orderbook-panel up' : 'orderbook-panel down';
+            const bids = (book && Array.isArray(book.bids)) ? book.bids : [];
+            const asks = (book && Array.isArray(book.asks)) ? book.asks : [];
+            const key = `${slug}::${side}`;
+            const collapsed = (key in orderbookCollapseState)
+                ? orderbookCollapseState[key]
+                : true;
+            const toggleLabel = collapsed ? 'Expand' : 'Collapse';
+            const toggleIcon = collapsed ? '▸' : '▾';
+            const maxRows = Math.max(bids.length, asks.length);
+            let rows = '';
+            if (collapsed) {
+                rows = `<tr><td colspan="4" class="orderbook-empty">Orderbook hidden</td></tr>`;
+            } else if (maxRows === 0) {
+                rows = `<tr><td colspan="4" class="orderbook-empty">No liquidity</td></tr>`;
+            } else {
+                for (let i = 0; i < maxRows; i++) {
+                    const bid = bids[i];
+                    const ask = asks[i];
+                    const bidPrice = bid ? Number(bid.price).toFixed(3) : '';
+                    const bidSize = bid ? formatBookSize(bid.size) : '';
+                    const askPrice = ask ? Number(ask.price).toFixed(3) : '';
+                    const askSize = ask ? formatBookSize(ask.size) : '';
+                    rows += `
+                        <tr>
+                            <td class="bid">${bidPrice}</td>
+                            <td>${bidSize}</td>
+                            <td class="ask">${askPrice}</td>
+                            <td>${askSize}</td>
+                        </tr>
+                    `;
+                }
+            }
+            return `
+                <div class="${panelClass}">
+                    <h3>
+                        <div class="orderbook-heading">
+                            <span class="orderbook-title-text">${title}</span>
+                            <span class="orderbook-side-label">${label}</span>
+                        </div>
+                        <button class="orderbook-toggle" onclick="toggleOrderbook('${slug}', '${side}')">${toggleIcon} ${toggleLabel}</button>
+                    </h3>
+                    <table class="orderbook-table">
+                        <thead>
+                            <tr>
+                                <th>Bid</th>
+                                <th>Size</th>
+                                <th>Ask</th>
+                                <th>Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rows}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function renderOrderActivity(activity, events) {
+            const tokens = ['UP', 'DOWN'];
+            const sides = ['bid', 'ask'];
+            const cells = [];
+            for (const token of tokens) {
+                for (const side of sides) {
+                    const info = activity && activity[token] && activity[token][side]
+                        ? activity[token][side]
+                        : null;
+                    const state = info && info.state ? info.state.toUpperCase() : 'IDLE';
+                    const pillClass = state === 'PLACED' ? 'placed' : state === 'FILLED' ? 'filled' : state === 'CANCELLED' ? 'cancelled' : 'idle';
+                    const basePrice = (info && typeof info.price === 'number') ? `$${Number(info.price).toFixed(3)}` : '--';
+                    const baseQty = (info && typeof info.qty === 'number') ? `${Number(info.qty).toFixed(1)} sh` : '--';
+                    let statusLine = 'Idle';
+                    let detailLine = 'No resting order';
+                    if (state === 'PLACED') {
+                        statusLine = `Placed ${info?.placed_at || '--'}`;
+                        detailLine = `${baseQty} @ ${basePrice}`;
+                    } else if (state === 'FILLED') {
+                        const fillPrice = (info && typeof info.fill_price === 'number') ? `$${Number(info.fill_price).toFixed(3)}` : basePrice;
+                        const fillQty = (info && typeof info.fill_qty === 'number') ? `${Number(info.fill_qty).toFixed(1)} sh` : baseQty;
+                        statusLine = `Filled ${info?.filled_at || info?.updated_at || '--'}`;
+                        detailLine = `${fillQty} @ ${fillPrice}`;
+                    } else if (state === 'CANCELLED') {
+                        statusLine = `Cancelled ${info?.updated_at || '--'}`;
+                        detailLine = `${baseQty} @ ${basePrice}`;
+                    }
+                    const badge = info && info.aggressive ? '<span style="color:#f97316;font-size:10px;">AGG</span>' : '';
+                    cells.push(`
+                        <div class="order-pill ${pillClass}">
+                            <div class="order-label">
+                                <span>${token} ${side === 'bid' ? 'BID' : 'ASK'}</span>
+                                ${badge}
+                            </div>
+                            <div class="order-price">${basePrice}</div>
+                            <div class="order-status">${statusLine}</div>
+                            <div class="order-status" style="font-size:9px;">${detailLine}</div>
+                        </div>
+                    `);
+                }
+            }
+            const summary = {};
+            for (const token of tokens) {
+                summary[token] = {
+                    bid: { placed: 0, filled: 0, cancelled: 0 },
+                    ask: { placed: 0, filled: 0, cancelled: 0 },
+                };
+            }
+            for (const evt of events || []) {
+                const token = evt.token;
+                const side = typeof evt.side === 'string' ? evt.side.toLowerCase() : '';
+                if (!summary[token] || !summary[token][side]) {
+                    continue;
+                }
+                if (evt.type === 'QUOTE_PLACED') {
+                    summary[token][side].placed += 1;
+                } else if (evt.type === 'FILL') {
+                    summary[token][side].filled += 1;
+                } else if (evt.type === 'QUOTE_CANCELLED') {
+                    summary[token][side].cancelled += 1;
+                }
+            }
+            const breakdownRows = [];
+            for (const token of tokens) {
+                for (const side of sides) {
+                    const stats = summary[token][side];
+                    breakdownRows.push(`
+                        <tr>
+                            <td>${token} ${side === 'bid' ? 'BID' : 'ASK'}</td>
+                            <td>${stats.placed}</td>
+                            <td>${stats.filled}</td>
+                            <td>${stats.cancelled}</td>
+                        </tr>
+                    `);
+                }
+            }
+            const breakdownHtml = `
+                <div class="order-breakdown" style="margin-top:8px;">
+                    <div style="font-size:11px;color:#94a3af;margin-bottom:4px;">Bid/ask outcomes (last ${(events || []).length} events)</div>
+                    <table style="width:100%;font-size:10px;border-collapse:collapse;">
+                        <thead>
+                            <tr style="text-align:left;color:#9ca3af;">
+                                <th style="padding:4px 0;">Side</th>
+                                <th style="padding:4px 0;">Placed</th>
+                                <th style="padding:4px 0;">Filled</th>
+                                <th style="padding:4px 0;">Cancelled</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${breakdownRows.join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            const recentEvents = (events || []).slice(-4).reverse();
+            const eventRows = recentEvents.length
+                ? recentEvents.map(evt => {
+                    const label = evt.type === 'FILL' ? 'Fill' : evt.type === 'QUOTE_PLACED' ? 'Placed' : evt.type === 'QUOTE_CANCELLED' ? 'Cancelled' : (evt.type || 'Event');
+                    const priceText = (typeof evt.price === 'number') ? `$${Number(evt.price).toFixed(3)}` : '--';
+                    const qtyText = (typeof evt.qty === 'number') ? `${Number(evt.qty).toFixed(1)} sh` : '--';
+                    const reasonText = evt.reason ? ` · ${evt.reason.replace(/_/g, ' ')}` : '';
+                    return `<div class="order-event"><span>${evt.time || '--'} • ${evt.token || ''} ${evt.side || ''} ${label}${reasonText}</span><strong>${priceText} | ${qtyText}</strong></div>`;
+                }).join('')
+                : '<div class="order-event" style="opacity:0.5;">No recent order activity</div>';
+
+            return `
+                <div class="order-activity">
+                    <div class="order-activity-header">
+                        <span>📡 Order Activity</span>
+                        <span style="color:#94a3af; font-size:10px;">Bid/ask placements & fills</span>
+                    </div>
+                    <div class="order-activity-grid">
+                        ${cells.join('')}
+                    </div>
+                    ${breakdownHtml}
+                    <div class="order-event-feed">
+                        ${eventRows}
+                    </div>
+                </div>
+            `;
+        }
+
+        function toggleOrderbook(slug, side) {
+            const key = `${slug}::${side}`;
+            const current = (key in orderbookCollapseState)
+                ? orderbookCollapseState[key]
+                : true;
+            orderbookCollapseState[key] = !current;
+            if (latestSnapshot) {
+                updateUI(latestSnapshot);
+            }
         }
         
         function connect() {
@@ -896,6 +1269,7 @@ HTML_TEMPLATE = """
         }
 
         function updateUI(data) {
+            latestSnapshot = data;
             // Update global stats
             document.getElementById('starting-balance').textContent = data.starting_balance.toFixed(2);
             document.getElementById('current-balance').textContent = data.true_balance.toFixed(2);
@@ -970,14 +1344,21 @@ HTML_TEMPLATE = """
                     
                     const markUp = typeof market.up_price === 'number' ? market.up_price : 0;
                     const markDown = typeof market.down_price === 'number' ? market.down_price : 0;
-                    const livePnl = (pt.qty_up * markUp) + (pt.qty_down * markDown)
-                        + (pt.total_sell_proceeds || 0) - (pt.cost_up + pt.cost_down);
+                    const cashOut = pt.cash_out || 0;
+                    const cashIn = pt.cash_in || 0;
+                    const livePnl = cashIn - cashOut;
                     const finalPnl = pt.final_pnl ?? 0;
                     const finalGross = pt.final_pnl_gross ?? finalPnl;
                     const feesPaid = pt.fees_paid ?? 0;
                     const activeSells = pt.active_sells || [];
                     const filledSells = pt.filled_sells || [];
-                    const lockedProfit = filledSells.reduce((sum, s) => sum + (s.profit || 0), 0);
+                    const lockedProfit = pt.locked_profit || 0;
+                    const orderbooks = market.orderbooks || {};
+                    const upOrderbook = orderbooks.up || { bids: [], asks: [] };
+                    const downOrderbook = orderbooks.down || { bids: [], asks: [] };
+                    const upOrderbookHtml = renderOrderbookTable(slug, 'UP', upOrderbook);
+                    const downOrderbookHtml = renderOrderbookTable(slug, 'DOWN', downOrderbook);
+                    const orderActivityHtml = renderOrderActivity(pt.order_activity, pt.recent_order_events);
                     const activeSellText = activeSells.length
                         ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
                         : 'none';
@@ -1008,6 +1389,11 @@ HTML_TEMPLATE = """
                                     <div class="price-value">$${market.down_price?.toFixed(3) || '-.--'}</div>
                                 </div>
                             </div>
+                            <div class="orderbook-grid">
+                                ${upOrderbookHtml}
+                                ${downOrderbookHtml}
+                            </div>
+                            ${orderActivityHtml}
                             <div class="holdings-row">
                                 <div class="holding-item">
                                     <div class="holding-label">Qty UP</div>
@@ -1092,21 +1478,21 @@ HTML_TEMPLATE = """
                                 <div class="holding-item">
                                     <div class="holding-label">If UP wins</div>
                                     <div class="holding-value" style="color: #10b981;">$${pt.qty_up.toFixed(2)}</div>
-                                    <div class="holding-label" style="font-size: 0.65rem; color: ${(pt.qty_up - pt.cost_up - pt.cost_down) >= 0 ? '#10b981' : '#ef4444'};">
-                                        ${(pt.qty_up - pt.cost_up - pt.cost_down) >= 0 ? '+' : ''}$${(pt.qty_up - pt.cost_up - pt.cost_down).toFixed(2)}
+                                    <div class="holding-label" style="font-size: 0.65rem; color: ${(pt.pnl_if_up_wins || 0) >= 0 ? '#10b981' : '#ef4444'};">
+                                        ${(pt.pnl_if_up_wins || 0) >= 0 ? '+' : ''}$${(pt.pnl_if_up_wins || 0).toFixed(2)}
                                     </div>
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">If DOWN wins</div>
                                     <div class="holding-value" style="color: #10b981;">$${pt.qty_down.toFixed(2)}</div>
-                                    <div class="holding-label" style="font-size: 0.65rem; color: ${(pt.qty_down - pt.cost_up - pt.cost_down) >= 0 ? '#10b981' : '#ef4444'};">
-                                        ${(pt.qty_down - pt.cost_up - pt.cost_down) >= 0 ? '+' : ''}$${(pt.qty_down - pt.cost_up - pt.cost_down).toFixed(2)}
+                                    <div class="holding-label" style="font-size: 0.65rem; color: ${(pt.pnl_if_down_wins || 0) >= 0 ? '#10b981' : '#ef4444'};">
+                                        ${(pt.pnl_if_down_wins || 0) >= 0 ? '+' : ''}$${(pt.pnl_if_down_wins || 0).toFixed(2)}
                                     </div>
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Worst Case</div>
-                                    <div class="holding-value" style="color: ${Math.min(pt.qty_up, pt.qty_down) - pt.cost_up - pt.cost_down >= 0 ? '#22c55e' : '#ef4444'};">
-                                        ${Math.min(pt.qty_up, pt.qty_down) - pt.cost_up - pt.cost_down >= 0 ? '+' : ''}$${(Math.min(pt.qty_up, pt.qty_down) - pt.cost_up - pt.cost_down).toFixed(2)}
+                                    <div class="holding-value" style="color: ${(pt.locked_profit || 0) >= 0 ? '#22c55e' : '#ef4444'};">
+                                        ${(pt.locked_profit || 0) >= 0 ? '+' : ''}$${(pt.locked_profit || 0).toFixed(2)}
                                     </div>
                                 </div>
                             </div>
@@ -1116,7 +1502,7 @@ HTML_TEMPLATE = """
                                 <span class="${livePnl >= 0 ? 'profit' : 'loss'}" style="font-weight: bold;">
                                     ${livePnl >= 0 ? '+' : ''}$${livePnl.toFixed(2)}
                                 </span>
-                                ${lockedProfit > 0.001 ? `<br><span style="color: #888;">Locked profit: </span><span class="profit" style="font-weight: bold;">+$${lockedProfit.toFixed(2)}</span>` : ''}
+                                ${Math.abs(lockedProfit) > 0.001 ? `<br><span style="color: #888;">Locked profit: </span><span class="${lockedProfit >= 0 ? 'profit' : 'loss'}" style="font-weight: bold;">${lockedProfit >= 0 ? '+' : ''}$${lockedProfit.toFixed(2)}</span>` : ''}
                                 ${pt.market_status === 'resolved' ? 
                                     `<br><span style="color: #3b82f6;">Outcome: ${pt.resolution_outcome} | Final: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}${Math.abs(finalGross - finalPnl) > 0.005 || feesPaid > 0 ? ` <span style="color:#888;">(gross $${finalGross.toFixed(2)} | fees $${feesPaid.toFixed(2)})</span>` : ''}</span>` 
                                     : ''}
@@ -1274,21 +1660,39 @@ HTML_TEMPLATE = """
             } else {
                 let html = '';
                 for (const t of data.trade_log.slice().reverse()) {
-                    const action = t.action || 'BUY';
-                    const actionClass = action === 'SELL' ? 'loss' : action === 'SELL_PLACED' ? 'neutral' : 'profit';
+                    const actionStr = (t.action || 'BUY').toString();
+                    const isQuoteAction = actionStr.startsWith('QUOTE_');
+                    const isBidQuote = isQuoteAction && actionStr.endsWith('BID');
+                    let actionLabel = actionStr;
+                    let actionClass = 'neutral';
+                    if (isQuoteAction) {
+                        actionLabel = isBidQuote ? 'Bid Placed' : 'Ask Placed';
+                        actionClass = 'quote-action';
+                    } else if (actionStr === 'BUY') {
+                        actionLabel = 'Bid Filled';
+                        actionClass = 'profit';
+                    } else if (actionStr === 'SELL') {
+                        actionLabel = 'Ask Filled';
+                        actionClass = 'loss';
+                    } else if (actionStr === 'SELL_PLACED') {
+                        actionLabel = 'Sell Placed';
+                        actionClass = 'neutral';
+                    } else {
+                        actionLabel = actionStr.replace(/_/g, ' ');
+                    }
                     const sideClass = t.side === 'UP' ? 'profit' : 'loss';
-                    const costCell = (action === 'SELL_PLACED') ? '-' : `$${t.cost.toFixed(2)}`;
-                    const profitCell = (action === 'SELL' && typeof t.profit === 'number')
+                    const costCell = (actionStr === 'SELL_PLACED' || isQuoteAction) ? '--' : `$${t.cost.toFixed(2)}`;
+                    const profitCell = (!isQuoteAction && actionStr === 'SELL' && typeof t.profit === 'number')
                         ? `${t.profit >= 0 ? '+' : ''}$${t.profit.toFixed(2)}`
-                        : '-';
-                    const profitClass = (action === 'SELL' && typeof t.profit === 'number')
+                        : '--';
+                    const profitClass = (!isQuoteAction && actionStr === 'SELL' && typeof t.profit === 'number')
                         ? (t.profit >= 0 ? 'profit' : 'loss')
                         : 'neutral';
                     html += `
                         <tr>
                             <td>${t.time}</td>
                             <td><span class="asset-badge asset-${t.asset.toLowerCase()}" style="font-size: 10px;">${t.asset}</span></td>
-                            <td class="${actionClass}">${action}</td>
+                            <td class="${actionClass}">${actionLabel}</td>
                             <td class="${sideClass}">${t.side}</td>
                             <td>$${t.price.toFixed(3)}</td>
                             <td>${t.qty.toFixed(1)}</td>
@@ -3742,6 +4146,9 @@ class MarketTracker:
         self.paper_trader.cash_ref = cash_ref  # Share cash reference
         self.initialized = False
         self.last_update = 0
+        self.up_orderbook = {'bids': [], 'asks': []}
+        self.down_orderbook = {'bids': [], 'asks': []}
+        self.orderbook_updated_at = 0.0
 
 
 class MultiMarketBot:
@@ -3810,43 +4217,7 @@ class MultiMarketBot:
                         
                         event = events[0]
                         markets = event.get('markets', [])
-                        
-                        up_token = None
-                        down_token = None
-                        
-                        # New format: single market with outcomes array
-                        for m in markets:
-                            outcomes = m.get('outcomes', [])
-                            tokens = m.get('clobTokenIds', [])
-                            
-                            # Parse tokens if it's a JSON string
-                            if isinstance(tokens, str):
-                                try:
-                                    tokens = json.loads(tokens)
-                                except:
-                                    tokens = []
-                            
-                            # Parse outcomes if it's a JSON string
-                            if isinstance(outcomes, str):
-                                try:
-                                    outcomes = json.loads(outcomes)
-                                except:
-                                    outcomes = []
-                            
-                            if outcomes and tokens and len(outcomes) >= 2 and len(tokens) >= 2:
-                                for i, outcome in enumerate(outcomes):
-                                    if outcome.lower() == 'up':
-                                        up_token = tokens[i]
-                                    elif outcome.lower() == 'down':
-                                        down_token = tokens[i]
-                            
-                            # Fallback: old format with groupItemTitle
-                            if not up_token or not down_token:
-                                outcome = m.get('groupItemTitle', '').lower()
-                                if 'up' in outcome and tokens:
-                                    up_token = tokens[0]
-                                elif 'down' in outcome and tokens:
-                                    down_token = tokens[0]
+                        up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
                         
                         if up_token and down_token:
                             asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
@@ -3872,6 +4243,77 @@ class MultiMarketBot:
                         print(f"⚠️ Failed to fetch {slug}: status {response.status}")
             except Exception as e:
                 print(f"Error loading manual market {slug}: {e}")
+
+    @staticmethod
+    def _compress_orderbook(book: dict, max_levels: Optional[int] = None) -> dict:
+        if not isinstance(book, dict):
+            return {'bids': [], 'asks': []}
+
+        def _convert(levels, reverse):
+            cleaned = []
+            for level in list(levels):
+                try:
+                    price = float(level.get('price', 0))
+                    size = float(level.get('size', 0))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0 or size <= 0:
+                    continue
+                cleaned.append({'price': round(price, 4), 'size': round(size, 2)})
+            cleaned.sort(key=lambda x: x['price'], reverse=reverse)
+            return cleaned if max_levels is None else cleaned[:max_levels]
+
+        return {
+            'bids': _convert(book.get('bids', []), reverse=True),
+            'asks': _convert(book.get('asks', []), reverse=False),
+        }
+
+    def _extract_tokens_from_markets(self, markets: List[dict], target_slug: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """Return UP/DOWN token ids, preferring the exact slug when available."""
+
+        def _ensure_list(value):
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except Exception:
+                    return []
+            return value or []
+
+        candidates = []
+        if target_slug:
+            for market in markets:
+                if market.get('slug') == target_slug:
+                    candidates = [market]
+                    break
+        if not candidates:
+            candidates = markets
+
+        up_token = None
+        down_token = None
+
+        for market in candidates:
+            outcomes = _ensure_list(market.get('outcomes', []))
+            tokens = _ensure_list(market.get('clobTokenIds', []))
+
+            if outcomes and tokens and len(outcomes) >= 2 and len(tokens) >= 2:
+                for idx, outcome in enumerate(outcomes):
+                    outcome_name = str(outcome).lower()
+                    if outcome_name == 'up':
+                        up_token = tokens[idx]
+                    elif outcome_name == 'down':
+                        down_token = tokens[idx]
+
+            if (not up_token or not down_token) and tokens:
+                outcome_label = str(market.get('groupItemTitle', '')).lower()
+                if 'up' in outcome_label and tokens:
+                    up_token = tokens[0]
+                elif 'down' in outcome_label and tokens:
+                    down_token = tokens[0]
+
+            if up_token and down_token:
+                break
+
+        return up_token, down_token
         
     async def discover_markets(self, session: aiohttp.ClientSession):
         """Discover active markets for all supported assets"""
@@ -3924,35 +4366,8 @@ class MultiMarketBot:
                             continue
                         
                         markets = event.get('markets', [])
-                        
-                        up_token = None
-                        down_token = None
-                        
-                        for m in markets:
-                            outcomes = m.get('outcomes', [])
-                            tokens = m.get('clobTokenIds', [])
-                            
-                            # Parse tokens if it's a JSON string
-                            if isinstance(tokens, str):
-                                try:
-                                    tokens = json.loads(tokens)
-                                except:
-                                    tokens = []
-                            
-                            # Parse outcomes if it's a JSON string
-                            if isinstance(outcomes, str):
-                                try:
-                                    outcomes = json.loads(outcomes)
-                                except:
-                                    outcomes = []
-                            
-                            if outcomes and tokens and len(outcomes) >= 2 and len(tokens) >= 2:
-                                for i, outcome in enumerate(outcomes):
-                                    if outcome.lower() == 'up':
-                                        up_token = tokens[i]
-                                    elif outcome.lower() == 'down':
-                                        down_token = tokens[i]
-                        
+                        up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
+
                         if up_token and down_token:
                             asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
                             tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
@@ -4050,6 +4465,9 @@ class MultiMarketBot:
                 fetch_book(tracker.down_token_id)
             )
             fetch_latency_ms = (time.time() - fetch_start) * 1000
+            tracker.up_orderbook = self._compress_orderbook(up_book)
+            tracker.down_orderbook = self._compress_orderbook(down_book)
+            tracker.orderbook_updated_at = time.time()
             
             # Extract prices
             asks_up = up_book.get('asks', [])
@@ -4328,7 +4746,12 @@ class MultiMarketBot:
                                 'up_price': tracker.up_price,
                                 'down_price': tracker.down_price,
                                 'window_time': f"{tracker.window_end.strftime('%H:%M:%S') if tracker.window_end else '--:--'}",
-                                'paper_trader': tracker.paper_trader.get_state()
+                                'paper_trader': tracker.paper_trader.get_state(),
+                                'orderbooks': {
+                                    'up': tracker.up_orderbook,
+                                    'down': tracker.down_orderbook,
+                                    'updated_at': tracker.orderbook_updated_at,
+                                }
                             }
                     
                     # True balance = cash + value of locked positions
