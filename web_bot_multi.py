@@ -4528,11 +4528,16 @@ class MultiMarketBot:
                 if tracker.window_end:
                     time_to_close = (tracker.window_end - now).total_seconds()
                 
-                # DEBUG: Print prices and why no trade
+                # DEBUG: Print prices and strategy state every tick
                 pt = tracker.paper_trader
-                if pt.qty_up == 0 and pt.qty_down == 0:
-                    spread = abs(tracker.up_price - tracker.down_price) if tracker.up_price and tracker.down_price else 0
-                    print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | {fetch_latency_ms:.0f}ms")
+                spread = abs(tracker.up_price - tracker.down_price) if tracker.up_price and tracker.down_price else 0
+                ttc_str = f"{time_to_close:.0f}s" if time_to_close is not None else "N/A"
+                extra = ""
+                if pt.qty_up > 0 or pt.qty_down > 0:
+                    ratio = pt.qty_up / pt.qty_down if pt.qty_down > 0 else (999 if pt.qty_up > 0 else 0)
+                    locked = pt.calculate_locked_profit()
+                    extra = f" | ratio={ratio:.2f} locked=${locked:+.2f} trades={pt.trade_count}"
+                print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | ttc={ttc_str}{extra} | {fetch_latency_ms:.0f}ms")
                 
                 trades = tracker.paper_trader.check_and_trade(
                     tracker.up_price, 

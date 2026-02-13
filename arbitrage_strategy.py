@@ -118,16 +118,67 @@ class ArbitrageStrategy:
         self.mid_bounds = (0.15, 0.85)
 
         # Pair-cost targeting strategy
-        self.cheap_entry_price = 0.48
-        self.target_pair_cost = 0.980
-        self.pair_cost_safety_margin = 0.980  # Never buy if pair would exceed this
+        self.target_pair_cost = 0.970
+        self.pair_cost_safety_margin = 1.000
+        self.pair_cost_max_limit = 1.020
         self.balance_ratio_max = 1.10
-        self.entry_trade_usd = 5.0
-        self.balance_trade_usd = 20.0  # Max for balancing trades (actual size calculated)
-        self.improve_trade_usd = 8.0  # Smaller for incremental improvements
-        self.max_imbalance_ratio = 1.5  # Rebalance if ratio exceeds this
-        self.max_overexposure = 1.20  # Don't buy more if already >20% heavier
-        self.balanced_ratio_range = (0.90, 1.10)  # Consider balanced within this range
+        self.entry_trade_usd = 3.0    # Base entry size (small! preserve capital)
+        self.balance_trade_usd = 5.0   # Base balance/hedge size
+        self.improve_trade_usd = 2.0   # Base improvement size
+        self.max_imbalance_ratio = 1.4
+        self.max_overexposure = 1.5    # Strict: never go beyond 1.5:1 ratio
+        self.balanced_ratio_range = (0.85, 1.15)
+        self.enable_sell_to_balance = False
+        self.aggressive_balance_mode = False
+        
+        # NEW: Temporal arbitrage parameters
+        self.combined_entry_threshold = 0.98  # Buy both when combined < this
+        self.single_entry_price = 0.48        # Enter one side if this cheap
+        self.hedge_target_pair = 0.98         # Target pair cost when completing hedge
+        self.min_discount_to_avg_down = 0.05  # 5% below avg to average down
+        self.aggressive_discount = 0.15       # 15%+ discount = bigger position
+        self.extreme_discount = 0.30          # 30%+ discount = maximum position
+        self.price_history_up: deque = deque(maxlen=60)    # Track recent UP prices
+        self.price_history_down: deque = deque(maxlen=60)  # Track recent DOWN prices
+        self.combined_history: deque = deque(maxlen=60)    # Track combined ask prices
+        
+        # HYBRID: Momentum / directional tilt parameters
+        self.momentum_trade_usd = 5.0         # Directional bet on trending side
+        self.momentum_min_samples = 8          # Need 8+ price samples before detecting trend
+        self.momentum_threshold = 0.06         # Side must be >6 cents above 0.50 to be "trending"
+        self.momentum_trend_strength = 0.03    # Price must have risen 3+ cents over window
+        self.max_tilt_ratio = 1.40             # Never tilt beyond 1.4:1 ratio
+        self.momentum_min_time = 120.0         # Need >2 min left to take momentum bet
+        self.momentum_max_price = 0.72         # Don't buy momentum side above $0.72
+        
+        # Budget management
+        self.max_market_spend_pct = 1.0   # Can use full budget in a market
+        self.reserve_budget_pct = 0.05    # Keep 5% reserve ($20) as safety buffer
+        self.emergency_mode_threshold = 0.10
+        self.max_position_per_market = 9999.0  # No hard cap per market
+        self.min_trade_interval = 12.0  # Minimum 12 seconds between trades (pacing)
+        
+        # Time-based parameters
+        self.min_time_to_enter = 60.0  # Don't enter if < 1 minute left (unless fixing negative profit)
+        self.time_scale_threshold = 240.0  # Start reducing size when < 4 min left
+        self.enable_time_scaling = True  # Scale position size based on time remaining
+        
+        # Profit-securing parameters
+        self.min_profit_target = 1.00  # Stop at $1 locked profit per market
+        self.excellent_pair_threshold = 0.900  # Lower threshold for excellent
+        self.good_pair_threshold = 0.940  # Lower threshold for good
+        self.size_multiplier_excellent = 4.0  # 4x size for excellent opportunities (pair < 0.90)
+        self.size_multiplier_good = 2.5  # 2.5x size for good opportunities (pair < 0.94)
+        self.max_pair_deterioration = 0.050  # More tolerant
+        self.enable_profit_scaling = True  # Scale position size based on opportunity quality
+        self.balance_first_mode = False  # Focus on low pair cost first
+        
+        # Tracking for profit security
+        self.best_pair_cost_seen = float('inf')  # Track best pair cost achieved
+        self.highest_locked_profit = -float('inf')  # Track peak locked profit
+        self.market_spent = 0.0  # Track total spent in current market
+        self.emergency_mode = False  # Emergency mode when budget critical
+        self._last_trade_time = 0.0  # Timestamp of last trade (for cooldown)
 
         # Telemetry / history for UI compatibility
         self.mgp_history = deque(maxlen=180)
@@ -348,6 +399,150 @@ class ArbitrageStrategy:
     @property
     def pair_cost(self) -> float:
         return self.avg_up + self.avg_down
+    
+    def _dynamic_safety_margin(self, current_ratio: float) -> float:
+        """Calculate dynamic safety margin - prioritize balance over pair cost."""
+        locked = self.calculate_locked_profit()
+        base_margin = self.pair_cost_safety_margin
+        
+        # For severe imbalances, allow much higher pair cost to achieve balance
+        imbalance_severity = abs(current_ratio - 1.0)
+        if imbalance_severity > 0.3:  # Significantly imbalanced
+            # Allow more room based on severity
+            imbalance_bonus = min(0.040, imbalance_severity * 0.05)  # Up to +4¢
+            base_margin += imbalance_bonus
+        
+        # If profit is locked and positive, allow higher margin
+        if locked >= 0:
+            profit_bonus = min(0.020, locked * 0.003)  # Up to +2¢ for locked profit
+            base_margin += profit_bonus
+        
+        # Never exceed absolute maximum
+        return min(base_margin, self.pair_cost_max_limit)
+
+    def _get_opportunity_size_multiplier(self, pair_cost: float) -> float:
+        """Calculate position size multiplier based on opportunity quality."""
+        if not self.enable_profit_scaling:
+            return 1.0
+        
+        if pair_cost < self.excellent_pair_threshold:
+            return self.size_multiplier_excellent
+        elif pair_cost < self.good_pair_threshold:
+            return self.size_multiplier_good
+        else:
+            return 1.0
+    
+    def _check_deterioration_stop(self, current_pair: float) -> Tuple[bool, str]:
+        """Check if position has deteriorated and should be exited early."""
+        # Track best pair cost
+        if current_pair < self.best_pair_cost_seen:
+            self.best_pair_cost_seen = current_pair
+        
+        # If pair has worsened significantly from best, consider stop
+        deterioration = current_pair - self.best_pair_cost_seen
+        if deterioration > self.max_pair_deterioration:
+            return True, f'Pair deteriorated ${deterioration:.3f} from best ${self.best_pair_cost_seen:.3f}'
+        
+        return False, ''
+    
+    def _check_profit_target_reached(self, locked_profit: float, ratio: float) -> Tuple[bool, str]:
+        """Check if we should stop trading because profit target is reached."""
+        # Track highest locked profit
+        if locked_profit > self.highest_locked_profit:
+            self.highest_locked_profit = locked_profit
+        
+        # CRITICAL: Never stop if locked profit is negative!
+        if locked_profit < 0:
+            return False, ''
+        
+        # Only stop if:
+        # 1. Locked profit >= minimum target
+        # 2. Position is reasonably balanced
+        if locked_profit >= self.min_profit_target:
+            if self.balanced_ratio_range[0] <= ratio <= self.balanced_ratio_range[1]:
+                return True, f'💰 Profit target reached: ${locked_profit:.2f} >= ${self.min_profit_target:.2f}'
+        
+        return False, ''
+    
+    def _get_time_scale_factor(self, time_to_close: Optional[float]) -> float:
+        """Calculate position size scaling based on time remaining."""
+        if not self.enable_time_scaling or time_to_close is None:
+            return 1.0
+        
+        # Don't scale if plenty of time
+        if time_to_close >= self.time_scale_threshold:
+            return 1.0
+        
+        # Linear scale down from 1.0 to 0.3 as time decreases
+        if time_to_close < 60:  # Less than 1 min
+            return 0.2
+        elif time_to_close < 120:  # Less than 2 min
+            return 0.4
+        elif time_to_close < 180:  # Less than 3 min
+            return 0.6
+        else:  # 3-4 minutes
+            return 0.8
+    
+    def _check_budget_limits(self, proposed_spend: float) -> Tuple[bool, float, str]:
+        """Check if proposed spend is within budget limits."""
+        # Check emergency mode
+        budget_remaining = self.remaining_budget()
+        budget_remaining_pct = budget_remaining / self.market_budget
+        
+        if budget_remaining_pct < self.emergency_mode_threshold:
+            if not self.emergency_mode:
+                self.emergency_mode = True
+            # In emergency, only allow tiny trades
+            max_spend = min(proposed_spend, budget_remaining * 0.1)
+            return True, max_spend, f'EMERGENCY MODE: {budget_remaining_pct*100:.0f}% budget left'
+        
+        # Check per-market spending limit
+        max_market_spend = self.market_budget * self.max_market_spend_pct
+        if self.market_spent >= max_market_spend:
+            return False, 0, f'Market limit reached: ${self.market_spent:.0f}/${max_market_spend:.0f}'
+        
+        # Check reserve budget
+        min_reserve = self.market_budget * self.reserve_budget_pct
+        available = max(0, budget_remaining - min_reserve)
+        
+        if available < proposed_spend:
+            if available < self.min_trade_size:
+                return False, 0, f'Reserve protected: need ${min_reserve:.0f} reserve'
+            return True, available, f'Reserve limited to ${available:.2f}'
+        
+        # Check against market limit
+        remaining_market_budget = max_market_spend - self.market_spent
+        capped_spend = min(proposed_spend, remaining_market_budget)
+        
+        return True, capped_spend, ''
+    
+    def reset_market_tracking(self):
+        """Reset per-market tracking variables."""
+        self.market_spent = 0.0
+        self.emergency_mode = False
+        self.best_pair_cost_seen = float('inf')
+        self._last_trade_time = 0.0
+        self.price_history_up.clear()
+        self.price_history_down.clear()
+        self.combined_history.clear()
+    def _should_take_profit_now(self, locked_profit: float, ratio: float, current_pair: float) -> Tuple[bool, str]:
+        """Determine if we should take profit and stop trading now."""
+        # NEVER stop if locked profit is negative
+        if locked_profit < 0:
+            return False, ''
+        
+        # Check profit target
+        target_reached, reason = self._check_profit_target_reached(locked_profit, ratio)
+        if target_reached:
+            return True, reason
+        
+        # Check deterioration (only if we have profit to protect)
+        if locked_profit > 0.50:  # Only protect if we have meaningful profit
+            should_stop, reason = self._check_deterioration_stop(current_pair)
+            if should_stop:
+                return True, f'⚠️ Stop: {reason}'
+        
+        return False, ''
 
     # ------------------------------------------------------------------
     # Public API
@@ -389,7 +584,7 @@ class ArbitrageStrategy:
             self._cancel_all_quotes('pair_cost_mode')
 
         trades.extend(
-            self._pair_cost_trade(metrics_map, up_orderbook, down_orderbook, timestamp)
+            self._pair_cost_trade(metrics_map, up_orderbook, down_orderbook, timestamp, time_to_close)
         )
 
         self._record_histories(up_metrics, down_metrics)
@@ -401,8 +596,35 @@ class ArbitrageStrategy:
         up_orderbook: Optional[dict],
         down_orderbook: Optional[dict],
         timestamp: str,
+        time_to_close: Optional[float] = None,
     ) -> List[Tuple[str, str, float, float]]:
+        """
+        Adaptive Arbitrage + Directional Strategy
+        
+        Core idea: Start with cheap side (base/insurance), continuously pursue
+        arbitrage to lock profit, AND follow directional trends for extra profit.
+        No trade limit — use full budget as needed.
+        
+        Phases:
+          1. ENTRY     - Buy the cheap side first (base position / reversal insurance).
+          2. DEVELOP   - Try to lock arbitrage (hedge at low pair cost).
+                         If arb unavailable, buy trending side for directional profit.
+          3. MANAGE    - Both sides owned. Continuously:
+                         a) Improve pair cost when discount available (lower avg cost)
+                         b) Follow trend — buy more of trending side
+                         c) On reversal — existing cheap-side base becomes new profit path
+          4. ENDGAME   - Force hedge if one-sided < 45s. Stop if profitable.
+        """
+        import time as _time
         trades: List[Tuple[str, str, float, float]] = []
+
+        # Fee-adjusted pair cost limit: pair_cost tracks raw price,
+        # but actual cost = price * (1 + FEE_RATE). For profitable arbitrage,
+        # pair_cost must be < 1.0 / (1+FEE_RATE) ≈ 0.985
+        # We use 0.97 to leave a healthy margin for profit.
+        MAX_PAIR_FOR_PROFIT = 0.97   # Pair must be below this for guaranteed profit after fees
+        MAX_PAIR_FOR_HEDGE = 1.00    # Pair must be below this for risk reduction (may break even)
+        MAX_PAIR_FOR_BALANCE = 0.99  # When balancing existing position, don't push pair above this
 
         up_price = metrics_map['UP'].best_ask
         down_price = metrics_map['DOWN'].best_ask
@@ -411,28 +633,78 @@ class ArbitrageStrategy:
             self.mode_reason = 'Missing best asks'
             return trades
 
+        # Trade cooldown: don't trade more often than min_trade_interval
+        now = _time.time()
+        time_since_last = now - self._last_trade_time
+        if self._last_trade_time > 0 and time_since_last < self.min_trade_interval:
+            # Still collecting price data even during cooldown
+            combined = up_price + down_price
+            self.price_history_up.append(up_price)
+            self.price_history_down.append(down_price)
+            self.combined_history.append(combined)
+            return trades
+
+        # Track price history for trend analysis
+        combined = up_price + down_price
+        self.price_history_up.append(up_price)
+        self.price_history_down.append(down_price)
+        self.combined_history.append(combined)
+
         remaining_budget = self.remaining_budget()
         if remaining_budget < self.min_trade_size:
             self.current_mode = 'standby'
             self.mode_reason = 'No budget left'
             return trades
 
+        locked_profit = self.calculate_locked_profit()
+        current_pair = self.pair_cost
+
+        # ── ENDGAME: Near market close ──
+        has_position = self.qty_up > 0 or self.qty_down > 0
+        if time_to_close is not None and time_to_close < 60 and has_position:
+            # Less than 1 minute left WITH a position
+            if locked_profit >= 0:
+                self.current_mode = 'profit_secured'
+                self.mode_reason = f'⏰ Endgame: profit secured ${locked_profit:.2f} | {time_to_close:.0f}s left'
+                return trades
+            
+            # FORCED HEDGE: If one-sided position with < 45s left, hedge at ANY price
+            # The ~$0.15 spread loss is far better than risking full position loss ($3+)
+            has_one_side_only = (self.qty_up > 0) != (self.qty_down > 0)
+            if has_one_side_only and time_to_close < 45:
+                owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
+                other_token = 'DOWN' if owned_token == 'UP' else 'UP'
+                owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
+                other_price = down_price if other_token == 'DOWN' else up_price
+                owned_avg = self.avg_up if owned_token == 'UP' else self.avg_down
+                
+                # Match dollar investment to balance quantities
+                spend = owned_cost
+                trade = buy_with_spend(other_token, other_price, spend, 'forced_hedge')
+                if trade:
+                    trades.append(trade)
+                    new_pair = owned_avg + other_price
+                    self.current_mode = 'forced_hedge'
+                    self.mode_reason = f'🛡️ FORCED HEDGE {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | {time_to_close:.0f}s left | limiting risk'
+                return trades
+            
+            if self.qty_up > 0 and self.qty_down > 0 and current_pair > 1.005:
+                # Losing position, stop trading to limit damage
+                self.current_mode = 'too_late'
+                self.mode_reason = f'⏰ Endgame: accepting loss (pair ${current_pair:.3f})'
+                return trades
+            # If we have a position with pair < 1.0 but unbalanced, try to balance
+            # Fall through to normal logic
+
+        # ── Helper functions ──
         def cap_spend(spend: float) -> float:
-            return min(spend, remaining_budget, self.cash * 0.95)
-
-        def kelly_fraction(price: float, other_price: float) -> float:
-            if price <= 0 or price >= 1:
-                return 0.0
-            pair = price + other_price
-            edge = 1.0 - pair
-            if edge <= 0:
-                return 0.0
-            fraction = edge / max(1e-6, 1.0 - price)
-            return max(0.0, min(fraction, 0.25))
-
-        def kelly_spend(price: float, other_price: float, max_spend: float, min_fraction: float) -> float:
-            fraction = max(kelly_fraction(price, other_price), min_fraction)
-            return min(self.cash * fraction, max_spend)
+            # Keep a small safety reserve
+            min_reserve = self.market_budget * self.reserve_budget_pct
+            available_cash = max(0, self.cash - min_reserve)
+            final = min(spend, remaining_budget, available_cash)
+            if final < 1.0:  # Polymarket minimum
+                return 0
+            return final
 
         def buy_with_spend(token: str, price: float, spend: float, reason: str) -> Optional[Tuple[str, str, float, float]]:
             spend = cap_spend(spend)
@@ -461,190 +733,278 @@ class ArbitrageStrategy:
                 return float('inf')
             return self.avg_up + new_avg_down
 
-        cheap_token = 'UP' if up_price <= down_price else 'DOWN'
-        cheap_price = min(up_price, down_price)
-        expensive_price = max(up_price, down_price)
+        def discount_to_avg(token: str, price: float) -> float:
+            """How much cheaper is current price vs our average? (0.20 = 20% discount)"""
+            avg = self.avg_up if token == 'UP' else self.avg_down
+            if avg <= 0:
+                return 0
+            return max(0, (avg - price) / avg)
 
+        def size_for_discount(discount: float) -> float:
+            """Scale position size based on discount quality (conservative)."""
+            if discount >= self.extreme_discount:   # 30%+
+                return 2.0
+            elif discount >= self.aggressive_discount:  # 15%+
+                return 1.5
+            elif discount >= self.min_discount_to_avg_down:  # 5%+
+                return 1.2
+            else:
+                return 1.0
+
+        def is_price_at_local_low(token: str) -> bool:
+            """Check if current price is near recent low (good entry timing)."""
+            history = self.price_history_up if token == 'UP' else self.price_history_down
+            if len(history) < 5:
+                return True  # Not enough data, assume OK
+            current = history[-1]
+            recent_min = min(list(history)[-10:]) if len(history) >= 10 else min(history)
+            recent_max = max(list(history)[-10:]) if len(history) >= 10 else max(history)
+            price_range = recent_max - recent_min
+            if price_range < 0.01:
+                return True  # No volatility, OK to trade
+            # Price is "at low" if within 30% of range from bottom
+            return (current - recent_min) < price_range * 0.3
+
+        def orderbook_liquidity(token: str) -> float:
+            """Check available liquidity at best ask."""
+            ob = up_orderbook if token == 'UP' else down_orderbook
+            if not ob or not ob.get('asks'):
+                return 0
+            asks = ob['asks']
+            total = 0
+            for ask in asks[:3]:  # Top 3 levels
+                try:
+                    total += float(ask.get('size', ask.get('s', 0)))
+                except (ValueError, TypeError):
+                    pass
+            return total
+
+        def detect_momentum() -> tuple:
+            """
+            Detect which side has momentum (trending toward winning).
+            Returns: (trending_token, strength, confidence)
+              - trending_token: 'UP' or 'DOWN' or None
+              - strength: float 0-1 (how strong the trend is)
+              - confidence: float 0-1 (how reliable the signal is)
+            """
+            if len(self.price_history_up) < self.momentum_min_samples:
+                return None, 0, 0
+            
+            # Current prices as probability signal
+            # UP at $0.60 = 60% chance UP wins
+            up_prob = up_price
+            down_prob = down_price
+            
+            # Check if one side is clearly favored (>56%)
+            if up_prob <= (0.50 + self.momentum_threshold) and down_prob <= (0.50 + self.momentum_threshold):
+                return None, 0, 0  # Market is ~50/50, no clear momentum
+            
+            # Determine favored side
+            if up_prob > down_prob:
+                favored = 'UP'
+                favored_prob = up_prob
+                history = list(self.price_history_up)
+            else:
+                favored = 'DOWN'
+                favored_prob = down_prob
+                history = list(self.price_history_down)
+            
+            # Check trend: is price rising over recent samples?
+            recent = history[-min(len(history), 10):]
+            if len(recent) < 3:
+                return None, 0, 0
+            
+            early_avg = sum(recent[:len(recent)//2]) / (len(recent)//2)
+            late_avg = sum(recent[len(recent)//2:]) / len(recent[len(recent)//2:])
+            trend = late_avg - early_avg  # positive = price rising = momentum
+            
+            # Two ways to detect momentum:
+            # 1. RISING: price is actively going up (trend >= threshold)
+            # 2. SUSTAINED: price has been consistently high for 70%+ of window
+            is_rising = trend >= self.momentum_trend_strength
+            above_count = sum(1 for p in recent if p > (0.50 + self.momentum_threshold))
+            is_sustained = above_count >= len(recent) * 0.7 and favored_prob > (0.50 + self.momentum_threshold)
+            
+            if not is_rising and not is_sustained:
+                return None, 0, 0  # Neither rising nor sustained
+            
+            # Strength: how far above 0.50 (capped at 1.0)
+            strength = min(1.0, (favored_prob - 0.50) / 0.30)  # 0.50=0, 0.80=1.0
+            
+            # Confidence: based on consistency of trend
+            # Count how many of the last 5 samples showed this side leading
+            last_5_up = list(self.price_history_up)[-5:]
+            last_5_down = list(self.price_history_down)[-5:]
+            leading_count = sum(1 for u, d in zip(last_5_up, last_5_down) 
+                              if (u > d) == (favored == 'UP'))
+            confidence = leading_count / max(len(last_5_up), 1)
+            
+            return favored, strength, confidence
+
+        # ══════════════════════════════════════════════════════════
+        #  PHASE 1: ENTRY - Buy the cheap side first
+        #  This becomes our base position AND reversal insurance.
+        #  Always buy cheap side — it's cheap because it's losing NOW,
+        #  but if the market reverses, we already have shares.
+        # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 and self.qty_down == 0:
-            if cheap_price <= self.cheap_entry_price:
-                trade = buy_with_spend(cheap_token, cheap_price, self.entry_trade_usd, 'entry_cheapest')
+            # Don't start new positions with < 1 min left
+            if time_to_close is not None and time_to_close < 60:
+                self.current_mode = 'too_late'
+                self.mode_reason = f'⏰ No position, <1min left ({time_to_close:.0f}s) - skipping'
+                return trades
+
+            cheap_token = 'UP' if up_price <= down_price else 'DOWN'
+            cheap_price = min(up_price, down_price)
+
+            if cheap_price <= self.single_entry_price:
+                spend = self.entry_trade_usd  # $3 initial base
+                trade = buy_with_spend(cheap_token, cheap_price, spend, 'base_entry')
                 if trade:
                     trades.append(trade)
+                    other_price = max(up_price, down_price)
                     self.current_mode = 'entry'
-                    self.mode_reason = f'Entry on cheap {cheap_token} @ ${cheap_price:.3f}'
+                    self.mode_reason = f'🎯 Base {cheap_token} @ ${cheap_price:.3f} | potential pair ${cheap_price + other_price:.3f}'
                 return trades
-            self.current_mode = 'standby'
-            self.mode_reason = f'Waiting for price <= ${self.cheap_entry_price:.2f}'
+
+            self.current_mode = 'scouting'
+            self.mode_reason = f'🔍 Cheapest ${cheap_price:.3f} > ${self.single_entry_price:.2f} | UP ${up_price:.3f} DOWN ${down_price:.3f}'
             return trades
 
+        # ══════════════════════════════════════════════════════════
+        #  PHASE 2: DEVELOP - One side owned. Try arbitrage first,
+        #  then directional trend if arb not available.
+        # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
-            existing_token = 'UP' if self.qty_up > 0 else 'DOWN'
-            existing_cost = self.cost_up if existing_token == 'UP' else self.cost_down
-            existing_avg = self.avg_up if existing_token == 'UP' else self.avg_down
-            existing_price = up_price if existing_token == 'UP' else down_price
-            other_token = 'DOWN' if existing_token == 'UP' else 'UP'
+            owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
+            other_token = 'DOWN' if owned_token == 'UP' else 'UP'
+            owned_avg = self.avg_up if owned_token == 'UP' else self.avg_down
+            owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
             other_price = down_price if other_token == 'DOWN' else up_price
-            
-            # AVERAGING DOWN: If existing side is trading below avg, buy more to lower avg
-            # This creates more room for hedging the other side
-            if existing_price < existing_avg * 0.95:  # At least 5% discount
-                # Calculate new avg if we buy more
-                test_spend = min(self.entry_trade_usd, existing_cost * 0.5)  # Don't overdo it
-                test_qty = test_spend / existing_price if existing_price > 0 else 0
-                if test_qty >= self.min_trade_size:
-                    new_avg = (existing_cost + test_spend) / (self.qty_up + self.qty_down + test_qty)
-                    new_potential_pair = new_avg + other_price
-                    old_potential_pair = existing_avg + other_price
-                    
-                    # Only if it significantly improves hedge room
-                    if new_potential_pair < old_potential_pair - 0.02:  # At least 2¢ improvement
-                        trade = buy_with_spend(existing_token, existing_price, test_spend, 'avg_down')
-                        if trade:
-                            trades.append(trade)
-                            self.current_mode = 'averaging'
-                            self.mode_reason = f'Avg down {existing_token}: ${existing_avg:.3f}→${new_avg:.3f} (more hedge room)'
-                        return trades
-            
-            potential_pair = existing_avg + other_price
+            potential_pair = owned_avg + other_price
 
-            # ONLY complete the pair if it would create profit opportunity (pair < 1.0)
-            if potential_pair < 1.0:
-                # Match the existing position size (slightly more for buffer)
-                balance_spend = min(existing_cost * 1.2, self.balance_trade_usd)
-                trade = buy_with_spend(other_token, other_price, balance_spend, 'balance_entry')
+            # ── A) ARBITRAGE LOCK: pair < 0.97 → guaranteed profit ──
+            if potential_pair < MAX_PAIR_FOR_PROFIT:
+                spend = owned_cost  # Match dollar investment
+                trade = buy_with_spend(other_token, other_price, spend, 'arb_hedge')
                 if trade:
                     trades.append(trade)
-                    self.current_mode = 'balance'
-                    self.mode_reason = f'Adding {other_token} for profit (pair~{potential_pair:.3f})'
+                    self.current_mode = 'arb_locked'
+                    self.mode_reason = f'🔀 ARB hedge {other_token} @ ${other_price:.3f} | pair ${potential_pair:.3f} < ${MAX_PAIR_FOR_PROFIT} ✅'
                 return trades
 
-            self.current_mode = 'standby'
-            self.mode_reason = f'Waiting for profitable hedge (pair~{potential_pair:.3f} > 1.0)'
-            return trades
-
-        ratio = (self.qty_up / self.qty_down) if self.qty_down > 0 else 999.0
-        current_pair = self.pair_cost
-        locked_profit = self.calculate_locked_profit()
-
-        # PROFIT LOCK PHASE: If pair < 0.98, aggressively balance before stopping
-        if current_pair < self.pair_cost_safety_margin:
-            # Check if already balanced enough to stop trading
-            if self.balanced_ratio_range[0] <= ratio <= self.balanced_ratio_range[1]:
-                self.current_mode = 'standby'
-                self.mode_reason = f'🔒 Profit locked & balanced! (pair ${current_pair:.3f}, ratio {ratio:.2f}, locked ${locked_profit:.2f})'
+            # ── B) PARTIAL HEDGE: pair < 1.00 → reduce risk ──
+            if potential_pair < MAX_PAIR_FOR_HEDGE:
+                spend = owned_cost * 0.5
+                trade = buy_with_spend(other_token, other_price, spend, 'partial_hedge')
+                if trade:
+                    trades.append(trade)
+                    self.current_mode = 'partial_hedge'
+                    self.mode_reason = f'🔀 Partial hedge {other_token} @ ${other_price:.3f} | pair ${potential_pair:.3f} | 50% size'
                 return trades
-            
-            # Not balanced yet - calculate exactly how much to buy for balance
-            lagging_token = 'DOWN' if ratio > 1.0 else 'UP'
-            lagging_price = down_price if lagging_token == 'DOWN' else up_price
-            lagging_qty = self.qty_down if lagging_token == 'DOWN' else self.qty_up
-            leading_qty = self.qty_up if lagging_token == 'DOWN' else self.qty_down
-            other_price = up_price if lagging_token == 'DOWN' else down_price
-            
-            # Calculate qty needed to reach target ratio (default 1.0, but allow some buffer)
-            target_ratio = 1.0
-            qty_needed = (leading_qty * target_ratio) - lagging_qty
-            
-            if qty_needed > 0:
-                # Calculate spend needed, but cap it reasonably
-                ideal_spend = qty_needed * lagging_price
-                max_spend = min(ideal_spend, self.balance_trade_usd, remaining_budget * 0.8)
-                spend = cap_spend(max_spend)
-                
-                qty = min(spend / lagging_price, self._max_affordable_qty(lagging_price)) if lagging_price > 0 else 0.0
-                if qty >= self.min_trade_size:
-                    new_pair = pair_cost_after_buy(lagging_token, lagging_price, qty)
-                    # In profit lock, allow even if pair doesn't improve (as long as stays < 0.98)
-                    if new_pair < self.pair_cost_safety_margin:
-                        trade = buy_with_spend(lagging_token, lagging_price, spend, 'lock_profit_balance')
+
+            # ── C) DIRECTIONAL: Arb not available → follow the trend ──
+            trending_token, trend_strength, trend_confidence = detect_momentum()
+            if trending_token and trend_confidence >= 0.6:
+                trending_price = up_price if trending_token == 'UP' else down_price
+                if trending_price <= self.momentum_max_price:
+                    if trending_token == other_token:
+                        # Other side is trending → buy it (builds pair + follows trend)
+                        spend = owned_cost * 1.3  # Slightly more on trending side
+                        trade = buy_with_spend(other_token, other_price, spend, 'trend_pair')
                         if trade:
                             trades.append(trade)
-                            self.current_mode = 'locking'
-                            self.mode_reason = f'🔒 Balancing {lagging_token}: {qty_needed:.1f} needed (ratio {ratio:.2f}→1.0, pair ${current_pair:.3f})'
+                            self.current_mode = 'trend_pair'
+                            self.mode_reason = f'📈 Trend+pair {other_token} @ ${other_price:.3f} | pair ${potential_pair:.3f} | trend conf {trend_confidence:.0%}'
                         return trades
                     else:
-                        self.current_mode = 'standby'
-                        self.mode_reason = f'🔒 Profit locked but can\'t balance (would exceed ${self.pair_cost_safety_margin:.3f})'
-                        return trades
+                        # We already own the trending side!
+                        # Add small insurance on other side if cheap enough
+                        if other_price <= self.single_entry_price:
+                            spend = self.entry_trade_usd  # Small insurance
+                            trade = buy_with_spend(other_token, other_price, spend, 'add_insurance')
+                            if trade:
+                                trades.append(trade)
+                                self.current_mode = 'insuring'
+                                self.mode_reason = f'🛡️ Insurance {other_token} @ ${other_price:.3f} | trend={trending_token}'
+                            return trades
 
-        # Normal rebalancing if imbalanced (stricter conditions)
-        if ratio > self.max_imbalance_ratio or ratio < (1.0 / self.max_imbalance_ratio):
-            lagging_token = 'DOWN' if ratio > 1.0 else 'UP'
-            lagging_price = down_price if lagging_token == 'DOWN' else up_price
-            lagging_avg = self.avg_down if lagging_token == 'DOWN' else self.avg_up
-            other_price = up_price if lagging_token == 'DOWN' else down_price
-            
-            # STRICT CONDITIONS:
-            # 1. Price must be below current average (brings avg down)
-            # 2. New pair must improve current pair
-            # 3. New pair must stay < 0.98 (safety margin)
-            if lagging_price >= lagging_avg:
-                self.current_mode = 'standby'
-                self.mode_reason = f'Imbalanced but {lagging_token} @ ${lagging_price:.3f} >= avg ${lagging_avg:.3f}'
-                return trades
-            
-            # Calculate spend - use more for extreme imbalances
-            imbalance_severity = max(ratio, 1.0/ratio)  # How far from 1.0
-            spend_multiplier = min(imbalance_severity / 2.0, 3.0)  # Scale up to 3x for severe imbalance
-            spend = cap_spend(kelly_spend(lagging_price, other_price, self.balance_trade_usd * spend_multiplier, 0.02))
-            qty = min(spend / lagging_price, self._max_affordable_qty(lagging_price)) if lagging_price > 0 else 0.0
-            if qty >= self.min_trade_size:
-                new_pair = pair_cost_after_buy(lagging_token, lagging_price, qty)
-                # Must improve AND stay under safety margin
-                if new_pair < current_pair and new_pair < self.pair_cost_safety_margin:
-                    trade = buy_with_spend(lagging_token, lagging_price, spend, 'rebalance')
-                    if trade:
-                        trades.append(trade)
-                        self.current_mode = 'balance'
-                        self.mode_reason = f'Rebalancing {lagging_token} (ratio {ratio:.2f}→balanced, pair {current_pair:.3f}→{new_pair:.3f})'
-                    return trades
-                else:
-                    self.current_mode = 'standby'
-                    self.mode_reason = f'Imbalanced but rebalance would worsen pair ({current_pair:.3f}→{new_pair:.3f})'
-                    return trades
+            target_other = MAX_PAIR_FOR_PROFIT - owned_avg
+            self.current_mode = 'waiting_develop'
+            self.mode_reason = f'⏳ {other_token} @ ${other_price:.3f} (need < ${target_other:.3f}) | pair ${potential_pair:.3f}'
+            return trades
 
-        if current_pair > self.target_pair_cost:
-            candidates = []
-            for token, price in (('UP', up_price), ('DOWN', down_price)):
-                current_avg = self.avg_up if token == 'UP' else self.avg_down
-                other_price = down_price if token == 'UP' else up_price
-                
-                # STRICT CONDITIONS:
-                # 1. Price must be below current average (brings avg down)
-                if price >= current_avg:
-                    continue
-                
-                # 2. Check for overexposure (>20% imbalance)
-                current_qty = self.qty_up if token == 'UP' else self.qty_down
-                other_qty = self.qty_down if token == 'UP' else self.qty_up
-                if other_qty > 0:  # Prevent div by zero
-                    current_ratio = current_qty / other_qty
-                    if current_ratio > self.max_overexposure:  # Already too heavy on this side
-                        continue
-                
-                spend = cap_spend(kelly_spend(price, other_price, self.improve_trade_usd, 0.01))
-                qty = min(spend / price, self._max_affordable_qty(price)) if price > 0 else 0.0
-                if qty < self.min_trade_size:
-                    continue
-                    
-                new_pair = pair_cost_after_buy(token, price, qty)
-                # 3. Must improve pair cost
-                # 4. Must stay under safety margin
-                if new_pair < current_pair and new_pair < self.pair_cost_safety_margin:
-                    candidates.append((new_pair, token, price, spend))
+        # ══════════════════════════════════════════════════════════
+        #  PHASE 3: MANAGE - Both sides owned
+        #  Continuously: improve arb + follow trends + handle reversals
+        #  No trade limit — use budget as needed.
+        # ══════════════════════════════════════════════════════════
+        ratio = (self.qty_up / self.qty_down) if self.qty_down > 0 else 999.0
+        pnl_up = self.calculate_pnl_if_up_wins()
+        pnl_down = self.calculate_pnl_if_down_wins()
 
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                new_pair, token, price, spend = candidates[0]
-                trade = buy_with_spend(token, price, spend, 'reduce_pair_cost')
+        # ── PROFIT SECURED? Stop trading. ──
+        if locked_profit >= self.min_profit_target:
+            self.current_mode = 'profit_secured'
+            self.mode_reason = f'💰 Locked ${locked_profit:.2f} ≥ ${self.min_profit_target:.2f} | pair ${current_pair:.3f} | ratio {ratio:.2f}'
+            return trades
+
+        trending_token, trend_strength, trend_confidence = detect_momentum()
+
+        # ── A) TREND FOLLOW: Buy more of the trending side (priority) ──
+        # This is the main profit driver — follow the market direction.
+        # If market reverses later, we already have the cheap-side base.
+        if (trending_token and trend_confidence >= 0.6
+            and time_to_close is not None and time_to_close > 60):
+
+            trending_price = up_price if trending_token == 'UP' else down_price
+
+            if trending_price <= self.momentum_max_price:
+                # Scale spend by trend strength
+                spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength)
+
+                trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
                 if trade:
                     trades.append(trade)
-                    self.current_mode = 'reduce_pair'
-                    self.mode_reason = f'Pair ${current_pair:.3f}→${new_pair:.3f}'
+                    new_pnl = self.calculate_pnl_if_up_wins() if trending_token == 'UP' else self.calculate_pnl_if_down_wins()
+                    self.current_mode = 'trend_follow'
+                    self.mode_reason = (f'📈 Follow {trending_token} @ ${trending_price:.3f} | '
+                                      f'conf {trend_confidence:.0%} str {trend_strength:.0%} | '
+                                      f'pnl_if_{trending_token.lower()}: ${new_pnl:+.2f}')
                 return trades
 
-        self.current_mode = 'standby'
-        self.mode_reason = f'Watching pair ${current_pair:.3f} / locked ${locked_profit:.2f}'
+        # ── B) ARB IMPROVE: Buy at discount to lower pair cost ──
+        # Only when no clear trend. Guards against extreme imbalance.
+        if not trending_token or trend_confidence < 0.5:
+            for token, price in [('UP', up_price), ('DOWN', down_price)]:
+                disc = discount_to_avg(token, price)
+                if disc < 0.05:  # Need 5%+ discount (strict)
+                    continue
+                # IMBALANCE GUARD: don't stack more than 3:1 on one side
+                my_qty = self.qty_up if token == 'UP' else self.qty_down
+                other_q = self.qty_down if token == 'UP' else self.qty_up
+                if other_q > 0 and my_qty / other_q > 3.0:
+                    continue  # Already too heavy on this side
+                if my_qty > 0 and other_q / my_qty > 3.0:
+                    pass  # This side is light — OK to buy more (rebalances)
+                test_spend = self.improve_trade_usd * size_for_discount(disc)
+                test_qty = test_spend / price if price > 0 else 0
+                if test_qty < self.min_trade_size:
+                    continue
+                new_pair = pair_cost_after_buy(token, price, test_qty)
+                if new_pair < current_pair - 0.005 and new_pair < MAX_PAIR_FOR_BALANCE:
+                    trade = buy_with_spend(token, price, test_spend, 'arb_improve')
+                    if trade:
+                        trades.append(trade)
+                        new_locked = self.calculate_locked_profit()
+                        self.current_mode = 'improving'
+                        self.mode_reason = f'⚡ {token} @ ${price:.3f} ({disc*100:.0f}%↓) | pair ${current_pair:.3f}→${new_pair:.3f} | locked ${locked_profit:+.2f}→${new_locked:+.2f}'
+                    return trades
+
+        # ── C) WATCHING: No discount, no trend ──
+        momentum_info = f' | 🧭 {trending_token} {trend_strength:.0%}/{trend_confidence:.0%}' if trending_token else ' | 🧭 no trend'
+        self.current_mode = 'watching'
+        self.mode_reason = f'👀 pair ${current_pair:.3f} | locked ${locked_profit:+.2f} | ratio {ratio:.2f} | UP:{pnl_up:+.1f} DOWN:{pnl_down:+.1f}{momentum_info}'
         return trades
 
     def resolve_market(self, outcome: str) -> float:
@@ -660,6 +1020,10 @@ class ArbitrageStrategy:
         pnl = self.cash_in - self.cash_out
         self.final_pnl = pnl
         self.final_pnl_gross = pnl + fees
+        
+        # Reset market-specific tracking for next market
+        self.reset_market_tracking()
+        
         return pnl
 
     def close_market(self):
@@ -668,6 +1032,7 @@ class ArbitrageStrategy:
     def set_market_start_time(self, start_time: Optional[datetime]):
         if start_time != self.window_start:
             self._reset_fill_history()
+            self.reset_market_tracking()  # Reset per-market budget tracking
         self.window_start = start_time
 
     def _reset_fill_history(self) -> None:
@@ -916,6 +1281,11 @@ class ArbitrageStrategy:
         total_cost = fill.total_cost
         fee = total_cost * FEE_RATE
         total_with_fee = total_cost + fee
+        
+        # Polymarket minimum order size is $1
+        if total_with_fee < 1.0:
+            return None
+            
         if total_with_fee > self.cash:
             return None
 
@@ -924,9 +1294,16 @@ class ArbitrageStrategy:
         self.total_fees_paid += fee
         self.net_invested = self.cash_out - self.cash_in  # compat
         self.trade_count += 1
+        self.market_spent += total_with_fee  # Track spending per market
         self.last_fill_time = time.time()
+        self._last_trade_time = time.time()  # Update cooldown timer
+        
+        # Simulate realistic trade execution time (25ms latency per trade)
+        # This ensures trades are sequential and see fresh orderbooks
+        time.sleep(0.025)
+        
         self.last_buy_fill = {
-            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3],  # Include milliseconds
             'token': token,
             'price': fill.fill_price,
             'qty': fill.filled_qty,
@@ -983,8 +1360,12 @@ class ArbitrageStrategy:
         self.net_invested = self.cash_out - self.cash_in  # compat
         self.trade_count += 1
         self.last_fill_time = time.time()
+        
+        # Simulate realistic trade execution time
+        time.sleep(0.025)
+        
         self.last_sell_fill = {
-            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3],  # Include milliseconds
             'token': token,
             'price': fill.fill_price,
             'qty': fill.filled_qty,
