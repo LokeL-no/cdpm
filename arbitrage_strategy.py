@@ -149,14 +149,14 @@ class ArbitrageStrategy:
         self.momentum_trend_strength = 0.03    # Price must have risen 3+ cents over window
         self.max_tilt_ratio = 1.40             # Never tilt beyond 1.4:1 ratio
         self.momentum_min_time = 120.0         # Need >2 min left to take momentum bet
-        self.momentum_max_price = 0.72         # Don't buy momentum side above $0.72
+        self.momentum_max_price = 0.85         # Don't buy momentum side above $0.85
         
         # Budget management
         self.max_market_spend_pct = 1.0   # Can use full budget in a market
         self.reserve_budget_pct = 0.05    # Keep 5% reserve ($20) as safety buffer
         self.emergency_mode_threshold = 0.10
         self.max_position_per_market = 9999.0  # No hard cap per market
-        self.min_trade_interval = 12.0  # Minimum 12 seconds between trades (pacing)
+        self.min_trade_interval = 12.0  # 12 seconds cooldown PER SIDE (UP/DOWN independent)
         
         # Time-based parameters
         self.min_time_to_enter = 60.0  # Don't enter if < 1 minute left (unless fixing negative profit)
@@ -178,7 +178,8 @@ class ArbitrageStrategy:
         self.highest_locked_profit = -float('inf')  # Track peak locked profit
         self.market_spent = 0.0  # Track total spent in current market
         self.emergency_mode = False  # Emergency mode when budget critical
-        self._last_trade_time = 0.0  # Timestamp of last trade (for cooldown)
+        self._last_trade_time_up = 0.0    # Per-side cooldown: last UP trade time
+        self._last_trade_time_down = 0.0  # Per-side cooldown: last DOWN trade time
 
         # Telemetry / history for UI compatibility
         self.mgp_history = deque(maxlen=180)
@@ -521,7 +522,8 @@ class ArbitrageStrategy:
         self.market_spent = 0.0
         self.emergency_mode = False
         self.best_pair_cost_seen = float('inf')
-        self._last_trade_time = 0.0
+        self._last_trade_time_up = 0.0
+        self._last_trade_time_down = 0.0
         self.price_history_up.clear()
         self.price_history_down.clear()
         self.combined_history.clear()
@@ -633,11 +635,12 @@ class ArbitrageStrategy:
             self.mode_reason = 'Missing best asks'
             return trades
 
-        # Trade cooldown: don't trade more often than min_trade_interval
+        # Per-side trade cooldown: each side (UP/DOWN) has independent 12s cooldown
         now = _time.time()
-        time_since_last = now - self._last_trade_time
-        if self._last_trade_time > 0 and time_since_last < self.min_trade_interval:
-            # Still collecting price data even during cooldown
+        up_on_cooldown = self._last_trade_time_up > 0 and (now - self._last_trade_time_up) < self.min_trade_interval
+        down_on_cooldown = self._last_trade_time_down > 0 and (now - self._last_trade_time_down) < self.min_trade_interval
+        if up_on_cooldown and down_on_cooldown:
+            # Both sides on cooldown — still collect price data
             combined = up_price + down_price
             self.price_history_up.append(up_price)
             self.price_history_down.append(down_price)
@@ -689,10 +692,9 @@ class ArbitrageStrategy:
                 return trades
             
             if self.qty_up > 0 and self.qty_down > 0 and current_pair > 1.005:
-                # Losing position, stop trading to limit damage
-                self.current_mode = 'too_late'
-                self.mode_reason = f'⏰ Endgame: accepting loss (pair ${current_pair:.3f})'
-                return trades
+                # Losing position, continue trading (no endgame stop)
+                self.current_mode = 'endgame_risk'
+                self.mode_reason = f'⏰ Endgame: loss risk (pair ${current_pair:.3f})'
             # If we have a position with pair < 1.0 but unbalanced, try to balance
             # Fall through to normal logic
 
@@ -707,6 +709,11 @@ class ArbitrageStrategy:
             return final
 
         def buy_with_spend(token: str, price: float, spend: float, reason: str) -> Optional[Tuple[str, str, float, float]]:
+            # Per-side cooldown check
+            if token == 'UP' and up_on_cooldown:
+                return None
+            if token == 'DOWN' and down_on_cooldown:
+                return None
             spend = cap_spend(spend)
             if spend <= 0 or price <= 0:
                 return None
@@ -962,6 +969,16 @@ class ArbitrageStrategy:
             if trending_price <= self.momentum_max_price:
                 # Scale spend by trend strength
                 spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength)
+
+                # HIGH-PRICE GUARD: At 0.80-0.85, limit to $1 on dominant side
+                # But allow full spend if buying the WEAKER side (market reversal rescue)
+                if trending_price >= 0.80:
+                    trending_qty = self.qty_up if trending_token == 'UP' else self.qty_down
+                    other_qty = self.qty_down if trending_token == 'UP' else self.qty_up
+                    if trending_qty >= other_qty:
+                        # Buying MORE of our dominant side at high price → small $1 only
+                        spend = min(spend, 1.0)
+                    # else: buying weaker side (reversal rescue) → keep full spend
 
                 trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
                 if trade:
@@ -1296,7 +1313,11 @@ class ArbitrageStrategy:
         self.trade_count += 1
         self.market_spent += total_with_fee  # Track spending per market
         self.last_fill_time = time.time()
-        self._last_trade_time = time.time()  # Update cooldown timer
+        # Update per-side cooldown timer
+        if token == 'UP':
+            self._last_trade_time_up = time.time()
+        else:
+            self._last_trade_time_down = time.time()
         
         # Simulate realistic trade execution time (25ms latency per trade)
         # This ensures trades are sequential and see fresh orderbooks
