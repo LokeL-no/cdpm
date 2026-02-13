@@ -180,6 +180,8 @@ class ArbitrageStrategy:
         self.emergency_mode = False  # Emergency mode when budget critical
         self._last_trade_time_up = 0.0    # Per-side cooldown: last UP trade time
         self._last_trade_time_down = 0.0  # Per-side cooldown: last DOWN trade time
+        self._prev_trend_token = None     # Track previous trend for flip detection
+        self._flip_active = False         # True when market flip detected (fast cooldown)
 
         # Telemetry / history for UI compatibility
         self.mgp_history = deque(maxlen=180)
@@ -524,6 +526,8 @@ class ArbitrageStrategy:
         self.best_pair_cost_seen = float('inf')
         self._last_trade_time_up = 0.0
         self._last_trade_time_down = 0.0
+        self._prev_trend_token = None
+        self._flip_active = False
         self.price_history_up.clear()
         self.price_history_down.clear()
         self.combined_history.clear()
@@ -615,7 +619,8 @@ class ArbitrageStrategy:
                          a) Improve pair cost when discount available (lower avg cost)
                          b) Follow trend — buy more of trending side
                          c) On reversal — existing cheap-side base becomes new profit path
-          4. ENDGAME   - Force hedge if one-sided < 45s. Stop if profitable.
+          4. PROTECT   - 120-60s left: lock in directional profit by hedging gradually.
+          5. ENDGAME   - <60s: stop if profitable. Only deeply discounted buys allowed.
         """
         import time as _time
         trades: List[Tuple[str, str, float, float]] = []
@@ -628,6 +633,23 @@ class ArbitrageStrategy:
         MAX_PAIR_FOR_HEDGE = 1.00    # Pair must be below this for risk reduction (may break even)
         MAX_PAIR_FOR_BALANCE = 0.99  # When balancing existing position, don't push pair above this
 
+        # ── TIME-DECAY MAX PRICE ──
+        # As market close approaches, lower the max price we'll pay.
+        # This prevents buying expensive shares that can reverse hard.
+        effective_max_price = self.momentum_max_price  # 0.85 default
+        late_game_scale = 1.0  # Trade size multiplier (shrinks near close)
+        if time_to_close is not None:
+            if time_to_close < 90:
+                # 90s→60s: max price drops 0.85→0.55, size drops to 30%
+                t_factor = max(0, (time_to_close - 60) / 30)  # 1.0→0.0
+                effective_max_price = 0.55 + (self.momentum_max_price - 0.55) * t_factor
+                late_game_scale = 0.3 + 0.7 * t_factor
+            elif time_to_close < 120:
+                # 120s→90s: max price drops 0.85→0.75, size drops to 60%
+                t_factor = max(0, (time_to_close - 90) / 30)  # 1.0→0.0
+                effective_max_price = 0.75 + (self.momentum_max_price - 0.75) * t_factor
+                late_game_scale = 0.6 + 0.4 * t_factor
+
         up_price = metrics_map['UP'].best_ask
         down_price = metrics_map['DOWN'].best_ask
         if up_price <= 0 or down_price <= 0:
@@ -635,10 +657,14 @@ class ArbitrageStrategy:
             self.mode_reason = 'Missing best asks'
             return trades
 
-        # Per-side trade cooldown: each side (UP/DOWN) has independent 12s cooldown
+        # Per-side trade cooldown: each side (UP/DOWN) has independent cooldown
+        # Normal: 12s per side. During FLIP (market reversal): 3s on rescue side.
         now = _time.time()
-        up_on_cooldown = self._last_trade_time_up > 0 and (now - self._last_trade_time_up) < self.min_trade_interval
-        down_on_cooldown = self._last_trade_time_down > 0 and (now - self._last_trade_time_down) < self.min_trade_interval
+        flip_cooldown = 3.0  # Fast cooldown when market flips (rescue buying)
+        up_cd = flip_cooldown if (self._flip_active and self._prev_trend_token == 'DOWN') else self.min_trade_interval
+        down_cd = flip_cooldown if (self._flip_active and self._prev_trend_token == 'UP') else self.min_trade_interval
+        up_on_cooldown = self._last_trade_time_up > 0 and (now - self._last_trade_time_up) < up_cd
+        down_on_cooldown = self._last_trade_time_down > 0 and (now - self._last_trade_time_down) < down_cd
         if up_on_cooldown and down_on_cooldown:
             # Both sides on cooldown — still collect price data
             combined = up_price + down_price
@@ -662,41 +688,51 @@ class ArbitrageStrategy:
         locked_profit = self.calculate_locked_profit()
         current_pair = self.pair_cost
 
-        # ── ENDGAME: Near market close ──
+        # ── ENDGAME: <60s left — minimize risk, stop most activity ──
         has_position = self.qty_up > 0 or self.qty_down > 0
         if time_to_close is not None and time_to_close < 60 and has_position:
-            # Less than 1 minute left WITH a position
             if locked_profit >= 0:
                 self.current_mode = 'profit_secured'
                 self.mode_reason = f'⏰ Endgame: profit secured ${locked_profit:.2f} | {time_to_close:.0f}s left'
                 return trades
             
-            # FORCED HEDGE: If one-sided position with < 45s left, hedge at ANY price
-            # The ~$0.15 spread loss is far better than risking full position loss ($3+)
+            # NO forced hedge — buying at any price during late volatility causes big losses.
+            # Only allow deeply discounted buys that genuinely improve our position.
             has_one_side_only = (self.qty_up > 0) != (self.qty_down > 0)
-            if has_one_side_only and time_to_close < 45:
+            if has_one_side_only:
                 owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
                 other_token = 'DOWN' if owned_token == 'UP' else 'UP'
-                owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
                 other_price = down_price if other_token == 'DOWN' else up_price
                 owned_avg = self.avg_up if owned_token == 'UP' else self.avg_down
+                potential_pair = owned_avg + other_price
                 
-                # Match dollar investment to balance quantities
-                spend = owned_cost
-                trade = buy_with_spend(other_token, other_price, spend, 'forced_hedge')
-                if trade:
-                    trades.append(trade)
-                    new_pair = owned_avg + other_price
-                    self.current_mode = 'forced_hedge'
-                    self.mode_reason = f'🛡️ FORCED HEDGE {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | {time_to_close:.0f}s left | limiting risk'
+                # Only hedge if it's genuinely cheap (pair < 1.00 = breakeven or better)
+                if potential_pair < MAX_PAIR_FOR_HEDGE:
+                    owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
+                    spend = min(owned_cost, 3.0)  # Cap at $3 in endgame
+                    trade = buy_with_spend(other_token, other_price, spend, 'endgame_hedge')
+                    if trade:
+                        trades.append(trade)
+                        self.current_mode = 'endgame_hedge'
+                        self.mode_reason = f'🛡️ Endgame hedge {other_token} @ ${other_price:.3f} | pair ${potential_pair:.3f} | {time_to_close:.0f}s left'
+                    return trades
+                
+                self.current_mode = 'endgame_hold'
+                self.mode_reason = f'⏰ Holding {owned_token} | hedge too expensive (pair ${potential_pair:.3f}) | {time_to_close:.0f}s left'
                 return trades
             
-            if self.qty_up > 0 and self.qty_down > 0 and current_pair > 1.005:
-                # Losing position, continue trading (no endgame stop)
-                self.current_mode = 'endgame_risk'
-                self.mode_reason = f'⏰ Endgame: loss risk (pair ${current_pair:.3f})'
-            # If we have a position with pair < 1.0 but unbalanced, try to balance
-            # Fall through to normal logic
+            # Both sides owned in endgame
+            if current_pair <= 1.00:
+                # Breakeven or profitable — hold
+                self.current_mode = 'endgame_hold'
+                self.mode_reason = f'⏰ Holding pair ${current_pair:.3f} | locked ${locked_profit:+.2f} | {time_to_close:.0f}s left'
+                return trades
+            
+            # Losing pair — only allow arb improve at deep discount in last minute
+            # Fall through but effective_max_price is already very low (0.55 or less)
+            self.current_mode = 'endgame_risk'
+            self.mode_reason = f'⏰ Endgame risk: pair ${current_pair:.3f} | {time_to_close:.0f}s left'
+            # Fall through to Phase 3 arb improve only (trend follow blocked by time gate)
 
         # ── Helper functions ──
         def cap_spend(spend: float) -> float:
@@ -914,7 +950,7 @@ class ArbitrageStrategy:
             trending_token, trend_strength, trend_confidence = detect_momentum()
             if trending_token and trend_confidence >= 0.6:
                 trending_price = up_price if trending_token == 'UP' else down_price
-                if trending_price <= self.momentum_max_price:
+                if trending_price <= effective_max_price:
                     if trending_token == other_token:
                         # Other side is trending → buy it (builds pair + follows trend)
                         spend = owned_cost * 1.3  # Slightly more on trending side
@@ -958,6 +994,69 @@ class ArbitrageStrategy:
 
         trending_token, trend_strength, trend_confidence = detect_momentum()
 
+        # ── FLIP DETECTION: Market reversal → fast rebalance ──
+        has_directional_exposure = abs(self.qty_up - self.qty_down) > 3.0  # Meaningful imbalance
+        if trending_token and trend_confidence >= 0.6 and has_directional_exposure:
+            if self._prev_trend_token and self._prev_trend_token != trending_token:
+                # FLIP! Trend changed direction — reset cooldown on new side for fast rescue
+                if trending_token == 'UP':
+                    self._last_trade_time_up = 0.0  # Reset UP cooldown immediately
+                    up_on_cooldown = False
+                else:
+                    self._last_trade_time_down = 0.0  # Reset DOWN cooldown immediately
+                    down_on_cooldown = False
+                self._flip_active = True
+                print(f"🔄 FLIP detected: {self._prev_trend_token}→{trending_token} | imbalance UP:{self.qty_up:.0f} DOWN:{self.qty_down:.0f} | fast cooldown ON")
+            self._prev_trend_token = trending_token
+        elif not trending_token or trend_confidence < 0.4:
+            # No clear trend — deactivate flip mode
+            if self._flip_active:
+                self._flip_active = False
+                print(f"🔄 Flip mode OFF — no clear trend")
+        
+        # Check if flip rescue is complete (position rebalanced)
+        if self._flip_active:
+            min_q = min(self.qty_up, self.qty_down)
+            max_q = max(self.qty_up, self.qty_down)
+            if min_q > 0 and max_q / min_q <= 2.0:
+                self._flip_active = False
+                print(f"🔄 Flip rescue complete — balanced UP:{self.qty_up:.0f} DOWN:{self.qty_down:.0f}")
+
+        # ══════════════════════════════════════════════════════════
+        #  PROTECTION MODE: 120s-60s left — lock in directional profits
+        #  If we have good PnL on one side, gradually buy the OTHER side
+        #  to convert directional profit into locked profit before volatility.
+        # ══════════════════════════════════════════════════════════
+        if time_to_close is not None and 60 <= time_to_close <= 120:
+            directional_profit = max(pnl_up, pnl_down)  # Best-case scenario PnL
+            weaker_pnl = min(pnl_up, pnl_down)  # Worst-case
+            
+            # Only protect if we have meaningful directional profit AND it's not already locked
+            if directional_profit >= 2.0 and weaker_pnl < directional_profit * 0.5:
+                # Figure out which side to hedge (buy the side we're weak on)
+                if pnl_up > pnl_down:
+                    # UP is our strong side → buy more DOWN to lock some of UP's profit
+                    hedge_token = 'DOWN'
+                    hedge_price = down_price
+                else:
+                    hedge_token = 'UP'
+                    hedge_price = up_price
+                
+                # Only hedge at reasonable prices (use time-decayed max)
+                if hedge_price <= effective_max_price:
+                    # Scale hedge spend: more aggressive as time runs out
+                    urgency = 1.0 - ((time_to_close - 60) / 60)  # 0.0 at 120s, 1.0 at 60s
+                    hedge_spend = 2.0 + urgency * 3.0  # $2 at 120s, $5 at 60s
+                    trade = buy_with_spend(hedge_token, hedge_price, hedge_spend, 'protect_lock')
+                    if trade:
+                        trades.append(trade)
+                        new_locked = self.calculate_locked_profit()
+                        self.current_mode = 'protecting'
+                        self.mode_reason = (f'🔒 Protect: buy {hedge_token} @ ${hedge_price:.3f} | '
+                                           f'dir profit ${directional_profit:.2f} → locked ${new_locked:+.2f} | '
+                                           f'{time_to_close:.0f}s left')
+                    return trades
+
         # ── A) TREND FOLLOW: Buy more of the trending side (priority) ──
         # This is the main profit driver — follow the market direction.
         # If market reverses later, we already have the cheap-side base.
@@ -966,17 +1065,16 @@ class ArbitrageStrategy:
 
             trending_price = up_price if trending_token == 'UP' else down_price
 
-            if trending_price <= self.momentum_max_price:
-                # Scale spend by trend strength
-                spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength)
+            if trending_price <= effective_max_price:
+                # Scale spend by trend strength AND time remaining
+                spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
 
-                # HIGH-PRICE GUARD: At 0.80-0.85, limit to $1 on dominant side
+                # HIGH-PRICE GUARD: At 0.80+, limit to $1 on dominant side
                 # But allow full spend if buying the WEAKER side (market reversal rescue)
                 if trending_price >= 0.80:
                     trending_qty = self.qty_up if trending_token == 'UP' else self.qty_down
                     other_qty = self.qty_down if trending_token == 'UP' else self.qty_up
                     if trending_qty >= other_qty:
-                        # Buying MORE of our dominant side at high price → small $1 only
                         spend = min(spend, 1.0)
                     # else: buying weaker side (reversal rescue) → keep full spend
 
