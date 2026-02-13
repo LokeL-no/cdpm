@@ -595,9 +595,7 @@ HTML_TEMPLATE = """
         <div class="header">
             <h1>🤖 Polymarket Multi-Market Bot</h1>
             <div style="color: #888; font-size: 12px;">
-                <span style="color: #3b82f6; font-weight: bold;">
-                💰 MGP ARBITRAGE 💰 | Delta Neutral | Lock Both Scenarios Positive
-                </span> | 
+
                 <span id="current-time">--:--:--</span>
             </div>
             <div style="margin-top: 10px;">
@@ -1458,7 +1456,7 @@ HTML_TEMPLATE = """
                                 </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Budget Used</div>
-                                    <div class="holding-value" style="color: ${(pt.cost_up + pt.cost_down) / 200 < 0.5 ? '#22c55e' : (pt.cost_up + pt.cost_down) / 200 < 0.9 ? '#f59e0b' : '#ef4444'};">$${(pt.cost_up + pt.cost_down).toFixed(0)}/$200</div>
+                                    <div class="holding-value" style="color: ${(pt.cost_up + pt.cost_down) / 400 < 0.5 ? '#22c55e' : (pt.cost_up + pt.cost_down) / 400 < 0.9 ? '#f59e0b' : '#ef4444'};">$${(pt.cost_up + pt.cost_down).toFixed(0)}/$400</div>
                                 </div>
                             </div>
                             <div class="holdings-row-2" style="margin-top: 8px; border-top: 1px solid #374151; padding-top: 8px;">
