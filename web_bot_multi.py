@@ -126,9 +126,9 @@ HTML_TEMPLATE = """
             width: 400px;
             flex-shrink: 0;
         }
-
-        #orderbook-mobile-slot {
-            margin-top: 20px;
+        .mobile-orderbook {
+            display: none;
+            margin-top: 12px;
         }
 
         @media (max-width: 900px) {
@@ -137,7 +137,11 @@ HTML_TEMPLATE = """
             }
 
             .markets-right {
-                width: 100%;
+                display: none;
+            }
+
+            .mobile-orderbook {
+                display: block;
             }
         }
         
@@ -792,7 +796,6 @@ HTML_TEMPLATE = """
                 </tbody>
             </table>
         </div>
-        <div id="orderbook-mobile-slot"></div>
     </div>
     
     <script>
@@ -800,20 +803,6 @@ HTML_TEMPLATE = """
         let reconnectTimeout;
         let latestSnapshot = null;
         const orderbookCollapseState = {};
-
-        function moveOrderbookForMobile() {
-            const panel = document.getElementById('orderbook-panel');
-            const mobileSlot = document.getElementById('orderbook-mobile-slot');
-            const desktopSlot = document.querySelector('.markets-right');
-            if (!panel || !mobileSlot || !desktopSlot) return;
-
-            const isMobile = window.innerWidth <= 900;
-            if (isMobile && panel.parentElement !== mobileSlot) {
-                mobileSlot.appendChild(panel);
-            } else if (!isMobile && panel.parentElement !== desktopSlot) {
-                desktopSlot.appendChild(panel);
-            }
-        }
         
         function togglePause() {
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -836,9 +825,6 @@ HTML_TEMPLATE = """
             const isCollapsed = section.classList.toggle('collapsed');
             btn.textContent = isCollapsed ? 'Show' : 'Hide';
         }
-
-        window.addEventListener('resize', moveOrderbookForMobile);
-        window.addEventListener('DOMContentLoaded', moveOrderbookForMobile);
 
         function formatBookSize(size) {
             if (!size || size <= 0) return '--';
@@ -1396,23 +1382,12 @@ HTML_TEMPLATE = """
                     const finalPnl = pt.final_pnl ?? 0;
                     const finalGross = pt.final_pnl_gross ?? finalPnl;
                     const feesPaid = pt.fees_paid ?? 0;
-                    const activeSells = pt.active_sells || [];
-                    const filledSells = pt.filled_sells || [];
                     const lockedProfit = pt.locked_profit || 0;
                     const orderbooks = market.orderbooks || {};
                     const upOrderbook = orderbooks.up || { bids: [], asks: [] };
                     const downOrderbook = orderbooks.down || { bids: [], asks: [] };
                     const upOrderbookHtml = renderOrderbookTable(slug, 'UP', upOrderbook);
                     const downOrderbookHtml = renderOrderbookTable(slug, 'DOWN', downOrderbook);
-                    const activeSellText = activeSells.length
-                        ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
-                        : 'none';
-                    const filledSellText = filledSells.length
-                        ? filledSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.fill_price.toFixed(3)}`).join(' | ')
-                        : 'none';
-                    const sellBadge = activeSells.length
-                        ? `<span class="sell-badge sell-badge-active">SELLS ${activeSells.length}</span>`
-                        : `<span class="sell-badge sell-badge-none">SELLS 0</span>`;
                     
                     html += `
                         <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}" 
@@ -1422,7 +1397,6 @@ HTML_TEMPLATE = """
                             <div class="market-header">
                                 <span class="asset-badge asset-${market.asset}">${asset}</span>
                                 <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
-                                ${sellBadge}
                             </div>
                             <div style="font-size: 11px; color: #888; margin-bottom: 6px;">
                                 ${market.window_time || slug}
@@ -1474,16 +1448,6 @@ HTML_TEMPLATE = """
                                 </div>
                             </div>
                             <div class="holdings-row-2" style="margin-top: 4px;">
-                                <div class="holding-item">
-                                    <div class="holding-label">Pivots</div>
-                                    <div class="holding-value" style="color: ${pt.pivot_count === 0 ? '#888' : pt.equalized ? '#ef4444' : '#3b82f6'};">🔄 ${pt.pivot_count || 0}/${pt.max_pivots || 4}${pt.equalized ? ' ⚖️' : ''}</div>
-                                </div>
-                                <div class="holding-item" style="grid-column: span 2;">
-                                    <div class="holding-label">Active Sells</div>
-                                    <div class="holding-label" style="color: #9ca3af;">${activeSellText}</div>
-                                    <div class="holding-label" style="margin-top: 4px;">Filled Sells</div>
-                                    <div class="holding-label" style="color: #22c55e;">${filledSellText}</div>
-                                </div>
                                 <div class="holding-item">
                                     <div class="holding-label">Trades</div>
                                     <div class="holding-value" style="color: #888;">${pt.trade_count || 0}</div>
@@ -1643,6 +1607,12 @@ HTML_TEMPLATE = """
                                 </div>
                             </div>
                             ` : ''}
+                            <div class="mobile-orderbook">
+                                <div class="orderbook-grid">
+                                    ${upOrderbookHtml}
+                                    ${downOrderbookHtml}
+                                </div>
+                            </div>
                         </div>
                     `;
                 }
