@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket Multi-Market Bot - BTC, ETH, SOL, XRP Up/Down Tracker
+Polymarket Multi-Market Bot - BTC 5m Up/Down Tracker
 Web-based interface with real-time updates via WebSocket.
 NEW: Dynamic Delta Neutral Arbitrage Strategy - Mean Reversion
 """
@@ -20,14 +20,16 @@ from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
 
 # Supported assets
-SUPPORTED_ASSETS = ['btc', 'eth', 'sol', 'xrp']
+SUPPORTED_ASSETS = ['btc']
 
-# Per-asset budget (how much $ to allocate per 15-min market)
+# 5-minute market settings
+MARKET_WINDOW_SECONDS = 300
+MARKET_WINDOW_SUFFIX = "5m"
+URGENCY_THRESHOLD_SECONDS = 90
+
+# Per-asset budget (how much $ to allocate per 5-min market)
 ASSET_BUDGETS = {
-    'btc': 200.0,
-    'eth': 200.0,
-    'sol': 200.0,
-    'xrp': 200.0,
+    'btc': 400.0,
 }
 
 # Manual markets to track (leave empty for auto-discovery)
@@ -109,11 +111,26 @@ HTML_TEMPLATE = """
         .neutral { color: #3b82f6; }
         .quote-action { color: #60a5fa; font-weight: 600; }
         
+        .markets-container {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .markets-left {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .markets-right {
+            width: 400px;
+            flex-shrink: 0;
+        }
+        
         .markets-grid {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: 1fr;
             gap: 15px;
-            margin-bottom: 20px;
         }
         
         .market-card {
@@ -568,57 +585,7 @@ HTML_TEMPLATE = """
             border-color: #f59e0b;
             background: rgba(245, 158, 11, 0.12);
         }
-        .order-event-feed {
-            margin-top: 12px;
-            border-top: 1px dashed #1f2937;
-            padding-top: 8px;
-            font-size: 10px;
-            color: #9ca3af;
-        }
-        .order-event {
-            display: flex;
-            justify-content: space-between;
-            padding: 2px 0;
-        }
-        .order-event strong {
-            color: #f9fafb;
-            font-weight: 600;
-        }
-        .fill-history {
-            margin-top: 10px;
-            padding: 10px;
-            background: #0f172a;
-            border: 1px solid #1f2937;
-            border-radius: 6px;
-        }
-        .fill-history-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 11px;
-            color: #94a3af;
-            margin-bottom: 6px;
-        }
-        .fill-row {
-            display: flex;
-            justify-content: space-between;
-            gap: 8px;
-            font-size: 11px;
-            padding: 4px 0;
-            border-top: 1px solid rgba(148, 163, 184, 0.12);
-        }
-        .fill-row:first-child {
-            border-top: none;
-        }
-        .fill-left {
-            color: #e2e8f0;
-        }
-        .fill-right {
-            text-align: right;
-            color: #9ca3af;
-        }
-        .fill-action-buy { color: #60a5fa; }
-        .fill-action-sell { color: #22c55e; }
+        
     </style>
 </head>
 <body>
@@ -642,11 +609,11 @@ HTML_TEMPLATE = """
         <div class="global-stats">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
-                <div class="value neutral">$<span id="starting-balance">800.00</span></div>
+                <div class="value neutral">$<span id="starting-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">True Balance</div>
-                <div class="value neutral">$<span id="current-balance">800.00</span></div>
+                <div class="value neutral">$<span id="current-balance">400.00</span></div>
             </div>
             <div class="global-stat">
                 <div class="label">Total PnL</div>
@@ -744,10 +711,20 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
-        <h2 style="color: #3b82f6; margin-bottom: 15px;">📊 Active Markets</h2>
-        <div class="markets-grid" id="active-markets">
-            <div style="color: #888; text-align: center; padding: 40px; grid-column: span 2;">
-                Searching for active markets...
+        <div class="markets-container">
+            <div class="markets-left">
+                <h2 style="color: #3b82f6; margin-bottom: 15px;">📊 Active Markets</h2>
+                <div class="markets-grid" id="active-markets">
+                    <div style="color: #888; text-align: center; padding: 40px;">
+                        Searching for active markets...
+                    </div>
+                </div>
+            </div>
+            <div class="markets-right">
+                <h2 style="color: #3b82f6; margin-bottom: 15px;">📖 Orderbook</h2>
+                <div id="global-orderbook" style="background: #111827; border-radius: 12px; border: 1px solid #1f2937; padding: 15px; min-height: 400px;">
+                    <div style="color: #888; text-align: center; padding: 40px;">Select a market to view orderbook</div>
+                </div>
             </div>
         </div>
         
@@ -816,7 +793,7 @@ HTML_TEMPLATE = """
         }
         
         function resetBot() {
-            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $800.')) {
+            if (confirm('Are you sure you want to reset the bot? This will clear all data and reset balance to $400.')) {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ action: 'reset' }));
                 }
@@ -902,181 +879,129 @@ HTML_TEMPLATE = """
             `;
         }
 
-        function renderOrderActivity(activity, events) {
-            const tokens = ['UP', 'DOWN'];
-            const sides = ['bid', 'ask'];
-            const cells = [];
-            for (const token of tokens) {
-                for (const side of sides) {
-                    const info = activity && activity[token] && activity[token][side]
-                        ? activity[token][side]
-                        : null;
-                    const state = info && info.state ? info.state.toUpperCase() : 'IDLE';
-                    const pillClass = state === 'PLACED' ? 'placed' : state === 'FILLED' ? 'filled' : state === 'CANCELLED' ? 'cancelled' : 'idle';
-                    const basePrice = (info && typeof info.price === 'number') ? `$${Number(info.price).toFixed(3)}` : '--';
-                    const baseQty = (info && typeof info.qty === 'number') ? `${Number(info.qty).toFixed(1)} sh` : '--';
-                    const displayPrice = (state === 'FILLED' && info && typeof info.fill_price === 'number')
-                        ? `$${Number(info.fill_price).toFixed(3)}`
-                        : basePrice;
-                    const displayQty = (state === 'FILLED' && info && typeof info.fill_qty === 'number')
-                        ? `${Number(info.fill_qty).toFixed(1)} sh`
-                        : baseQty;
-                    let statusLine = 'Idle';
-                    let detailLine = 'No resting order';
-                    if (state === 'PLACED') {
-                        statusLine = `Placed ${info?.placed_at || '--'}`;
-                        detailLine = `${baseQty} @ ${basePrice}`;
-                    } else if (state === 'FILLED') {
-                        const fillPrice = (info && typeof info.fill_price === 'number') ? `$${Number(info.fill_price).toFixed(3)}` : basePrice;
-                        const fillQty = (info && typeof info.fill_qty === 'number') ? `${Number(info.fill_qty).toFixed(1)} sh` : baseQty;
-                        statusLine = `Filled ${info?.filled_at || info?.updated_at || '--'}`;
-                        detailLine = `${fillQty} @ ${fillPrice}`;
-                    } else if (state === 'CANCELLED') {
-                        statusLine = `Cancelled ${info?.updated_at || '--'}`;
-                        detailLine = `${baseQty} @ ${basePrice}`;
-                    }
-                    const badge = info && info.aggressive ? '<span style="color:#f97316;font-size:10px;">AGG</span>' : '';
-                    cells.push(`
-                        <div class="order-pill ${pillClass}">
-                            <div class="order-label">
-                                <span>${token} ${side === 'bid' ? 'BID' : 'ASK'}</span>
-                                ${badge}
-                            </div>
-                            <div class="order-price">${displayPrice}</div>
-                            <div class="order-status">${statusLine}</div>
-                            <div class="order-status" style="font-size:9px;">${detailLine}</div>
+        let selectedMarketSlug = null;
+
+        function selectMarket(slug) {
+            selectedMarketSlug = slug;
+            // Highlight selected market
+            document.querySelectorAll('.market-card').forEach(card => {
+                if (card.dataset.slug === slug) {
+                    card.style.borderColor = '#3b82f6';
+                    card.style.transform = 'scale(1.02)';
+                } else {
+                    card.style.borderColor = '#333';
+                    card.style.transform = 'scale(1)';
+                }
+            });
+            // Update orderbook display
+            if (latestSnapshot) {
+                updateGlobalOrderbook(latestSnapshot);
+            }
+        }
+
+        function updateGlobalOrderbook(data) {
+            if (!selectedMarketSlug || !data.active_markets[selectedMarketSlug]) {
+                return;
+            }
+            
+            const market = data.active_markets[selectedMarketSlug];
+            const orderbooks = market.orderbooks || {};
+            const upOrderbook = orderbooks.up || { bids: [], asks: [] };
+            const downOrderbook = orderbooks.down || { bids: [], asks: [] };
+            
+            let html = `
+                <div style="margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #374151;">
+                    <div style="font-weight: bold; color: #3b82f6; margin-bottom: 5px;">
+                        ${market.asset.toUpperCase()} Market
+                    </div>
+                    <div style="font-size: 11px; color: #888;">
+                        ${market.window_time || selectedMarketSlug}
+                    </div>
+                </div>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div style="background: rgba(34, 197, 94, 0.1); padding: 8px; border-radius: 6px; border: 1px solid #16a34a;">
+                        <div style="text-align: center; color: #22c55e; font-weight: bold; margin-bottom: 4px;">UP</div>
+                        <div style="text-align: center; font-size: 20px; font-weight: bold; color: #fff;">
+                            $${market.up_price?.toFixed(3) || '-.---'}
                         </div>
-                    `);
-                }
-            }
-            const summary = {};
-            for (const token of tokens) {
-                summary[token] = {
-                    bid: { placed: 0, filled: 0, cancelled: 0 },
-                    ask: { placed: 0, filled: 0, cancelled: 0 },
-                };
-            }
-            for (const evt of events || []) {
-                const token = evt.token;
-                const side = typeof evt.side === 'string' ? evt.side.toLowerCase() : '';
-                if (!summary[token] || !summary[token][side]) {
-                    continue;
-                }
-                if (evt.type === 'QUOTE_PLACED') {
-                    summary[token][side].placed += 1;
-                } else if (evt.type === 'FILL') {
-                    summary[token][side].filled += 1;
-                } else if (evt.type === 'QUOTE_CANCELLED') {
-                    summary[token][side].cancelled += 1;
-                }
-            }
-            const breakdownRows = [];
-            for (const token of tokens) {
-                for (const side of sides) {
-                    const stats = summary[token][side];
-                    breakdownRows.push(`
-                        <tr>
-                            <td>${token} ${side === 'bid' ? 'BID' : 'ASK'}</td>
-                            <td>${stats.placed}</td>
-                            <td>${stats.filled}</td>
-                            <td>${stats.cancelled}</td>
-                        </tr>
-                    `);
-                }
-            }
-            const breakdownHtml = `
-                <div class="order-breakdown" style="margin-top:8px;">
-                    <div style="font-size:11px;color:#94a3af;margin-bottom:4px;">Bid/ask outcomes (last ${(events || []).length} events)</div>
-                    <table style="width:100%;font-size:10px;border-collapse:collapse;">
+                    </div>
+                    <div style="background: rgba(239, 68, 68, 0.1); padding: 8px; border-radius: 6px; border: 1px solid #dc2626;">
+                        <div style="text-align: center; color: #ef4444; font-weight: bold; margin-bottom: 4px;">DOWN</div>
+                        <div style="text-align: center; font-size: 20px; font-weight: bold; color: #fff;">
+                            $${market.down_price?.toFixed(3) || '-.---'}
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="orderbook-panel up" style="margin-bottom: 15px;">
+                    <h3 style="color: #22c55e; font-size: 14px; margin-bottom: 10px;">UP Token (Long)</h3>
+                    <table class="orderbook-table">
                         <thead>
-                            <tr style="text-align:left;color:#9ca3af;">
-                                <th style="padding:4px 0;">Side</th>
-                                <th style="padding:4px 0;">Placed</th>
-                                <th style="padding:4px 0;">Filled</th>
-                                <th style="padding:4px 0;">Cancelled</th>
+                            <tr>
+                                <th>BID</th>
+                                <th>SIZE</th>
+                                <th>ASK</th>
+                                <th>SIZE</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${breakdownRows.join('')}
+                            ${renderOrderbookRows(upOrderbook)}
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="orderbook-panel down">
+                    <h3 style="color: #ef4444; font-size: 14px; margin-bottom: 10px;">DOWN Token (Short)</h3>
+                    <table class="orderbook-table">
+                        <thead>
+                            <tr>
+                                <th>BID</th>
+                                <th>SIZE</th>
+                                <th>ASK</th>
+                                <th>SIZE</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${renderOrderbookRows(downOrderbook)}
                         </tbody>
                     </table>
                 </div>
             `;
-            const recentEvents = (events || []).slice(-4).reverse();
-            const eventRows = recentEvents.length
-                ? recentEvents.map(evt => {
-                    const label = evt.type === 'FILL' ? 'Fill' : evt.type === 'QUOTE_PLACED' ? 'Placed' : evt.type === 'QUOTE_CANCELLED' ? 'Cancelled' : (evt.type || 'Event');
-                    const priceText = (typeof evt.price === 'number') ? `$${Number(evt.price).toFixed(3)}` : '--';
-                    const qtyText = (typeof evt.qty === 'number') ? `${Number(evt.qty).toFixed(1)} sh` : '--';
-                    const reasonText = evt.reason ? ` · ${evt.reason.replace(/_/g, ' ')}` : '';
-                    return `<div class="order-event"><span>${evt.time || '--'} • ${evt.token || ''} ${evt.side || ''} ${label}${reasonText}</span><strong>${priceText} | ${qtyText}</strong></div>`;
-                }).join('')
-                : '<div class="order-event" style="opacity:0.5;">No recent order activity</div>';
-
-            return `
-                <div class="order-activity">
-                    <div class="order-activity-header">
-                        <span>📡 Order Activity</span>
-                        <span style="color:#94a3af; font-size:10px;">Bid/ask placements & fills</span>
-                    </div>
-                    <div class="order-activity-grid">
-                        ${cells.join('')}
-                    </div>
-                    ${breakdownHtml}
-                    <div class="order-event-feed">
-                        ${eventRows}
-                    </div>
-                </div>
-            `;
+            
+            document.getElementById('global-orderbook').innerHTML = html;
         }
 
-        function renderFillHistory(fillHistory) {
-            const history = Array.isArray(fillHistory) ? fillHistory.slice(-6).reverse() : [];
-            if (!history.length) {
-                return `
-                    <div class="fill-history">
-                        <div class="fill-history-header">
-                            <span>🧾 Fill History</span>
-                            <span style="opacity:0.7;">No fills yet</span>
-                        </div>
-                        <div class="fill-row" style="opacity:0.6;">
-                            <div class="fill-left">Waiting for fills...</div>
-                            <div class="fill-right">--</div>
-                        </div>
-                    </div>
+        function renderOrderbookRows(book) {
+            const bids = (book && Array.isArray(book.bids)) ? book.bids : [];
+            const asks = (book && Array.isArray(book.asks)) ? book.asks : [];
+            const maxRows = Math.max(bids.length, asks.length, 5);
+            
+            if (maxRows === 0 || (bids.length === 0 && asks.length === 0)) {
+                return `<tr><td colspan="4" class="orderbook-empty" style="text-align: center; color: #666; padding: 20px;">No liquidity</td></tr>`;
+            }
+            
+            let rows = '';
+            for (let i = 0; i < Math.min(maxRows, 10); i++) {
+                const bid = bids[i];
+                const ask = asks[i];
+                const bidPrice = bid ? `<span style="color: #22c55e;">${Number(bid.price).toFixed(3)}</span>` : '<span style="color: #444;">--</span>';
+                const bidSize = bid ? formatBookSize(bid.size) : '<span style="color: #444;">--</span>';
+                const askPrice = ask ? `<span style="color: #ef4444;">${Number(ask.price).toFixed(3)}</span>` : '<span style="color: #444;">--</span>';
+                const askSize = ask ? formatBookSize(ask.size) : '<span style="color: #444;">--</span>';
+                rows += `
+                    <tr>
+                        <td>${bidPrice}</td>
+                        <td style="color: #fbbf24;">${bidSize}</td>
+                        <td>${askPrice}</td>
+                        <td style="color: #fbbf24;">${askSize}</td>
+                    </tr>
                 `;
             }
-            const rows = history.map((fill) => {
-                const action = (fill.action || '').toUpperCase();
-                const actionClass = action === 'SELL' ? 'fill-action-sell' : 'fill-action-buy';
-                const time = fill.time || '--';
-                const token = fill.token || '--';
-                const qty = typeof fill.qty === 'number' ? fill.qty.toFixed(1) : '--';
-                const price = typeof fill.price === 'number' ? fill.price.toFixed(3) : '--';
-                const realized = typeof fill.realized_pnl === 'number' ? fill.realized_pnl : null;
-                const realizedText = realized !== null ? `${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}` : '';
-                const reason = fill.reason ? ` · ${String(fill.reason).replace(/_/g, ' ')}` : '';
-                return `
-                    <div class="fill-row">
-                        <div class="fill-left">
-                            <span class="${actionClass}">${action}</span>
-                            <span> ${token} ${qty}sh @ $${price}</span>
-                            <span style="color:#64748b;">${reason}</span>
-                        </div>
-                        <div class="fill-right">${realizedText || time}</div>
-                    </div>
-                `;
-            }).join('');
-            return `
-                <div class="fill-history">
-                    <div class="fill-history-header">
-                        <span>🧾 Fill History (last ${history.length})</span>
-                        <span>Newest first</span>
-                    </div>
-                    ${rows}
-                </div>
-            `;
+            return rows;
         }
+
+        
 
         function toggleOrderbook(slug, side) {
             const key = `${slug}::${side}`;
@@ -1447,8 +1372,6 @@ HTML_TEMPLATE = """
                     const downOrderbook = orderbooks.down || { bids: [], asks: [] };
                     const upOrderbookHtml = renderOrderbookTable(slug, 'UP', upOrderbook);
                     const downOrderbookHtml = renderOrderbookTable(slug, 'DOWN', downOrderbook);
-                    const orderActivityHtml = renderOrderActivity(pt.order_activity, pt.recent_order_events);
-                    const fillHistoryHtml = renderFillHistory(pt.fill_history);
                     const activeSellText = activeSells.length
                         ? activeSells.map(s => `${s.side} ${s.qty.toFixed(1)}sh @ $${s.min_price.toFixed(2)}`).join(' | ')
                         : 'none';
@@ -1460,7 +1383,10 @@ HTML_TEMPLATE = """
                         : `<span class="sell-badge sell-badge-none">SELLS 0</span>`;
                     
                     html += `
-                        <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}">
+                        <div class="market-card ${pt.market_status === 'resolved' ? 'resolved' : ''}" 
+                             onclick="selectMarket('${slug}')" 
+                             data-slug="${slug}"
+                             style="cursor: pointer; transition: transform 0.1s, border-color 0.2s;">
                             <div class="market-header">
                                 <span class="asset-badge asset-${market.asset}">${asset}</span>
                                 <span class="market-status ${statusClass}">${pt.market_status.toUpperCase()}</span>
@@ -1479,12 +1405,7 @@ HTML_TEMPLATE = """
                                     <div class="price-value">$${market.down_price?.toFixed(3) || '-.--'}</div>
                                 </div>
                             </div>
-                            <div class="orderbook-grid">
-                                ${upOrderbookHtml}
-                                ${downOrderbookHtml}
-                            </div>
-                            ${orderActivityHtml}
-                            ${fillHistoryHtml}
+
                             <div class="holdings-row">
                                 <div class="holding-item">
                                     <div class="holding-label">Qty UP</div>
@@ -1761,10 +1682,10 @@ HTML_TEMPLATE = """
                         actionLabel = isBidQuote ? 'Bid Placed' : 'Ask Placed';
                         actionClass = 'quote-action';
                     } else if (actionStr === 'BUY') {
-                        actionLabel = 'Bid Filled';
+                        actionLabel = 'BOUGHT';
                         actionClass = 'profit';
                     } else if (actionStr === 'SELL') {
-                        actionLabel = 'Ask Filled';
+                        actionLabel = 'SOLD';
                         actionClass = 'loss';
                     } else if (actionStr === 'SELL_PLACED') {
                         actionLabel = 'Sell Placed';
@@ -1846,6 +1767,15 @@ HTML_TEMPLATE = """
                     }
                     slipTbody.innerHTML = slipHtml;
                 }
+            }
+            
+            // Update global orderbook if a market is selected
+            if (selectedMarketSlug) {
+                updateGlobalOrderbook(data);
+            } else if (Object.keys(data.active_markets).length > 0) {
+                // Auto-select first market if none selected
+                const firstSlug = Object.keys(data.active_markets)[0];
+                selectMarket(firstSlug);
             }
         }
         
@@ -3166,7 +3096,7 @@ class PaperTrader:
                 return False, 0, f"⏳ Hedge expensive (pair ${potential_pair:.3f}). {improve_reason}"
             
             # After 10 seconds, refuse pair > $1.00 unless it is mathematically recoverable
-            market_elapsed = 900.0 - time_to_close if time_to_close is not None else 0.0
+            market_elapsed = MARKET_WINDOW_SECONDS - time_to_close if time_to_close is not None else 0.0
             if market_elapsed > 10 and potential_pair > 1.0:
                 target_qty = other_qty
                 hedge_cost = target_qty * price
@@ -4247,7 +4177,7 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 800.0, per_market_budget: float = 200.0):
+    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 400.0):
         self.initial_starting_balance = starting_balance
         # Allow overrides via env to match Render/VPS config.
         try:
@@ -4289,7 +4219,7 @@ class MultiMarketBot:
             # Determine asset from slug
             asset = None
             for a in SUPPORTED_ASSETS:
-                if slug.startswith(f'{a}-updown-15m-'):
+                if slug.startswith(f'{a}-updown-{MARKET_WINDOW_SUFFIX}-'):
                     asset = a
                     break
             
@@ -4412,10 +4342,10 @@ class MultiMarketBot:
         # First, load manual markets if any
         await self.load_manual_markets(session)
         
-        # Calculate current and next 15-minute windows
+        # Calculate current and next 5-minute windows
         now = int(time.time())
-        current_window = (now // 900) * 900  # Current 15-min window start
-        next_window = current_window + 900   # Next 15-min window
+        current_window = (now // MARKET_WINDOW_SECONDS) * MARKET_WINDOW_SECONDS  # Current 5-min window start
+        next_window = current_window + MARKET_WINDOW_SECONDS   # Next 5-min window
         
         # Only track one market per asset at a time
         # Check current window first, then next if current is closed
@@ -4433,7 +4363,7 @@ class MultiMarketBot:
             
             # Find one market for this asset
             for ts in timestamps_to_check:
-                slug = f"{asset}-updown-15m-{ts}"
+                slug = f"{asset}-updown-{MARKET_WINDOW_SUFFIX}-{ts}"
                 
                 # Skip if already tracking or in history
                 if slug in self.active_markets:
@@ -4625,7 +4555,11 @@ class MultiMarketBot:
                             side, actual_price, actual_qty = trade
                             action = 'BUY'
                         pt = tracker.paper_trader
-                        urgency_msg = f" [⚠️ {time_to_close:.0f}s left!]" if time_to_close and time_to_close < 300 else ""
+                        urgency_msg = (
+                            f" [⚠️ {time_to_close:.0f}s left!]"
+                            if time_to_close and time_to_close < URGENCY_THRESHOLD_SECONDS
+                            else ""
+                        )
                         print(f"📈 [{tracker.asset.upper()}] {action} {actual_qty:.1f} {side} @ ${actual_price:.3f} | Pair: ${pt.pair_cost:.3f} | {fetch_latency_ms:.0f}ms{urgency_msg}")
                         
                         # Add to trade log
