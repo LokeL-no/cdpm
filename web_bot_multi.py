@@ -126,6 +126,20 @@ HTML_TEMPLATE = """
             width: 400px;
             flex-shrink: 0;
         }
+
+        #orderbook-mobile-slot {
+            margin-top: 20px;
+        }
+
+        @media (max-width: 900px) {
+            .markets-container {
+                flex-direction: column;
+            }
+
+            .markets-right {
+                width: 100%;
+            }
+        }
         
         .markets-grid {
             display: grid;
@@ -719,9 +733,11 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="markets-right">
-                <h2 style="color: #3b82f6; margin-bottom: 15px;">📖 Orderbook</h2>
-                <div id="global-orderbook" style="background: #111827; border-radius: 12px; border: 1px solid #1f2937; padding: 15px; min-height: 400px;">
-                    <div style="color: #888; text-align: center; padding: 40px;">Select a market to view orderbook</div>
+                <div id="orderbook-panel">
+                    <h2 style="color: #3b82f6; margin-bottom: 15px;">📖 Orderbook</h2>
+                    <div id="global-orderbook" style="background: #111827; border-radius: 12px; border: 1px solid #1f2937; padding: 15px; min-height: 400px;">
+                        <div style="color: #888; text-align: center; padding: 40px;">Select a market to view orderbook</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -776,6 +792,7 @@ HTML_TEMPLATE = """
                 </tbody>
             </table>
         </div>
+        <div id="orderbook-mobile-slot"></div>
     </div>
     
     <script>
@@ -783,6 +800,20 @@ HTML_TEMPLATE = """
         let reconnectTimeout;
         let latestSnapshot = null;
         const orderbookCollapseState = {};
+
+        function moveOrderbookForMobile() {
+            const panel = document.getElementById('orderbook-panel');
+            const mobileSlot = document.getElementById('orderbook-mobile-slot');
+            const desktopSlot = document.querySelector('.markets-right');
+            if (!panel || !mobileSlot || !desktopSlot) return;
+
+            const isMobile = window.innerWidth <= 900;
+            if (isMobile && panel.parentElement !== mobileSlot) {
+                mobileSlot.appendChild(panel);
+            } else if (!isMobile && panel.parentElement !== desktopSlot) {
+                desktopSlot.appendChild(panel);
+            }
+        }
         
         function togglePause() {
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -805,6 +836,9 @@ HTML_TEMPLATE = """
             const isCollapsed = section.classList.toggle('collapsed');
             btn.textContent = isCollapsed ? 'Show' : 'Hide';
         }
+
+        window.addEventListener('resize', moveOrderbookForMobile);
+        window.addEventListener('DOMContentLoaded', moveOrderbookForMobile);
 
         function formatBookSize(size) {
             if (!size || size <= 0) return '--';
