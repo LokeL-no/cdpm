@@ -195,10 +195,7 @@ class ArbitrageStrategy:
         self.emergency_mode = False  # Emergency mode when budget critical
         self._last_trade_time_up = 0.0    # Per-side cooldown: last UP trade time
         self._last_trade_time_down = 0.0  # Per-side cooldown: last DOWN trade time
-        self._prev_trend_token = None     # Track previous trend for flip detection
-        self._flip_active = False         # True when market flip detected (zero cooldown)
-        self._flip_last_buy_price = 0.0   # Last price we bought at during flip (for $0.20 steps)
-        self._flip_token = None           # Which token we're buying during flip
+        self._prev_trend_token = None     # Track previous trend for logging
 
         # Telemetry / history for UI compatibility
         self.mgp_history = deque(maxlen=180)
@@ -544,9 +541,6 @@ class ArbitrageStrategy:
         self._last_trade_time_up = 0.0
         self._last_trade_time_down = 0.0
         self._prev_trend_token = None
-        self._flip_active = False
-        self._flip_last_buy_price = 0.0
-        self._flip_token = None
         self.price_history_up.clear()
         self.price_history_down.clear()
         self.combined_history.clear()
@@ -677,19 +671,10 @@ class ArbitrageStrategy:
             return trades
 
         # Per-side trade cooldown: each side (UP/DOWN) has independent cooldown
-        # Normal: 12s per side. During FLIP: ZERO cooldown on rescue side.
+        # Normal: 12s per side. Profit seed bypasses cooldown directly.
         now = _time.time()
-        if self._flip_active and self._flip_token:
-            # FLIP MODE: zero cooldown on the flip token, normal on the other
-            if self._flip_token == 'UP':
-                up_cd = 0.0   # No cooldown at all during flip
-                down_cd = self.min_trade_interval
-            else:
-                up_cd = self.min_trade_interval
-                down_cd = 0.0  # No cooldown at all during flip
-        else:
-            up_cd = self.min_trade_interval
-            down_cd = self.min_trade_interval
+        up_cd = self.min_trade_interval
+        down_cd = self.min_trade_interval
         up_on_cooldown = self._last_trade_time_up > 0 and (now - self._last_trade_time_up) < up_cd
         down_on_cooldown = self._last_trade_time_down > 0 and (now - self._last_trade_time_down) < down_cd
         if up_on_cooldown and down_on_cooldown:
@@ -1014,97 +999,77 @@ class ArbitrageStrategy:
 
         trending_token, trend_strength, trend_confidence = detect_momentum()
 
-        # ── FLIP DETECTION: Market reversal → aggressive rebalance ──
-        # Market shift rule: if the losing side (lower price) crosses 0.55,
-        # treat it as the new trend and flip immediately.
-        has_directional_exposure = abs(self.qty_up - self.qty_down) > 3.0  # Meaningful imbalance
-        losing_token = 'UP' if up_price < down_price else 'DOWN'
-        losing_price = up_price if losing_token == 'UP' else down_price
-        flip_triggered = losing_price >= self.flip_trigger_price
+        # Track trend direction for logging
+        if trending_token and trend_confidence >= 0.6:
+            self._prev_trend_token = trending_token
 
-        if ((trending_token and trend_confidence >= 0.6) or flip_triggered) and has_directional_exposure:
-            flip_target = losing_token if flip_triggered else trending_token
-            if self._prev_trend_token and self._prev_trend_token != flip_target:
-                # FLIP! Trend changed direction
-                flip_price = up_price if flip_target == 'UP' else down_price
-                self._flip_active = True
-                self._flip_token = flip_target
-                self._flip_last_buy_price = flip_price  # Start tracking from current price
-                # Reset cooldown immediately on flip side
-                if flip_target == 'UP':
-                    self._last_trade_time_up = 0.0
-                    up_on_cooldown = False
-                else:
-                    self._last_trade_time_down = 0.0
-                    down_on_cooldown = False
-                reason = 'price trigger' if flip_triggered else 'trend flip'
-                print(f"🔄 FLIP detected: {self._prev_trend_token}→{flip_target} | "
-                      f"entry ${flip_price:.3f} | {reason} | imbalance UP:{self.qty_up:.0f} DOWN:{self.qty_down:.0f} | "
-                      f"ZERO cooldown ON")
-            self._prev_trend_token = flip_target
-        elif not trending_token or trend_confidence < 0.4:
-            # No clear trend — deactivate flip mode
-            if self._flip_active:
-                self._flip_active = False
-                self._flip_token = None
-                self._flip_last_buy_price = 0.0
-                print(f"🔄 Flip mode OFF — no clear trend")
+        # ══════════════════════════════════════════════════════════
+        #  PROFIT SEED: Ensure the winning side has >= $5 profit potential
+        #  This replaces the old flip state machine with a simple stateless
+        #  check EVERY TICK. If the currently-winning side (price >= 0.55)
+        #  doesn't have $5 profit potential and we're underweight on it,
+        #  buy immediately with ZERO cooldown until target is met.
+        #
+        #  This naturally handles market flips: when the winning side
+        #  changes, the new winning side won't have enough profit → buy.
+        # ══════════════════════════════════════════════════════════
+        winning_token = 'UP' if up_price >= down_price else 'DOWN'
+        winning_price = up_price if winning_token == 'UP' else down_price
+        winning_qty = self.qty_up if winning_token == 'UP' else self.qty_down
+        winning_cost = self.cost_up if winning_token == 'UP' else self.cost_down
         
-        # Check if flip rescue is complete (position rebalanced)
-        if self._flip_active:
-            min_q = min(self.qty_up, self.qty_down)
-            max_q = max(self.qty_up, self.qty_down)
-            if min_q > 0 and max_q / min_q <= 1.5:
-                print(f"🔄 Flip rescue complete — balanced UP:{self.qty_up:.0f} DOWN:{self.qty_down:.0f}")
-                self._flip_active = False
-                self._flip_token = None
-                self._flip_last_buy_price = 0.0
+        # PnL if winning side actually wins: shares × $1 - cost
+        pnl_if_winning_wins = winning_qty - winning_cost
         
-        # ── FLIP SEED BUY: One-shot buy targeting $5 profit on flip side ──
-        # Then deactivate flip mode and let normal trend follow build from there.
-        if self._flip_active and self._flip_token:
-            flip_token = self._flip_token
-            flip_price = up_price if flip_token == 'UP' else down_price
-            flip_qty_owned = self.qty_up if flip_token == 'UP' else self.qty_down
-            flip_cost_owned = self.cost_up if flip_token == 'UP' else self.cost_down
-            
-            if flip_price <= self.awareness_max_price and flip_price < 0.95:
-                # Current PnL if flip side wins: qty × $1 - cost
-                current_pnl_if_wins = flip_qty_owned - flip_cost_owned
-                additional_profit_needed = self.flip_target_profit - current_pnl_if_wins
-                
-                if additional_profit_needed > 0.50:  # Need at least $0.50 more
-                    # shares needed: additional / (1 - price)
-                    profit_per_share = 1.0 - flip_price
-                    if profit_per_share > 0.05:  # Don't buy above $0.95
-                        shares_needed = additional_profit_needed / profit_per_share
-                        flip_spend = shares_needed * flip_price
-                        flip_spend = max(2.0, min(flip_spend, 50.0))  # Cap at $50 safety
-                        
-                        trade = buy_with_spend(flip_token, flip_price, flip_spend, 'flip_seed')
-                        if trade:
-                            trades.append(trade)
-                            new_flip_qty = self.qty_up if flip_token == 'UP' else self.qty_down
-                            new_flip_cost = self.cost_up if flip_token == 'UP' else self.cost_down
-                            new_pnl = new_flip_qty - new_flip_cost
-                            self.current_mode = 'flip_seed'
-                            self.mode_reason = (f'🔄 FLIP seed {flip_token} @ ${flip_price:.3f} | '
-                                              f'${flip_spend:.1f} spend | '
-                                              f'pnl_if_win {current_pnl_if_wins:+.1f}→{new_pnl:+.1f} | '
-                                              f'target ${self.flip_target_profit:.0f}')
-                
-                # Seed done — deactivate flip, let normal trend follow continue
-                self._flip_active = False
-                self._flip_token = None
-                self._flip_last_buy_price = 0.0
-                return trades
+        # Conditions for profit seed buy:
+        # 1) Winning side price >= 0.55 (clear winner, not 50/50 noise)
+        # 2) We don't have $5 profit on it yet
+        # 3) Price is below 0.92 (don't chase at extreme highs)
+        # 4) More than 60s left (don't seed in endgame)
+        # 5) We have at least SOME position (both sides OR one side owned)
+        needs_seed = (winning_price >= self.flip_trigger_price and
+                      pnl_if_winning_wins < self.flip_target_profit and
+                      winning_price < 0.92 and
+                      time_to_close is not None and time_to_close > self.awareness_time_end)
+        
+        if needs_seed:
+            additional_needed = self.flip_target_profit - pnl_if_winning_wins
+            if additional_needed > 0.50:
+                profit_per_share = 1.0 - winning_price
+                if profit_per_share > 0.05:
+                    shares_needed = additional_needed / profit_per_share
+                    seed_spend = shares_needed * winning_price
+                    seed_spend = max(2.0, min(seed_spend, 50.0))  # $2 min, $50 safety cap
+                    
+                    # ZERO cooldown for seed buys — must get in fast
+                    if winning_token == 'UP':
+                        self._last_trade_time_up = 0.0
+                        up_on_cooldown = False
+                    else:
+                        self._last_trade_time_down = 0.0
+                        down_on_cooldown = False
+                    
+                    trade = buy_with_spend(winning_token, winning_price, seed_spend, 'profit_seed')
+                    if trade:
+                        trades.append(trade)
+                        new_qty = self.qty_up if winning_token == 'UP' else self.qty_down
+                        new_cost = self.cost_up if winning_token == 'UP' else self.cost_down
+                        new_pnl = new_qty - new_cost
+                        self.current_mode = 'profit_seed'
+                        self.mode_reason = (f'🔄 SEED {winning_token} @ ${winning_price:.3f} | '
+                                          f'${seed_spend:.1f} spend | '
+                                          f'pnl_if_win {pnl_if_winning_wins:+.1f}→{new_pnl:+.1f} | '
+                                          f'target ${self.flip_target_profit:.0f} | '
+                                          f'need ${additional_needed:.1f} more')
+                    # DON'T deactivate — check again next tick.
+                    # If we still need more shares, we'll buy more.
+                    return trades
 
         # ══════════════════════════════════════════════════════════
         #  AWARENESS MODE: 150s-60s left — heightened reversal detection
         #  Two jobs:
-        #  1) Ensure a defensive hedge exists (small baseline)
-        #  2) If a FLIP is detected, spend aggressively to catch up on
-        #     the new trend — proportional to how much PnL is at risk.
+        #  1) Run the same profit seed check (even in awareness window)
+        #  2) Ensure a defensive hedge exists (small baseline)
         #  After handling awareness, fall through to normal trend follow.
         # ══════════════════════════════════════════════════════════
         if time_to_close is not None and self.awareness_time_end <= time_to_close <= self.awareness_time_start:
@@ -1114,39 +1079,41 @@ class ArbitrageStrategy:
             weak_qty = self.qty_down if weak_token == 'DOWN' else self.qty_up
             strong_qty = self.qty_up if strong_token == 'UP' else self.qty_down
             weak_price = down_price if weak_token == 'DOWN' else up_price
-            strong_pnl = pnl_up if strong_token == 'UP' else pnl_down
-            weak_pnl = pnl_down if strong_token == 'UP' else pnl_up
             
-            # ── REVERSAL CATCH-UP: Flip detected → seed $5 profit on weak side ──
-            # Same logic as flip seed: buy enough for $5 profit, then normal follow.
-            if self._flip_active and trending_token == weak_token:
-                catchup_price = weak_price
-                if catchup_price <= self.awareness_max_price and catchup_price < 0.95:
-                    current_weak_pnl = weak_qty - (self.cost_down if weak_token == 'DOWN' else self.cost_up)
-                    additional_needed = self.flip_target_profit - current_weak_pnl
-                    
-                    if additional_needed > 0.50:
-                        profit_per_share = 1.0 - catchup_price
-                        if profit_per_share > 0.05:
-                            shares_needed = additional_needed / profit_per_share
-                            catchup_spend = shares_needed * catchup_price
-                            catchup_spend = max(2.0, min(catchup_spend, 50.0))
-                            
-                            trade = buy_with_spend(weak_token, catchup_price, catchup_spend, 'awareness_seed')
-                            if trade:
-                                trades.append(trade)
-                                new_weak_pnl = (self.qty_down if weak_token == 'DOWN' else self.qty_up) - (self.cost_down if weak_token == 'DOWN' else self.cost_up)
-                                self.current_mode = 'awareness_seed'
-                                self.mode_reason = (f'🚨 Awareness seed {weak_token} @ ${catchup_price:.3f} | '
-                                                   f'pnl_if_win {current_weak_pnl:+.1f}→{new_weak_pnl:+.1f} | '
-                                                   f'target ${self.flip_target_profit:.0f} | '
-                                                   f'{time_to_close:.0f}s left')
-                    
-                    # Seed done — deactivate flip, normal follow continues
-                    self._flip_active = False
-                    self._flip_token = None
-                    self._flip_last_buy_price = 0.0
-                    return trades
+            # ── AWARENESS PROFIT SEED: Same $5 target but with awareness max price ──
+            weak_cost = self.cost_down if weak_token == 'DOWN' else self.cost_up
+            weak_pnl_if_wins = weak_qty - weak_cost
+            
+            if (weak_price >= self.flip_trigger_price and
+                weak_pnl_if_wins < self.flip_target_profit and
+                weak_price <= self.awareness_max_price and weak_price < 0.95):
+                
+                additional_needed = self.flip_target_profit - weak_pnl_if_wins
+                if additional_needed > 0.50:
+                    profit_per_share = 1.0 - weak_price
+                    if profit_per_share > 0.05:
+                        shares_needed = additional_needed / profit_per_share
+                        seed_spend = shares_needed * weak_price
+                        seed_spend = max(2.0, min(seed_spend, 50.0))
+                        
+                        # Zero cooldown
+                        if weak_token == 'UP':
+                            self._last_trade_time_up = 0.0
+                            up_on_cooldown = False
+                        else:
+                            self._last_trade_time_down = 0.0
+                            down_on_cooldown = False
+                        
+                        trade = buy_with_spend(weak_token, weak_price, seed_spend, 'awareness_seed')
+                        if trade:
+                            trades.append(trade)
+                            new_weak_pnl = (self.qty_down if weak_token == 'DOWN' else self.qty_up) - weak_cost
+                            self.current_mode = 'awareness_seed'
+                            self.mode_reason = (f'🚨 Awareness SEED {weak_token} @ ${weak_price:.3f} | '
+                                               f'pnl_if_win {weak_pnl_if_wins:+.1f}→{new_weak_pnl:+.1f} | '
+                                               f'target ${self.flip_target_profit:.0f} | '
+                                               f'{time_to_close:.0f}s left')
+                        return trades
             
             # ── BASELINE HEDGE: Ensure minimum defensive position exists ──
             hedge_ratio = weak_qty / strong_qty if strong_qty > 0 else 0
