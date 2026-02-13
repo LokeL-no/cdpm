@@ -182,18 +182,11 @@ class ArbitrageStrategy:
         # Awareness Mode parameters (150-60s: detect reversals and catch up)
         self.awareness_time_start = 150.0    # Enter awareness mode at 2:30 left
         self.awareness_time_end = 60.0       # Exit awareness mode at 1:00 left
-        self.awareness_reversal_min_spend = 15.0  # Minimum spend on reversal catch-up
-        self.awareness_reversal_max_spend = 80.0  # Maximum spend on reversal catch-up
-        self.awareness_reversal_pnl_pct = 0.70    # Spend up to 70% of at-risk PnL on catch-up
         self.awareness_max_price = 0.90      # Don't chase above $0.90 in awareness mode
 
-        # Aggressive flip parameters (market shift when losing side crosses this)
+        # Flip parameters (market shift when losing side crosses this)
         self.flip_trigger_price = 0.55       # Losing side >= this means trend has flipped
-        self.flip_min_spend = 15.0           # Minimum spend per flip catch-up trade
-        self.flip_max_spend = 80.0           # Maximum spend per flip catch-up ($400 budget)
-        self.flip_gap_spend_pct = 0.80       # Spend 80% of gap value per catch-up
-        self.flip_price_step = 0.02          # Buy on every 2-cent move (near-continuous)
-        self.flip_position_pct = 0.50        # Spend up to 50% of total position value to catch up
+        self.flip_target_profit = 5.0        # Buy enough for $5 profit on flip side, then normal follow
         
         # Tracking for profit security
         self.best_pair_cost_seen = float('inf')  # Track best pair cost achieved
@@ -1067,52 +1060,43 @@ class ArbitrageStrategy:
                 self._flip_token = None
                 self._flip_last_buy_price = 0.0
         
-        # ── FLIP AGGRESSIVE BUY: Buy on every $0.20 price step during flip ──
-        # No cooldown. Spend proportional to imbalance to rebalance fast.
+        # ── FLIP SEED BUY: One-shot buy targeting $5 profit on flip side ──
+        # Then deactivate flip mode and let normal trend follow build from there.
         if self._flip_active and self._flip_token:
             flip_token = self._flip_token
             flip_price = up_price if flip_token == 'UP' else down_price
             flip_qty_owned = self.qty_up if flip_token == 'UP' else self.qty_down
-            other_qty_flip = self.qty_down if flip_token == 'UP' else self.qty_up
+            flip_cost_owned = self.cost_up if flip_token == 'UP' else self.cost_down
             
-            # Buy if price has moved $0.20+ above last buy (or first buy)
-            price_step = flip_price - self._flip_last_buy_price
-            should_buy_flip = False
-            if self._flip_last_buy_price == 0 or self._flip_last_buy_price == flip_price:
-                # First buy at flip detection — go immediately
-                should_buy_flip = True
-            elif price_step >= self.flip_price_step:
-                # Price moved up $0.20 — buy at this new level
-                should_buy_flip = True
-            
-            if should_buy_flip and flip_price <= self.awareness_max_price:
-                # EXPLOSIVE spend: proportional to total position at risk
-                # The bigger our position on the OTHER side, the more we need on THIS side
-                imbalance = abs(other_qty_flip - flip_qty_owned)
-                other_cost = self.cost_up if flip_token == 'DOWN' else self.cost_down  # cost of losing side
-                if imbalance > 0:
-                    # Method 1: Gap-based — close the share gap
-                    gap_value = imbalance * flip_price
-                    gap_spend = gap_value * self.flip_gap_spend_pct
-                    # Method 2: Position-based — spend relative to total position at risk
-                    position_spend = other_cost * self.flip_position_pct
-                    # Use the LARGER of the two methods
-                    flip_spend = max(gap_spend, position_spend)
-                    flip_spend = min(flip_spend, self.flip_max_spend)
-                    flip_spend = max(flip_spend, self.flip_min_spend)
-                else:
-                    flip_spend = self.flip_min_spend
+            if flip_price <= self.awareness_max_price and flip_price < 0.95:
+                # Current PnL if flip side wins: qty × $1 - cost
+                current_pnl_if_wins = flip_qty_owned - flip_cost_owned
+                additional_profit_needed = self.flip_target_profit - current_pnl_if_wins
                 
-                trade = buy_with_spend(flip_token, flip_price, flip_spend, 'flip_catchup')
-                if trade:
-                    trades.append(trade)
-                    self._flip_last_buy_price = flip_price  # Record this price level
-                    new_flip_qty = self.qty_up if flip_token == 'UP' else self.qty_down
-                    self.current_mode = 'flip_catchup'
-                    self.mode_reason = (f'🔄 FLIP buy {flip_token} @ ${flip_price:.3f} | '
-                                      f'${flip_spend:.1f} spend | '
-                                      f'gap {imbalance:.0f} shares | '
-                                      f'{flip_qty_owned:.0f}→{new_flip_qty:.0f} qty')
+                if additional_profit_needed > 0.50:  # Need at least $0.50 more
+                    # shares needed: additional / (1 - price)
+                    profit_per_share = 1.0 - flip_price
+                    if profit_per_share > 0.05:  # Don't buy above $0.95
+                        shares_needed = additional_profit_needed / profit_per_share
+                        flip_spend = shares_needed * flip_price
+                        flip_spend = max(2.0, min(flip_spend, 50.0))  # Cap at $50 safety
+                        
+                        trade = buy_with_spend(flip_token, flip_price, flip_spend, 'flip_seed')
+                        if trade:
+                            trades.append(trade)
+                            new_flip_qty = self.qty_up if flip_token == 'UP' else self.qty_down
+                            new_flip_cost = self.cost_up if flip_token == 'UP' else self.cost_down
+                            new_pnl = new_flip_qty - new_flip_cost
+                            self.current_mode = 'flip_seed'
+                            self.mode_reason = (f'🔄 FLIP seed {flip_token} @ ${flip_price:.3f} | '
+                                              f'${flip_spend:.1f} spend | '
+                                              f'pnl_if_win {current_pnl_if_wins:+.1f}→{new_pnl:+.1f} | '
+                                              f'target ${self.flip_target_profit:.0f}')
+                
+                # Seed done — deactivate flip, let normal trend follow continue
+                self._flip_active = False
+                self._flip_token = None
+                self._flip_last_buy_price = 0.0
                 return trades
 
         # ══════════════════════════════════════════════════════════
@@ -1133,30 +1117,35 @@ class ArbitrageStrategy:
             strong_pnl = pnl_up if strong_token == 'UP' else pnl_down
             weak_pnl = pnl_down if strong_token == 'UP' else pnl_up
             
-            # ── REVERSAL CATCH-UP: Flip detected → buy hard into new trend ──
-            # If market just reversed AND the new trend token is our weak side,
-            # spend proportional to how much directional PnL we could lose.
+            # ── REVERSAL CATCH-UP: Flip detected → seed $5 profit on weak side ──
+            # Same logic as flip seed: buy enough for $5 profit, then normal follow.
             if self._flip_active and trending_token == weak_token:
                 catchup_price = weak_price
-                if catchup_price <= self.awareness_max_price:
-                    # Scale spend: more at risk → spend more to catch up
-                    # Use 40% of the PnL difference as catch-up budget
-                    pnl_at_risk = max(0, strong_pnl - weak_pnl)
-                    catchup_spend = pnl_at_risk * self.awareness_reversal_pnl_pct
-                    catchup_spend = max(self.awareness_reversal_min_spend,
-                                       min(self.awareness_reversal_max_spend, catchup_spend))
+                if catchup_price <= self.awareness_max_price and catchup_price < 0.95:
+                    current_weak_pnl = weak_qty - (self.cost_down if weak_token == 'DOWN' else self.cost_up)
+                    additional_needed = self.flip_target_profit - current_weak_pnl
                     
-                    trade = buy_with_spend(weak_token, catchup_price, catchup_spend, 'awareness_catchup')
-                    if trade:
-                        trades.append(trade)
-                        new_weak_qty = self.qty_down if weak_token == 'DOWN' else self.qty_up
-                        new_weak_pnl = self.calculate_pnl_if_down_wins() if weak_token == 'DOWN' else self.calculate_pnl_if_up_wins()
-                        self.current_mode = 'awareness_catchup'
-                        self.mode_reason = (f'🚨 Catchup {weak_token} @ ${catchup_price:.3f} | '
-                                           f'${catchup_spend:.1f} spend | '
-                                           f'risk ${pnl_at_risk:.1f} | '
-                                           f'pnl {weak_pnl:+.1f}→{new_weak_pnl:+.1f} | '
-                                           f'{time_to_close:.0f}s left')
+                    if additional_needed > 0.50:
+                        profit_per_share = 1.0 - catchup_price
+                        if profit_per_share > 0.05:
+                            shares_needed = additional_needed / profit_per_share
+                            catchup_spend = shares_needed * catchup_price
+                            catchup_spend = max(2.0, min(catchup_spend, 50.0))
+                            
+                            trade = buy_with_spend(weak_token, catchup_price, catchup_spend, 'awareness_seed')
+                            if trade:
+                                trades.append(trade)
+                                new_weak_pnl = (self.qty_down if weak_token == 'DOWN' else self.qty_up) - (self.cost_down if weak_token == 'DOWN' else self.cost_up)
+                                self.current_mode = 'awareness_seed'
+                                self.mode_reason = (f'🚨 Awareness seed {weak_token} @ ${catchup_price:.3f} | '
+                                                   f'pnl_if_win {current_weak_pnl:+.1f}→{new_weak_pnl:+.1f} | '
+                                                   f'target ${self.flip_target_profit:.0f} | '
+                                                   f'{time_to_close:.0f}s left')
+                    
+                    # Seed done — deactivate flip, normal follow continues
+                    self._flip_active = False
+                    self._flip_token = None
+                    self._flip_last_buy_price = 0.0
                     return trades
             
             # ── BASELINE HEDGE: Ensure minimum defensive position exists ──
