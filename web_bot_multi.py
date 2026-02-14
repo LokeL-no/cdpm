@@ -931,7 +931,7 @@ HTML_TEMPLATE = """
             if (!size || size <= 0) return '--';
             if (size >= 1000) {
                 const val = (size / 1000).toFixed(1);
-                return val.replace(/\.0$/, '') + 'k';
+                return val.replace(/\\.0$/, '') + 'k';
             }
             return size >= 100 ? size.toFixed(0) : size.toFixed(1);
         }
