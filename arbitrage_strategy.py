@@ -186,7 +186,11 @@ class ArbitrageStrategy:
 
         # Flip parameters (market shift when losing side crosses this)
         self.flip_trigger_price = 0.55       # Losing side >= this means trend has flipped
-        self.flip_target_profit = 5.0        # Buy enough for $5 profit on flip side, then normal follow
+        self.flip_target_profit = 2.5        # Target ~$2.5 profit on dominant side before standing by
+        self.trend_profit_floor = 2.5        # Start tapering once profit >= $2.5
+        self.trend_profit_cap = 3.0          # Hard stop for further buildup (preserve flip capacity)
+        self.trend_profit_taper_usd = 3.0    # Max spend per trend add once floor reached
+        self.trend_balance_ratio = 1.35      # Keep ratio tight once profit target hit
         
         # Tracking for profit security
         self.best_pair_cost_seen = float('inf')  # Track best pair cost achieved
@@ -562,6 +566,46 @@ class ArbitrageStrategy:
                 return True, f'⚠️ Stop: {reason}'
         
         return False, ''
+
+    def _profit_if_token_wins(self, token: str) -> float:
+        """Return PnL if the specified token resolves in our favor."""
+        return (self.calculate_pnl_if_up_wins() if token == 'UP'
+                else self.calculate_pnl_if_down_wins())
+
+    def _trend_profit_room(self, token: str) -> float:
+        """How much additional profit room remains before capping the trend side."""
+        return self.trend_profit_cap - self._profit_if_token_wins(token)
+
+    def _max_trend_spend(self, token: str, price: float) -> float:
+        """Translate remaining profit room into a max spend budget for the trend side."""
+        if price <= 0:
+            return 0.0
+        room = self._trend_profit_room(token)
+        if room <= 0:
+            return 0.0
+        profit_per_share = max(0.0, 1.0 - price * FEE_MULT)
+        if profit_per_share <= 0:
+            return 0.0
+        shares_allowed = room / profit_per_share
+        return max(0.0, shares_allowed * price)
+
+    def _cap_trend_spend(self, token: str, price: float, proposed_spend: float) -> float:
+        """Apply profit-cap and tapering rules to a proposed trend spend."""
+        if proposed_spend <= 0 or price <= 0:
+            return 0.0
+        max_spend = self._max_trend_spend(token, price)
+        if max_spend <= 0:
+            return 0.0
+        if self._profit_if_token_wins(token) >= self.trend_profit_floor:
+            max_spend = min(max_spend, self.trend_profit_taper_usd)
+        return min(proposed_spend, max_spend)
+
+    def _set_trend_cap_mode(self, token: str, context: str):
+        """Update mode display when a trend add is blocked by the profit cap."""
+        profit = self._profit_if_token_wins(token)
+        self.current_mode = 'trend_capped'
+        self.mode_reason = (f'🧊 {context}: holding {token} profit ${profit:.2f}/'
+                            f'${self.trend_profit_cap:.2f} to stay nimble')
 
     # ------------------------------------------------------------------
     # Public API
@@ -946,24 +990,26 @@ class ArbitrageStrategy:
             if trending_token and trend_confidence >= 0.6:
                 trending_price = up_price if trending_token == 'UP' else down_price
                 if trending_price <= effective_max_price:
-                    if trending_token == owned_token:
-                        # We own the trending side — add more! This is the big money.
-                        spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
-                        trade = buy_with_spend(owned_token, owned_price, spend, 'trend_buildup')
+                    target_token = owned_token if trending_token == owned_token else other_token
+                    target_price = owned_price if trending_token == owned_token else other_price
+                    reason = 'trend_buildup' if trending_token == owned_token else 'trend_switch'
+                    spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
+                    spend = self._cap_trend_spend(target_token, target_price, spend)
+                    min_spend_needed = self.min_trade_size * max(target_price, 0.01)
+                    if spend >= min_spend_needed:
+                        trade = buy_with_spend(target_token, target_price, spend, reason)
                         if trade:
                             trades.append(trade)
-                            self.current_mode = 'trend_buildup'
-                            self.mode_reason = f'📈 Building {owned_token} @ ${owned_price:.3f} | conf {trend_confidence:.0%} str {trend_strength:.0%}'
+                            self.current_mode = reason
+                            if reason == 'trend_buildup':
+                                self.mode_reason = (f'📈 Building {target_token} @ ${target_price:.3f} | '
+                                                    f'conf {trend_confidence:.0%} str {trend_strength:.0%}')
+                            else:
+                                self.mode_reason = (f'📈 Trend switch to {target_token} @ ${target_price:.3f} | '
+                                                    f'conf {trend_confidence:.0%} | pair ${potential_pair:.3f}')
                         return trades
                     else:
-                        # Other side is trending — buy it as new directional play
-                        spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
-                        trade = buy_with_spend(other_token, other_price, spend, 'trend_switch')
-                        if trade:
-                            trades.append(trade)
-                            self.current_mode = 'trend_switch'
-                            self.mode_reason = f'📈 Trend switch to {other_token} @ ${other_price:.3f} | conf {trend_confidence:.0%} | pair ${potential_pair:.3f}'
-                        return trades
+                        self._set_trend_cap_mode(target_token, reason)
 
             # ── B) DEFENSIVE HEDGE: Add small opposite-side position for reversal safety ──
             # Only if other side is cheap — this is insurance, NOT arb locking.
@@ -1144,12 +1190,13 @@ class ArbitrageStrategy:
             other_qty_t = self.qty_down if trending_token == 'UP' else self.qty_up
             other_price_t = down_price if trending_token == 'UP' else up_price
 
-            # IMBALANCE GUARD: If we're already tilted > max_tilt_ratio on the
-            # trending side, DON'T buy more trending — buy the weak side instead
-            # (it's cheap and reduces risk).
+            # IMBALANCE GUARD: tighten threshold once profit objective is met.
             current_tilt = (trending_qty / other_qty_t) if other_qty_t > 0 else 999.0
-            if current_tilt > self.max_tilt_ratio and other_price_t <= self.defensive_max_price:
-                # We're over-tilted. Buy weak side to rebalance.
+            profit_ready = self._profit_if_token_wins(trending_token)
+            tilt_guard = (self.trend_balance_ratio
+                          if profit_ready >= self.trend_profit_floor
+                          else self.max_tilt_ratio)
+            if current_tilt > tilt_guard and other_price_t <= self.defensive_max_price:
                 rebal_spend = self.balance_trade_usd * late_game_scale
                 trade = buy_with_spend(other_token_t, other_price_t, rebal_spend, 'rebalance_weak')
                 if trade:
@@ -1157,42 +1204,42 @@ class ArbitrageStrategy:
                     new_ratio_t = (self.qty_up / self.qty_down) if self.qty_down > 0 else 999.0
                     self.current_mode = 'rebalancing'
                     self.mode_reason = (f'⚖️ Rebalance: buy {other_token_t} @ ${other_price_t:.3f} | '
-                                      f'tilt was {current_tilt:.1f}:1 (max {self.max_tilt_ratio:.1f}) | '
+                                      f'tilt was {current_tilt:.1f}:1 (guard {tilt_guard:.2f}) | '
                                       f'ratio now {new_ratio_t:.2f}')
                 return trades
-            elif current_tilt > self.max_tilt_ratio:
-                # Over-tilted but weak side too expensive — just wait
+            elif current_tilt > tilt_guard:
                 self.current_mode = 'tilt_wait'
                 self.mode_reason = (f'⚖️ Tilted {current_tilt:.1f}:1 on {trending_token} | '
-                                  f'{other_token_t} @ ${other_price_t:.3f} too expensive to rebalance')
+                                  f'{other_token_t} @ ${other_price_t:.3f} too expensive to rebalance | '
+                                  f'profit ${profit_ready:+.2f}')
                 return trades
 
             if trending_price <= effective_max_price:
-                # Scale spend by trend strength AND time remaining
                 spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
 
-                # PAIR COST GUARD: Don't buy more trending side if pair cost is
-                # already deep underwater (> 1.05). Each buy just digs the hole deeper.
                 if current_pair > 1.05 and current_tilt > 1.0:
-                    spend = min(spend, 1.5)  # Limit to $1.50 when pair is bad
+                    spend = min(spend, 1.5)
 
-                # HIGH-PRICE GUARD: At 0.80+, limit to $1 on dominant side
-                # But allow full spend if buying the WEAKER side (market reversal rescue)
                 if trending_price >= 0.80:
                     if trending_qty >= other_qty_t:
                         spend = min(spend, 1.0)
-                    # else: buying weaker side (reversal rescue) → keep full spend
 
-                trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
-                if trade:
-                    trades.append(trade)
-                    new_pnl = self.calculate_pnl_if_up_wins() if trending_token == 'UP' else self.calculate_pnl_if_down_wins()
-                    self.current_mode = 'trend_follow'
-                    self.mode_reason = (f'📈 Follow {trending_token} @ ${trending_price:.3f} | '
-                                      f'conf {trend_confidence:.0%} str {trend_strength:.0%} | '
-                                      f'tilt {current_tilt:.1f}:1 | '
-                                      f'pnl_if_{trending_token.lower()}: ${new_pnl:+.2f}')
-                return trades
+                spend = self._cap_trend_spend(trending_token, trending_price, spend)
+                min_spend_needed = self.min_trade_size * max(trending_price, 0.01)
+                if spend < min_spend_needed:
+                    self._set_trend_cap_mode(trending_token, 'trend_follow')
+                else:
+                    trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
+                    if trade:
+                        trades.append(trade)
+                        new_pnl = (self.calculate_pnl_if_up_wins() if trending_token == 'UP'
+                                   else self.calculate_pnl_if_down_wins())
+                        self.current_mode = 'trend_follow'
+                        self.mode_reason = (f'📈 Follow {trending_token} @ ${trending_price:.3f} | '
+                                          f'conf {trend_confidence:.0%} str {trend_strength:.0%} | '
+                                          f'tilt {current_tilt:.1f}:1 | '
+                                          f'pnl_if_{trending_token.lower()}: ${new_pnl:+.2f}')
+                        return trades
 
         # ── B) ARB IMPROVE: Buy at discount to lower pair cost ──
         # Only when no clear trend. Guards against extreme imbalance.
