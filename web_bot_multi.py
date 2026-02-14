@@ -19,21 +19,32 @@ import os
 from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
 
-# Supported assets
-SUPPORTED_ASSETS = ['btc']
-
-# 5-minute market settings
-MARKET_WINDOW_SECONDS = 300
-MARKET_WINDOW_SUFFIX = "5m"
-URGENCY_THRESHOLD_SECONDS = 90
-
-# Per-asset budget (how much $ to allocate per 5-min market)
-ASSET_BUDGETS = {
-    'btc': 400.0,
+# Supported assets and per-asset settings
+ASSET_CONFIG = {
+    'btc': {'window_seconds': 300, 'window_suffix': '5m', 'budget': 400.0},
+    'eth': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
+    'sol': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
+    'xrp': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
 }
+SUPPORTED_ASSETS = list(ASSET_CONFIG.keys())
+DEFAULT_PER_MARKET_BUDGET = 400.0
+DEFAULT_STARTING_BALANCE = sum(cfg['budget'] for cfg in ASSET_CONFIG.values())
+
+# Legacy fallback for PaperTrader (single-market simulator)
+MARKET_WINDOW_SECONDS = 300
+URGENCY_THRESHOLD_SECONDS = 90
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
+
+
+def get_asset_config(asset: str) -> dict:
+    base = ASSET_CONFIG.get(asset, {})
+    return {
+        'window_seconds': base.get('window_seconds', 300),
+        'window_suffix': base.get('window_suffix', '5m'),
+        'budget': base.get('budget', DEFAULT_PER_MARKET_BUDGET),
+    }
 
 # HTML Template
 HTML_TEMPLATE = """
@@ -4179,7 +4190,8 @@ class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 400.0):
+    def __init__(self, starting_balance: float = DEFAULT_STARTING_BALANCE,
+                 per_market_budget: float = DEFAULT_PER_MARKET_BUDGET):
         self.initial_starting_balance = starting_balance
         # Allow overrides via env to match Render/VPS config.
         try:
@@ -4221,9 +4233,15 @@ class MultiMarketBot:
             # Determine asset from slug
             asset = None
             for a in SUPPORTED_ASSETS:
-                if slug.startswith(f'{a}-updown-{MARKET_WINDOW_SUFFIX}-'):
+                cfg = get_asset_config(a)
+                suffix = cfg['window_suffix']
+                if slug.startswith(f'{a}-updown-{suffix}-'):
                     asset = a
                     break
+            if not asset and '-' in slug:
+                candidate = slug.split('-')[0]
+                if candidate in SUPPORTED_ASSETS:
+                    asset = candidate
             
             if not asset:
                 print(f"⚠️ Unknown asset in slug: {slug}")
@@ -4244,7 +4262,8 @@ class MultiMarketBot:
                         up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
                         
                         if up_token and down_token:
-                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
+                            asset_cfg = get_asset_config(asset)
+                            asset_budget = asset_cfg.get('budget', self.per_market_budget)
                             tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
@@ -4344,16 +4363,16 @@ class MultiMarketBot:
         # First, load manual markets if any
         await self.load_manual_markets(session)
         
-        # Calculate current and next 5-minute windows
+        # Calculate current and next market windows per asset
         now = int(time.time())
-        current_window = (now // MARKET_WINDOW_SECONDS) * MARKET_WINDOW_SECONDS  # Current 5-min window start
-        next_window = current_window + MARKET_WINDOW_SECONDS   # Next 5-min window
-        
-        # Only track one market per asset at a time
-        # Check current window first, then next if current is closed
-        timestamps_to_check = [current_window, next_window]
         
         for asset in SUPPORTED_ASSETS:
+            cfg = get_asset_config(asset)
+            window_seconds = cfg['window_seconds']
+            window_suffix = cfg['window_suffix']
+            current_window = (now // window_seconds) * window_seconds
+            next_window = current_window + window_seconds
+            timestamps_to_check = [current_window, next_window]
             # Skip if we already have an OPEN market for this asset
             # Resolved markets don't block new ones
             has_open_market = any(
@@ -4365,7 +4384,7 @@ class MultiMarketBot:
             
             # Find one market for this asset
             for ts in timestamps_to_check:
-                slug = f"{asset}-updown-{MARKET_WINDOW_SUFFIX}-{ts}"
+                slug = f"{asset}-updown-{window_suffix}-{ts}"
                 
                 # Skip if already tracking or in history
                 if slug in self.active_markets:
@@ -4393,7 +4412,7 @@ class MultiMarketBot:
                         up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
 
                         if up_token and down_token:
-                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
+                            asset_budget = cfg.get('budget', self.per_market_budget)
                             tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
