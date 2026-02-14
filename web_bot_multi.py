@@ -18,33 +18,23 @@ import os
 # Import new arbitrage strategy
 from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
+from trend_predictor import fetch_btc_spot
 
-# Supported assets and per-asset settings
-ASSET_CONFIG = {
-    'btc': {'window_seconds': 300, 'window_suffix': '5m', 'budget': 400.0},
-    'eth': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
-    'sol': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
-    'xrp': {'window_seconds': 900, 'window_suffix': '15m', 'budget': 400.0},
-}
-SUPPORTED_ASSETS = list(ASSET_CONFIG.keys())
-DEFAULT_PER_MARKET_BUDGET = 400.0
-DEFAULT_STARTING_BALANCE = sum(cfg['budget'] for cfg in ASSET_CONFIG.values())
+# Supported assets
+SUPPORTED_ASSETS = ['btc']
 
-# Legacy fallback for PaperTrader (single-market simulator)
+# 5-minute market settings
 MARKET_WINDOW_SECONDS = 300
+MARKET_WINDOW_SUFFIX = "5m"
 URGENCY_THRESHOLD_SECONDS = 90
+
+# Per-asset budget (how much $ to allocate per 5-min market)
+ASSET_BUDGETS = {
+    'btc': 400.0,
+}
 
 # Manual markets to track (leave empty for auto-discovery)
 MANUAL_MARKETS = []
-
-
-def get_asset_config(asset: str) -> dict:
-    base = ASSET_CONFIG.get(asset, {})
-    return {
-        'window_seconds': base.get('window_seconds', 300),
-        'window_suffix': base.get('window_suffix', '5m'),
-        'budget': base.get('budget', DEFAULT_PER_MARKET_BUDGET),
-    }
 
 # HTML Template
 HTML_TEMPLATE = """
@@ -360,6 +350,102 @@ HTML_TEMPLATE = """
         .connected { background: #22c55e; color: #000; }
         .disconnected { background: #ef4444; color: #fff; }
 
+        .spot-predictor {
+            margin-top: 10px;
+            padding: 10px;
+            background: linear-gradient(135deg, #0d1117 0%, #0d0d1a 100%);
+            border: 1px solid #f59e0b33;
+            border-radius: 6px;
+        }
+        .spot-predictor-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .spot-predictor-title {
+            color: #f59e0b;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .spot-prediction-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        .spot-prediction-badge.up {
+            background: rgba(34, 197, 94, 0.15);
+            color: #22c55e;
+            border: 1px solid #22c55e44;
+        }
+        .spot-prediction-badge.down {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+            border: 1px solid #ef444444;
+        }
+        .spot-prediction-badge.none {
+            background: rgba(107, 114, 128, 0.15);
+            color: #6b7280;
+            border: 1px solid #6b728044;
+        }
+        .spot-confidence-bar {
+            width: 100%;
+            height: 6px;
+            background: #1f2937;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+        .spot-confidence-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+        .spot-metrics {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-top: 8px;
+            font-size: 10px;
+        }
+        .spot-metric {
+            text-align: center;
+            padding: 5px 4px;
+            background: #111827;
+            border-radius: 4px;
+        }
+        .spot-metric .spm-label {
+            color: #6b7280;
+            font-size: 9px;
+            text-transform: uppercase;
+        }
+        .spot-metric .spm-value {
+            font-weight: bold;
+            font-size: 12px;
+            margin-top: 2px;
+        }
+        .spot-chart-container {
+            position: relative;
+            width: 100%;
+            height: 60px;
+            margin-top: 8px;
+        }
+        .spot-chart-container canvas {
+            width: 100%;
+            height: 100%;
+        }
+        .spot-details {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            margin-top: 8px;
+            font-size: 10px;
+        }
         .spread-tracker {
             margin-top: 10px;
             padding: 10px;
@@ -633,7 +719,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
-        <div class="global-stats">
+        <div class="global-stats" style="grid-template-columns: repeat(5, 1fr);">
             <div class="global-stat">
                 <div class="label">Starting Balance</div>
                 <div class="value neutral">$<span id="starting-balance">400.00</span></div>
@@ -649,6 +735,10 @@ HTML_TEMPLATE = """
             <div class="global-stat">
                 <div class="label">Markets Resolved</div>
                 <div class="value neutral"><span id="markets-resolved">0</span></div>
+            </div>
+            <div class="global-stat">
+                <div class="label">🎯 BTC Spot</div>
+                <div class="value neutral" id="btc-spot-price" style="font-size: 12px;">--</div>
             </div>
         </div>
         
@@ -1068,6 +1158,75 @@ HTML_TEMPLATE = """
             };
         }
         
+        function drawSpotChart(canvasId, spotHistory, openPrice) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas || !spotHistory || spotHistory.length < 2) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.parentElement.getBoundingClientRect();
+            const w = rect.width;
+            const h = rect.height;
+            canvas.width = w * dpr;
+            canvas.height = h * dpr;
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, w, h);
+            
+            const prices = spotHistory.map(p => p[1]);
+            const minP = Math.min(...prices, openPrice || Infinity);
+            const maxP = Math.max(...prices, openPrice || -Infinity);
+            const range = maxP - minP || 1;
+            const pad = range * 0.1;
+            
+            // Draw open price line
+            if (openPrice) {
+                const openY = h - ((openPrice - minP + pad) / (range + pad * 2)) * h;
+                ctx.strokeStyle = '#f59e0b44';
+                ctx.lineWidth = 1;
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath();
+                ctx.moveTo(0, openY);
+                ctx.lineTo(w, openY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.fillStyle = '#f59e0b88';
+                ctx.font = '9px monospace';
+                ctx.fillText('OPEN', 2, openY - 3);
+            }
+            
+            // Draw price line
+            ctx.beginPath();
+            ctx.lineWidth = 1.5;
+            for (let i = 0; i < prices.length; i++) {
+                const x = (i / (prices.length - 1)) * w;
+                const y = h - ((prices[i] - minP + pad) / (range + pad * 2)) * h;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            // Color based on whether above or below open
+            const lastPrice = prices[prices.length - 1];
+            ctx.strokeStyle = lastPrice >= (openPrice || lastPrice) ? '#22c55e' : '#ef4444';
+            ctx.stroke();
+            
+            // Fill area between line and open price
+            if (openPrice) {
+                const openY = h - ((openPrice - minP + pad) / (range + pad * 2)) * h;
+                ctx.lineTo(w, openY);
+                ctx.lineTo(0, openY);
+                ctx.closePath();
+                ctx.fillStyle = lastPrice >= openPrice ? 'rgba(34, 197, 94, 0.08)' : 'rgba(239, 68, 68, 0.08)';
+                ctx.fill();
+            }
+            
+            // Current price label
+            ctx.fillStyle = lastPrice >= (openPrice || lastPrice) ? '#22c55e' : '#ef4444';
+            ctx.font = 'bold 9px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('$' + lastPrice.toFixed(0), w - 2, 10);
+            ctx.textAlign = 'left';
+        }
+        
         function drawSpreadChart(canvasId, zHistory, spreadHistory, bbUpperHist, bbLowerHist, signalHistory) {
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
@@ -1330,6 +1489,32 @@ HTML_TEMPLATE = """
             
             document.getElementById('markets-resolved').textContent = data.history.length;
             
+            // Update global BTC spot price
+            if (data.active_markets) {
+                let spotInfo = null;
+                for (const [slug, market] of Object.entries(data.active_markets)) {
+                    const sp = market.paper_trader?.spot_predictor;
+                    if (sp && sp.current_price) {
+                        spotInfo = sp;
+                        break;
+                    }
+                }
+                const spotEl = document.getElementById('btc-spot-price');
+                if (spotInfo && spotEl) {
+                    const delta = spotInfo.delta || 0;
+                    const pred = spotInfo.prediction;
+                    const conf = (spotInfo.confidence * 100).toFixed(0);
+                    const deltaStr = (delta >= 0 ? '+' : '') + '$' + delta.toFixed(1);
+                    const arrow = pred === 'UP' ? '▲' : pred === 'DOWN' ? '▼' : '';
+                    const color = pred === 'UP' ? '#22c55e' : pred === 'DOWN' ? '#ef4444' : '#9ca3af';
+                    spotEl.innerHTML = '<span style="color: #9ca3af;">$' + spotInfo.current_price.toLocaleString(undefined, {maximumFractionDigits: 0}) + '</span>' +
+                        ' <span style="color: ' + color + '; font-weight: bold;">' + arrow + deltaStr + '</span>' +
+                        '<br><span style="color: ' + color + '; font-size: 10px;">' + (pred || '?') + ' ' + conf + '%</span>';
+                } else if (spotEl) {
+                    spotEl.innerHTML = '<span style="color: #6b7280;">--</span>';
+                }
+            }
+            
             // Update W/D/L per asset
             if (data.asset_wdl) {
                 const wdlContainer = document.getElementById('asset-wdl-stats');
@@ -1548,6 +1733,78 @@ HTML_TEMPLATE = """
                                 <div style="color: #9ca3af; font-size: 0.7rem; margin-top: 3px;">${pt.mode_reason || 'Monitoring market'}</div>
                             </div>
                             ` : ''}
+                            ${pt.market_status === 'open' && pt.spot_predictor ? `
+                            <div class="spot-predictor">
+                                <div class="spot-predictor-header">
+                                    <span class="spot-predictor-title">🎯 Spot Predictor</span>
+                                    ${(() => {
+                                        const sp = pt.spot_predictor;
+                                        if (!sp.prediction) return '<span class="spot-prediction-badge none">NO DATA</span>';
+                                        const cls = sp.prediction === 'UP' ? 'up' : 'down';
+                                        const arrow = sp.prediction === 'UP' ? '▲' : '▼';
+                                        return '<span class="spot-prediction-badge ' + cls + '">' + arrow + ' ' + sp.prediction + ' ' + (sp.confidence * 100).toFixed(0) + '%</span>';
+                                    })()}
+                                </div>
+                                ${(() => {
+                                    const sp = pt.spot_predictor;
+                                    if (!sp.current_price) return '<div style="color: #6b7280; font-size: 11px;">Waiting for BTC spot price...</div>';
+                                    const delta = sp.delta || 0;
+                                    const deltaColor = delta >= 0 ? '#22c55e' : '#ef4444';
+                                    const confPct = (sp.confidence * 100);
+                                    const confColor = confPct >= 85 ? '#22c55e' : confPct >= 70 ? '#f59e0b' : confPct >= 60 ? '#fb923c' : '#6b7280';
+                                    
+                                    return '<div>' +
+                                        '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">' +
+                                            '<span style="color: #9ca3af; font-size: 11px;">BTC: $' + sp.current_price.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '</span>' +
+                                            '<span style="color: ' + deltaColor + '; font-size: 12px; font-weight: bold;">Δ$' + (delta >= 0 ? '+' : '') + delta.toFixed(1) + '</span>' +
+                                        '</div>' +
+                                        '<div class="spot-confidence-bar">' +
+                                            '<div class="spot-confidence-fill" style="width: ' + Math.min(100, confPct) + '%; background: ' + confColor + ';"></div>' +
+                                        '</div>' +
+                                        '<div style="display: flex; justify-content: space-between; margin-top: 3px;">' +
+                                            '<span style="color: #6b7280; font-size: 9px;">50%</span>' +
+                                            '<span style="color: ' + confColor + '; font-size: 10px; font-weight: bold;">' + confPct.toFixed(0) + '% confidence</span>' +
+                                            '<span style="color: #6b7280; font-size: 9px;">100%</span>' +
+                                        '</div>' +
+                                        '<div class="spot-metrics">' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">Open</div>' +
+                                                '<div class="spm-value" style="color: #9ca3af; font-size: 10px;">$' + (sp.open_price || 0).toLocaleString(undefined, {maximumFractionDigits: 0}) + '</div>' +
+                                            '</div>' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">Volatility</div>' +
+                                                '<div class="spm-value" style="color: #a78bfa;">$' + (sp.volatility || 0).toFixed(1) + '</div>' +
+                                            '</div>' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">Range</div>' +
+                                                '<div class="spm-value" style="color: #60a5fa;">$' + (sp.window_range || 0).toFixed(1) + '</div>' +
+                                            '</div>' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">EG Spent</div>' +
+                                                '<div class="spm-value" style="color: ' + ((sp.endgame_total_spent || 0) > 0 ? '#f59e0b' : '#6b7280') + ';">$' + (sp.endgame_total_spent || 0).toFixed(1) + '</div>' +
+                                            '</div>' +
+                                        '</div>' +
+                                        '<div class="spot-details">' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">Window H</div>' +
+                                                '<div class="spm-value" style="color: #22c55e; font-size: 10px;">$' + (sp.window_high || 0).toLocaleString(undefined, {maximumFractionDigits: 0}) + '</div>' +
+                                            '</div>' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">Window L</div>' +
+                                                '<div class="spm-value" style="color: #ef4444; font-size: 10px;">$' + (sp.window_low || 0).toLocaleString(undefined, {maximumFractionDigits: 0}) + '</div>' +
+                                            '</div>' +
+                                            '<div class="spot-metric">' +
+                                                '<div class="spm-label">History</div>' +
+                                                '<div class="spm-value" style="color: #9ca3af; font-size: 10px;">' + (sp.history_up || 0) + 'U / ' + (sp.history_down || 0) + 'D</div>' +
+                                            '</div>' +
+                                        '</div>' +
+                                        (sp.spot_history && sp.spot_history.length > 2 ? 
+                                            '<div class="spot-chart-container"><canvas id="spot-chart-' + slug.replace(/[^a-zA-Z0-9]/g, '_') + '"></canvas></div>' : '') +
+                                        (sp.reason ? '<div style="color: #6b7280; font-size: 9px; margin-top: 6px; font-family: monospace;">' + sp.reason + '</div>' : '') +
+                                    '</div>';
+                                })()}
+                            </div>
+                            ` : ''}
                             ${pt.market_status === 'open' ? `
                             <div class="mgp-tracker">
                                 <div class="mgp-tracker-header">
@@ -1640,6 +1897,11 @@ HTML_TEMPLATE = """
                     if (pt.market_status === 'open' && pt.mgp_history && pt.mgp_history.length > 1) {
                         const mgpCanvasId = 'mgp-chart-' + slug.replace(/[^a-zA-Z0-9]/g, '_');
                         drawMgpChart(mgpCanvasId, pt.mgp_history, pt.pnl_up_history || [], pt.pnl_down_history || [], pt.arb_locked || false);
+                    }
+                    // Draw Spot charts
+                    if (pt.market_status === 'open' && pt.spot_predictor && pt.spot_predictor.spot_history && pt.spot_predictor.spot_history.length > 2) {
+                        const spotCanvasId = 'spot-chart-' + slug.replace(/[^a-zA-Z0-9]/g, '_');
+                        drawSpotChart(spotCanvasId, pt.spot_predictor.spot_history, pt.spot_predictor.open_price);
                     }
                 }
             }
@@ -4184,14 +4446,14 @@ class MarketTracker:
         self.up_orderbook = {'bids': [], 'asks': []}
         self.down_orderbook = {'bids': [], 'asks': []}
         self.orderbook_updated_at = 0.0
+        self.spot_open_price: Optional[float] = None  # BTC spot at market open
 
 
 class MultiMarketBot:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     CLOB_API_URL = "https://clob.polymarket.com"
     
-    def __init__(self, starting_balance: float = DEFAULT_STARTING_BALANCE,
-                 per_market_budget: float = DEFAULT_PER_MARKET_BUDGET):
+    def __init__(self, starting_balance: float = 400.0, per_market_budget: float = 400.0):
         self.initial_starting_balance = starting_balance
         # Allow overrides via env to match Render/VPS config.
         try:
@@ -4209,6 +4471,9 @@ class MultiMarketBot:
         self.active_markets: Dict[str, MarketTracker] = {}
         self.history: List[dict] = []
         self.websockets = set()
+        # Spot price state
+        self.last_btc_spot: Optional[float] = None
+        self.spot_fetch_errors: int = 0
         self.running = True
         self.update_count = 0
         self.manual_markets_loaded = False
@@ -4233,15 +4498,9 @@ class MultiMarketBot:
             # Determine asset from slug
             asset = None
             for a in SUPPORTED_ASSETS:
-                cfg = get_asset_config(a)
-                suffix = cfg['window_suffix']
-                if slug.startswith(f'{a}-updown-{suffix}-'):
+                if slug.startswith(f'{a}-updown-{MARKET_WINDOW_SUFFIX}-'):
                     asset = a
                     break
-            if not asset and '-' in slug:
-                candidate = slug.split('-')[0]
-                if candidate in SUPPORTED_ASSETS:
-                    asset = candidate
             
             if not asset:
                 print(f"⚠️ Unknown asset in slug: {slug}")
@@ -4262,8 +4521,7 @@ class MultiMarketBot:
                         up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
                         
                         if up_token and down_token:
-                            asset_cfg = get_asset_config(asset)
-                            asset_budget = asset_cfg.get('budget', self.per_market_budget)
+                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
                             tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
@@ -4363,16 +4621,16 @@ class MultiMarketBot:
         # First, load manual markets if any
         await self.load_manual_markets(session)
         
-        # Calculate current and next market windows per asset
+        # Calculate current and next 5-minute windows
         now = int(time.time())
+        current_window = (now // MARKET_WINDOW_SECONDS) * MARKET_WINDOW_SECONDS  # Current 5-min window start
+        next_window = current_window + MARKET_WINDOW_SECONDS   # Next 5-min window
+        
+        # Only track one market per asset at a time
+        # Check current window first, then next if current is closed
+        timestamps_to_check = [current_window, next_window]
         
         for asset in SUPPORTED_ASSETS:
-            cfg = get_asset_config(asset)
-            window_seconds = cfg['window_seconds']
-            window_suffix = cfg['window_suffix']
-            current_window = (now // window_seconds) * window_seconds
-            next_window = current_window + window_seconds
-            timestamps_to_check = [current_window, next_window]
             # Skip if we already have an OPEN market for this asset
             # Resolved markets don't block new ones
             has_open_market = any(
@@ -4384,7 +4642,7 @@ class MultiMarketBot:
             
             # Find one market for this asset
             for ts in timestamps_to_check:
-                slug = f"{asset}-updown-{window_suffix}-{ts}"
+                slug = f"{asset}-updown-{MARKET_WINDOW_SUFFIX}-{ts}"
                 
                 # Skip if already tracking or in history
                 if slug in self.active_markets:
@@ -4412,7 +4670,7 @@ class MultiMarketBot:
                         up_token, down_token = self._extract_tokens_from_markets(markets, target_slug=slug)
 
                         if up_token and down_token:
-                            asset_budget = cfg.get('budget', self.per_market_budget)
+                            asset_budget = ASSET_BUDGETS.get(asset, self.per_market_budget)
                             tracker = MarketTracker(slug, asset, self.cash_ref, asset_budget, self.exec_sim)
                             tracker.up_token_id = up_token
                             tracker.down_token_id = down_token
@@ -4425,6 +4683,8 @@ class MultiMarketBot:
                                     pass
                             
                             tracker.initialized = True
+                            tracker.spot_open_price = None  # Reset for new market
+                            tracker.paper_trader.reset_predictor_for_new_market()
                             self.active_markets[slug] = tracker
                             print(f"🔍 Auto-discovered: {slug} (budget ${asset_budget:.0f})")
                             break  # Found one for this asset, move to next asset
@@ -4560,7 +4820,15 @@ class MultiMarketBot:
                     ratio = pt.qty_up / pt.qty_down if pt.qty_down > 0 else (999 if pt.qty_up > 0 else 0)
                     locked = pt.calculate_locked_profit()
                     extra = f" | ratio={ratio:.2f} locked=${locked:+.2f} trades={pt.trade_count}"
-                print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | ttc={ttc_str}{extra} | {fetch_latency_ms:.0f}ms")
+                # Add spot prediction info if available
+                spot_info = ""
+                if pt._spot_prediction and pt._spot_confidence > 0.55:
+                    spot_delta = ""
+                    if pt.trend_predictor.market_open_price and pt.trend_predictor.current_spot_price:
+                        d = pt.trend_predictor.current_spot_price - pt.trend_predictor.market_open_price
+                        spot_delta = f" Δ${d:+,.0f}"
+                    spot_info = f" | 🎯{pt._spot_prediction} {pt._spot_confidence:.0%}{spot_delta}"
+                print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | ttc={ttc_str}{extra}{spot_info} | {fetch_latency_ms:.0f}ms")
                 
                 trades = tracker.paper_trader.check_and_trade(
                     tracker.up_price, 
@@ -4645,6 +4913,12 @@ class MultiMarketBot:
                                 gross_pnl = getattr(pt, 'final_pnl_gross', pnl + fees_paid)
                                 net_payout = max(0.0, pt.payout - fees_paid)
                                 print(f"🏁 [{tracker.asset.upper()}] Resolved: {resolution} | Net: ${pnl:.2f} (fees ${fees_paid:.2f})")
+                                
+                                # Record outcome in trend predictor for future predictions
+                                if tracker.spot_open_price and self.last_btc_spot:
+                                    pt.trend_predictor.record_market_outcome(
+                                        resolution, tracker.spot_open_price, self.last_btc_spot
+                                    )
                                 
                                 # Add to history
                                 self.history.append({
@@ -4745,6 +5019,28 @@ class MultiMarketBot:
         async with aiohttp.ClientSession() as session:
             while self.running:
                 try:
+                    # === FETCH BTC SPOT PRICE ===
+                    # This is the ground truth for UP/DOWN prediction
+                    try:
+                        btc_spot = await fetch_btc_spot(session)
+                        if btc_spot:
+                            self.last_btc_spot = btc_spot
+                            self.spot_fetch_errors = 0
+                            # Update all active strategies with spot price
+                            for tracker in self.active_markets.values():
+                                if tracker.paper_trader.market_status == 'open':
+                                    # Set open price on first spot fetch for this market
+                                    if tracker.spot_open_price is None:
+                                        tracker.spot_open_price = btc_spot
+                                        tracker.paper_trader.set_market_open_spot(btc_spot)
+                                    tracker.paper_trader.update_spot_price(btc_spot)
+                        else:
+                            self.spot_fetch_errors += 1
+                    except Exception as e:
+                        self.spot_fetch_errors += 1
+                        if self.spot_fetch_errors <= 3:
+                            print(f"⚠️ Spot price fetch error: {e}")
+
                     # Discover new markets
                     await self.discover_markets(session)
                     
