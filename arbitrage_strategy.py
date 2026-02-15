@@ -1133,17 +1133,15 @@ class ArbitrageStrategy:
             return trades
 
         # ══════════════════════════════════════════════════════════
-        #  PHASE 2: ONE-SIDED — Lock profit FIRST, then follow trend
+        #  PHASE 2: ONE-SIDED — Lock profit, then wait
         #  
-        #  Price-level based logic:
-        #   A) PROFIT LOCK: If pair < $0.98 → lock guaranteed profit first
-        #   B) PRICE-LEVEL TREND: When ANY side crosses $0.60, buy at each
-        #      $0.05 increment. Only triggers if lock isn't available.
-        #   C) WAIT: If no trigger → hold and wait
+        #  Simple logic:
+        #   A) PROFIT LOCK: If pair < $0.98 → lock guaranteed profit
+        #   B) WAIT: Hold and wait for lock opportunity
         #  
-        #  Locking first ensures we never take a loss from one-sided exposure.
-        #  After locking (→ Phase 3), price-level buying continues via
-        #  Priority 2.5 with relaxed locked-profit guard.
+        #  NO trend building while one-sided — all trend-level buying
+        #  happens in Phase 3 AFTER locking, to prevent unrecoverable
+        #  one-sided losses.
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
             owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
@@ -1178,85 +1176,9 @@ class ArbitrageStrategy:
                     self.mode_reason = f'{lock_label}: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | locked ${locked_after:+.2f}'
                 return trades
 
-            # ── B) PRICE-LEVEL TREND FOLLOWING ──
-            # Once ANY side crosses $0.60, the trend is established.
-            # Buy at each new $0.05 price level (0.60, 0.65, 0.70, 0.75, 0.80).
-            # Only triggers if profit lock is NOT available (pair ≥ $0.98).
-            # EXPOSURE CAP: Skip if one-sided cost > $10 — force lock first.
-            TREND_CONFIRM_PRICE = 0.60  # Trend is "real" at this price
-            LEVEL_STEP = 0.05           # Buy at each $0.05 increment
-            MAX_TREND_PRICE = 0.85      # Don't chase above this
-            MAX_ONE_SIDED_COST = self.entry_trade_usd * 2.0  # Max $10 before lock
-            
-            owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
-            if owned_cost > MAX_ONE_SIDED_COST:
-                # Too much one-sided exposure — wait for lock opportunity
-                up_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_up)) or 'none'
-                dn_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_down)) or 'none'
-                self.current_mode = 'waiting_lock'
-                self.mode_reason = f'⏳ Exposure cap ${owned_cost:.1f} > ${MAX_ONE_SIDED_COST:.0f} — waiting for lock | pair ${potential_pair:.3f} | UP=[{up_levels_str}] DN=[{dn_levels_str}]'
-                return trades
-            
-            # Check both sides for price-level triggers
-            for check_token, check_price in [('UP', up_price), ('DOWN', down_price)]:
-                if check_price < TREND_CONFIRM_PRICE:
-                    continue  # Side hasn't confirmed trend yet
-                if check_price > MAX_TREND_PRICE:
-                    continue  # Too expensive
-                if time_to_close is not None and time_to_close < 20:
-                    continue  # Too late
-                
-                # Snap price to $0.05 grid level (round DOWN)
-                price_level = int(check_price / LEVEL_STEP) * LEVEL_STEP
-                price_level = round(price_level, 2)
-                
-                # Check if we've already bought at this level
-                bought_levels = self._bought_levels_up if check_token == 'UP' else self._bought_levels_down
-                if price_level in bought_levels:
-                    continue  # Already bought at this level
-                
-                # NEW LEVEL — buy!
-                level_strength = (price_level - 0.55) / 0.30  # 0.0 at 0.55, 1.0 at 0.85
-                level_strength = max(0.1, min(1.0, level_strength))
-                spend = self.entry_trade_usd * (1.0 + level_strength)  # $5 to $10
-                
-                # Spot confidence boost: if spot agrees, buy more
-                if self._spot_prediction == check_token and self._spot_confidence is not None and self._spot_confidence >= 0.65:
-                    spend *= 1.5
-                
-                # Endgame boost: more aggressive in final 90s
-                if time_to_close is not None and time_to_close <= 90:
-                    spend *= 1.5
-                    if time_to_close < 30:
-                        # Remove cooldown for final sprint
-                        if check_token == 'UP':
-                            self._last_trade_time_up = 0.0
-                            up_on_cooldown = False
-                        else:
-                            self._last_trade_time_down = 0.0
-                            down_on_cooldown = False
-                        spend *= 1.5
-                
-                is_reversal = (check_token != owned_token)
-                tag = 'trend_follow_reversal' if is_reversal else 'trend_buildup_solo'
-                trade = buy_with_spend(check_token, check_price, spend, tag)
-                if trade:
-                    trades.append(trade)
-                    bought_levels.add(price_level)
-                    levels_str = ','.join(f'{l:.2f}' for l in sorted(bought_levels))
-                    if is_reversal:
-                        self.current_mode = 'trend_reversal'
-                        self.mode_reason = f'🔄 Trend reversed → {check_token} @ ${check_price:.3f} | level ${price_level:.2f} | levels=[{levels_str}]'
-                    else:
-                        self.current_mode = 'trend_buildup'
-                        self.mode_reason = f'📈 Building {check_token} @ ${check_price:.3f} | level ${price_level:.2f} | levels=[{levels_str}]'
-                return trades
-
-            # ── C) WAIT — no side has crossed $0.60 or all levels bought ──
-            up_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_up)) or 'none'
-            dn_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_down)) or 'none'
+            # ── B) WAIT — lock not available yet ──
             self.current_mode = 'waiting_lock'
-            self.mode_reason = f'⏳ Holding {owned_token} ({owned_qty:.1f} @ ${owned_avg:.3f}) | UP ${up_price:.3f} DOWN ${down_price:.3f} | pair ${potential_pair:.3f} | UP levels=[{up_levels_str}] DN levels=[{dn_levels_str}]'
+            self.mode_reason = f'⏳ Holding {owned_token} ({owned_qty:.1f} @ ${owned_avg:.3f}) | UP ${up_price:.3f} DOWN ${down_price:.3f} | pair ${potential_pair:.3f} — waiting for lock'
             return trades
 
         # ══════════════════════════════════════════════════════════
