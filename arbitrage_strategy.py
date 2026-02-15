@@ -204,6 +204,7 @@ class ArbitrageStrategy:
         self._prev_trend_token = None     # Track previous trend for logging
         self._bought_levels_up: set = set()    # Price levels bought: {0.60, 0.65, ...}
         self._bought_levels_down: set = set()  # Price levels bought: {0.60, 0.65, ...}
+        self._trend_level_spent: float = 0.0   # Total $ spent on trend_level buys this market
 
         # Spot-based trend predictor (BTC spot price from Binance)
         self.trend_predictor = TrendPredictor()
@@ -577,6 +578,7 @@ class ArbitrageStrategy:
         # Price-level trend tracking: which $0.05 levels we've bought at
         self._bought_levels_up: set = set()    # e.g. {0.60, 0.65, 0.70}
         self._bought_levels_down: set = set()
+        self._trend_level_spent: float = 0.0
     def _should_take_profit_now(self, locked_profit: float, ratio: float, current_pair: float) -> Tuple[bool, str]:
         """Determine if we should take profit and stop trading now."""
         # NEVER stop if locked profit is negative
@@ -825,6 +827,7 @@ class ArbitrageStrategy:
             # In real markets combined > 1.0, so locked is usually slightly negative
             # after pair entry (~-$0.50). This is normal and recovered through trend.
             # Guard levels:
+            #  trend_level: relaxed floor (-$15) — confirmed trends justify risk
             #  locked >= 0: profitable — cap buys to protect profit
             #  locked > -$2: mildly underwater — allow trend following, cap to prevent worsening
             #  locked < -$2: severely underwater — emergency, only weak-side buys
@@ -832,10 +835,15 @@ class ArbitrageStrategy:
                 pnl_up_now = self.calculate_pnl_if_up_wins()
                 pnl_down_now = self.calculate_pnl_if_down_wins()
                 locked_now = min(pnl_up_now, pnl_down_now)
+                other_pnl = pnl_down_now if token == 'UP' else pnl_up_now
                 
-                if locked_now >= 0:
+                if reason == 'trend_level':
+                    # Price-level trend buys: skip locked profit guard entirely.
+                    # Spending is capped by _trend_level_budget in Phase 3.
+                    # Emergency fix adjusts for trend_level spending too.
+                    pass  # No locked profit restriction
+                elif locked_now >= 0:
                     # Position is profitable — protect it universally
-                    other_pnl = pnl_down_now if token == 'UP' else pnl_up_now
                     max_spend_safe = max(0, (other_pnl - self.min_locked_buffer) / FEE_MULT)
                     if max_spend_safe < 1.0:
                         return None  # Would breach locked profit protection
@@ -843,7 +851,6 @@ class ArbitrageStrategy:
                 elif locked_now > -2.00:
                     # Mildly underwater (normal market spread) — allow trading
                     # but cap spend so locked doesn't fall below -$2
-                    other_pnl = pnl_down_now if token == 'UP' else pnl_up_now
                     max_spend_safe = max(0, (other_pnl + 2.00) / FEE_MULT)
                     if max_spend_safe < 1.0:
                         return None
@@ -1123,14 +1130,17 @@ class ArbitrageStrategy:
             return trades
 
         # ══════════════════════════════════════════════════════════
-        #  PHASE 2: ONE-SIDED — Lock arbitrage or follow trend reversals
+        #  PHASE 2: ONE-SIDED — Lock profit FIRST, then follow trend
         #  
-        #  Simple price-level based logic:
-        #   A) PROFIT LOCK: If pair < $0.98 → lock guaranteed profit
+        #  Price-level based logic:
+        #   A) PROFIT LOCK: If pair < $0.98 → lock guaranteed profit first
         #   B) PRICE-LEVEL TREND: When ANY side crosses $0.60, buy at each
-        #      $0.05 increment (0.60, 0.65, 0.70, 0.75, 0.80). This follows
-        #      the trend without needing momentum detection.
+        #      $0.05 increment. Only triggers if lock isn't available.
         #   C) WAIT: If no trigger → hold and wait
+        #  
+        #  Locking first ensures we never take a loss from one-sided exposure.
+        #  After locking (→ Phase 3), price-level buying continues via
+        #  Priority 2.5 with relaxed locked-profit guard.
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
             owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
@@ -1168,7 +1178,7 @@ class ArbitrageStrategy:
             # ── B) PRICE-LEVEL TREND FOLLOWING ──
             # Once ANY side crosses $0.60, the trend is established.
             # Buy at each new $0.05 price level (0.60, 0.65, 0.70, 0.75, 0.80).
-            # This works for both our side continuing AND trend reversals.
+            # Only triggers if profit lock is NOT available (pair ≥ $0.98).
             TREND_CONFIRM_PRICE = 0.60  # Trend is "real" at this price
             LEVEL_STEP = 0.05           # Buy at each $0.05 increment
             MAX_TREND_PRICE = 0.85      # Don't chase above this
@@ -1182,9 +1192,7 @@ class ArbitrageStrategy:
                 if time_to_close is not None and time_to_close < 20:
                     continue  # Too late
                 
-                # Snap price to $0.05 grid level
-                price_level = round(check_price * 20) / 20  # 0.60, 0.65, 0.70, ...
-                # Ensure we round DOWN to current level (e.g., 0.63 → 0.60)
+                # Snap price to $0.05 grid level (round DOWN)
                 price_level = int(check_price / LEVEL_STEP) * LEVEL_STEP
                 price_level = round(price_level, 2)
                 
@@ -1194,8 +1202,6 @@ class ArbitrageStrategy:
                     continue  # Already bought at this level
                 
                 # NEW LEVEL — buy!
-                # Sizing: moderate-aggressive, scales with price level
-                # Higher price = stronger trend = slightly bigger buys
                 level_strength = (price_level - 0.55) / 0.30  # 0.0 at 0.55, 1.0 at 0.85
                 level_strength = max(0.1, min(1.0, level_strength))
                 spend = self.entry_trade_usd * (1.0 + level_strength)  # $5 to $10
@@ -1284,7 +1290,10 @@ class ArbitrageStrategy:
         # In volatile markets, still allow emergency fix but vol_scale will reduce size.
         # Blocking entirely prevented recovery from imbalanced positions.
         emergency_vol_ok = True
-        if locked_profit < -2.00 and emergency_time_ok and emergency_vol_ok:
+        # Adjust locked for intentional trend_level spending
+        # trend_level buys are calculated risk, not a deficit to fix
+        adjusted_locked = locked_profit + self._trend_level_spent
+        if adjusted_locked < -2.00 and emergency_time_ok and emergency_vol_ok:
             weak_token = 'UP' if pnl_up < pnl_down else 'DOWN'
             strong_pnl = max(pnl_up, pnl_down)
             weak_pnl = min(pnl_up, pnl_down)
@@ -1380,6 +1389,73 @@ class ArbitrageStrategy:
                                               f'combined ${combined_ask:.3f} | margin ${arb_margin:.3f} | '
                                               f'locked ${locked_profit:+.2f}→${new_locked:+.2f}')
                         return trades
+
+        # ── PRIORITY 2.5: PRICE-LEVEL TREND BUILD ──
+        # When a side ≥ $0.60, buy at each new $0.05 level on the trending side.
+        # This ensures the trending side ALWAYS has the most shares, even after
+        # profit lock creates balanced positions. Uses relaxed locked-profit guard
+        # (trend_level tag: floor -$15) to allow building through the lock.
+        TREND_CONFIRM_P3 = 0.60
+        LEVEL_STEP_P3 = 0.05
+        MAX_TREND_P3 = 0.85
+        
+        for check_token, check_price in [('UP', up_price), ('DOWN', down_price)]:
+            if check_price < TREND_CONFIRM_P3:
+                continue
+            if check_price > MAX_TREND_P3:
+                continue
+            if time_to_close is not None and time_to_close < 30:
+                continue
+            
+            # Snap to $0.05 grid (round DOWN)
+            price_level = int(check_price / LEVEL_STEP_P3) * LEVEL_STEP_P3
+            price_level = round(price_level, 2)
+            
+            bought_levels = self._bought_levels_up if check_token == 'UP' else self._bought_levels_down
+            if price_level in bought_levels:
+                continue  # Already bought at this level
+            
+            # New level — buy trending side!
+            # Small, controlled buys ($2) to tilt ratio toward trending side.
+            # Total capped at $10 per market via _trend_level_budget.
+            TREND_LEVEL_BUDGET = 10.0
+            remaining_trend_budget = TREND_LEVEL_BUDGET - self._trend_level_spent
+            if remaining_trend_budget < 1.0:
+                continue  # Trend level budget exhausted
+            spend = min(2.0, remaining_trend_budget)
+            
+            # Spot confidence boost
+            if (self._spot_prediction == check_token
+                and self._spot_confidence is not None
+                and self._spot_confidence >= 0.65):
+                spend *= 1.5
+            
+            # Endgame boost
+            if time_to_close is not None and time_to_close <= 90:
+                spend *= 1.5
+                if time_to_close < 30:
+                    spend *= 1.5
+            
+            # Bypass cooldown for new level buys
+            if check_token == 'UP':
+                self._last_trade_time_up = 0.0
+                up_on_cooldown = False
+            else:
+                self._last_trade_time_down = 0.0
+                down_on_cooldown = False
+            
+            trade = buy_with_spend(check_token, check_price, spend, 'trend_level')
+            if trade:
+                trades.append(trade)
+                bought_levels.add(price_level)
+                self._trend_level_spent += spend
+                levels_str = ','.join(f'{l:.2f}' for l in sorted(bought_levels))
+                new_locked = self.calculate_locked_profit()
+                self.current_mode = 'trend_level'
+                self.mode_reason = (f'📈 Level {check_token} @ ${check_price:.3f} | '
+                                   f'lvl ${price_level:.2f} | [{levels_str}] | '
+                                   f'locked ${new_locked:+.2f} | t_spent ${self._trend_level_spent:.0f}')
+            return trades
 
         # ── PRIORITY 3: PROFIT SEED — ensure winning side has min profit ──
         # Buy currently winning side to build profit potential.
