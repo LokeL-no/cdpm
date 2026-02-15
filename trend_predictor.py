@@ -551,45 +551,137 @@ async def fetch_btc_spot(session) -> Optional[float]:
     return None
 
 
-async def fetch_btc_price_at_timestamp(session, target_timestamp: float) -> Optional[float]:
-    """
-    Fetch BTC price at a specific Unix timestamp using Binance kline API.
-    
-    This gives us the BTC price at the exact start of a market window,
-    which is the reference price the market resolves against.
-    
-    Uses the 1-minute candle that contains the target timestamp.
-    Returns the candle's open price (closest to the exact second).
-    """
+# ══════════════════════════════════════════════════════════
+#  MULTI-ASSET SPOT PRICE FETCHING
+#  Binance symbols: ETHUSDT, SOLUSDT, XRPUSDT
+#  CoinGecko ids: ethereum, solana, ripple
+#  Coinbase: ETH-USD, SOL-USD, XRP-USD
+# ══════════════════════════════════════════════════════════
+
+# Map asset -> Binance symbol
+BINANCE_SYMBOLS = {
+    'btc': 'BTCUSDT',
+    'eth': 'ETHUSDT',
+    'sol': 'SOLUSDT',
+    'xrp': 'XRPUSDT',
+}
+
+# Map asset -> CoinGecko id
+COINGECKO_IDS = {
+    'btc': 'bitcoin',
+    'eth': 'ethereum',
+    'sol': 'solana',
+    'xrp': 'ripple',
+}
+
+# Map asset -> Coinbase pair
+COINBASE_PAIRS = {
+    'btc': 'BTC-USD',
+    'eth': 'ETH-USD',
+    'sol': 'SOL-USD',
+    'xrp': 'XRP-USD',
+}
+
+
+async def fetch_asset_spot_binance(session, asset: str) -> Optional[float]:
+    """Fetch spot price for any supported asset from Binance."""
+    symbol = BINANCE_SYMBOLS.get(asset.lower())
+    if not symbol:
+        return None
     try:
-        # Binance kline API uses milliseconds
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        async with session.get(url, timeout=2.0) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data['price'])
+    except Exception as e:
+        logger.debug(f"Binance {asset} fetch error: {e}")
+    return None
+
+
+async def fetch_asset_spot_coinbase(session, asset: str) -> Optional[float]:
+    """Fetch spot price for any supported asset from Coinbase."""
+    pair = COINBASE_PAIRS.get(asset.lower())
+    if not pair:
+        return None
+    try:
+        url = f"https://api.coinbase.com/v2/prices/{pair}/spot"
+        async with session.get(url, timeout=3.0) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data['data']['amount'])
+    except Exception as e:
+        logger.debug(f"Coinbase {asset} fetch error: {e}")
+    return None
+
+
+async def fetch_asset_spot_coingecko(session, asset: str) -> Optional[float]:
+    """Fetch spot price for any supported asset from CoinGecko."""
+    cg_id = COINGECKO_IDS.get(asset.lower())
+    if not cg_id:
+        return None
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+        async with session.get(url, timeout=3.0) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data[cg_id]['usd'])
+    except Exception as e:
+        logger.debug(f"CoinGecko {asset} fetch error: {e}")
+    return None
+
+
+async def fetch_asset_spot(session, asset: str) -> Optional[float]:
+    """
+    Fetch spot price for any supported asset with fallback chain.
+    Supports: btc, eth, sol, xrp
+    """
+    # For BTC, use the optimized existing function
+    if asset.lower() == 'btc':
+        return await fetch_btc_spot(session)
+    
+    price = await fetch_asset_spot_binance(session, asset)
+    if price:
+        return price
+
+    price = await fetch_asset_spot_coinbase(session, asset)
+    if price:
+        return price
+
+    price = await fetch_asset_spot_coingecko(session, asset)
+    if price:
+        return price
+
+    return None
+
+
+async def fetch_asset_price_at_timestamp(session, asset: str, target_timestamp: float) -> Optional[float]:
+    """
+    Fetch asset price at a specific Unix timestamp using Binance kline API.
+    Works for BTC, ETH, SOL, XRP.
+    """
+    symbol = BINANCE_SYMBOLS.get(asset.lower())
+    if not symbol:
+        return None
+    try:
         start_ms = int(target_timestamp * 1000)
         url = (f"https://api.binance.com/api/v3/klines"
-               f"?symbol=BTCUSDT&interval=1m&startTime={start_ms}&limit=1")
+               f"?symbol={symbol}&interval=1m&startTime={start_ms}&limit=1")
         async with session.get(url, timeout=3.0) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data and len(data) > 0:
-                    # Kline format: [open_time, open, high, low, close, volume, ...]
                     open_price = float(data[0][1])
-                    logger.info(f"📍 BTC reference price at {target_timestamp:.0f}: ${open_price:,.2f} (Binance kline)")
+                    logger.info(f"📍 {asset.upper()} reference price at {target_timestamp:.0f}: ${open_price:,.2f} (Binance kline)")
                     return open_price
     except Exception as e:
-        logger.debug(f"Binance kline fetch error: {e}")
+        logger.debug(f"Binance kline {asset} fetch error: {e}")
     
-    # Fallback: try Coinbase price (current, not historical — less accurate)
-    try:
-        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-        async with session.get(url, timeout=3.0) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                price = float(data['data']['amount'])
-                logger.info(f"📍 BTC fallback price: ${price:,.2f} (Coinbase current)")
-                return price
-    except Exception as e:
-        logger.debug(f"Coinbase fallback error: {e}")
-    
-    return None
+    # Fallback: current spot
+    price = await fetch_asset_spot(session, asset)
+    if price:
+        logger.info(f"📍 {asset.upper()} fallback price: ${price:,.2f} (current spot)")
+    return price
 
 
 def fetch_btc_spot_sync() -> Optional[float]:

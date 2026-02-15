@@ -1238,9 +1238,24 @@ class ArbitrageStrategy:
                 
                 if trend_price <= effective_max_price and time_to_close is not None and time_to_close > 30:
                     conf = trend_confidence or 0
-                    base_mult = 0.5 + 0.5 * (trend_strength or 0.5)
-                    if conf >= 0.80:
-                        base_mult *= 1.5  # High confidence boost
+                    
+                    # Determine if arbitrage is still possible
+                    # Arb is lost when potential pair > ~1.05 (too expensive to pair profitably)
+                    arb_lost = potential_pair > 1.05
+                    
+                    # Base sizing: more aggressive when arb is lost
+                    if arb_lost:
+                        # No arb opportunity — go all-in on trend following
+                        base_mult = 1.0 + 1.0 * (trend_strength or 0.5)
+                        if conf >= 0.75:
+                            base_mult *= 1.8  # High confidence + arb lost = aggressive
+                        elif conf >= 0.65:
+                            base_mult *= 1.4
+                    else:
+                        # Arb still possible — moderate sizing, don't burn cash
+                        base_mult = 0.5 + 0.5 * (trend_strength or 0.5)
+                        if conf >= 0.80:
+                            base_mult *= 1.5  # High confidence boost
                     
                     spend = self.entry_trade_usd * base_mult
                     
@@ -1248,6 +1263,8 @@ class ArbitrageStrategy:
                     if time_to_close <= 90 and self._spot_confidence is not None and self._spot_confidence >= 0.65:
                         spend = self.momentum_trade_usd * (0.5 + (self._spot_confidence or 0))
                         spend *= self._vol_scale
+                        if arb_lost:
+                            spend *= 1.5  # Arb lost + endgame = max aggression
                         if time_to_close < 30:
                             if trending_token == 'UP':
                                 self._last_trade_time_up = 0.0
@@ -1261,12 +1278,13 @@ class ArbitrageStrategy:
                     trade = buy_with_spend(trending_token, trend_price, spend, tag)
                     if trade:
                         trades.append(trade)
+                        arb_status = '(arb lost — aggressive)' if arb_lost else f'(pair ${potential_pair:.3f})'
                         if trending_token == owned_token:
                             self.current_mode = 'trend_buildup'
-                            self.mode_reason = f'📈 Building {owned_token} @ ${trend_price:.3f} | conf {conf:.0%} | waiting for {other_token} to drop (${other_price:.3f})'
+                            self.mode_reason = f'📈 Building {owned_token} @ ${trend_price:.3f} | conf {conf:.0%} {arb_status}'
                         else:
                             self.current_mode = 'trend_reversal'
-                            self.mode_reason = f'🔄 Trend reversed → following {trending_token} @ ${trend_price:.3f} | conf {conf:.0%} | abandoning arb'
+                            self.mode_reason = f'🔄 Trend reversed → {trending_token} @ ${trend_price:.3f} | conf {conf:.0%} {arb_status}'
                     return trades
 
             # ── C) WAIT — no clear signal, hold position ──
