@@ -1095,15 +1095,16 @@ class ArbitrageStrategy:
             entry_price = up_price if entry_token == 'UP' else down_price
 
             # TREND STRENGTH GUARD: Only enter if trending side shows conviction
-            # Price > 0.55 means the market has a clear opinion.
-            # At 0.50-0.50 the market is undecided — wait for direction.
-            min_trend_price = 0.53  # Need some trend conviction
+            # Price >= 0.55 means the market has a clear opinion.
+            # At 0.50-0.53 the market is undecided — wait for direction.
+            # Even with strong spot signal, NEVER enter below 0.55:
+            #   - Buying at $0.51 wastes arbitrage potential (pair would be ~$1.02+)
+            #   - Buying at $0.55+ means opposite is $0.45 → pair $1.00 = breakeven or better
+            min_trend_price = 0.55  # Hard minimum — preserves arbitrage opportunity
             if entry_price < min_trend_price:
-                # Exception: spot predictor is very confident
-                if not (self._spot_confidence is not None and self._spot_confidence >= 0.70):
-                    self.current_mode = 'scouting'
-                    self.mode_reason = f'🔍 No clear trend yet | UP ${up_price:.3f} DOWN ${down_price:.3f} — waiting for direction'
-                    return trades
+                self.current_mode = 'scouting'
+                self.mode_reason = f'🔍 No clear trend yet | UP ${up_price:.3f} DOWN ${down_price:.3f} — waiting for ≥$0.55'
+                return trades
             
             # DON'T enter at extreme prices — too late, bad ROI
             if entry_price > 0.85:
@@ -1140,9 +1141,8 @@ class ArbitrageStrategy:
         #  
         #  Strategy:
         #   A) PROFIT LOCK: If opposite side is cheap enough → pair for guaranteed profit
-        #   B) TREND BUILD: If our side is trending → keep building position  
-        #   C) DEFENSIVE PAIR: If trend reverses → pair to limit losses
-        #   D) WAIT: If no clear signal → wait for opportunity
+        #   B) TREND FOLLOW: If any side is trending → keep building that side  
+        #   C) WAIT: If no clear signal → wait for opportunity
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
             owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
