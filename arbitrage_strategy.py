@@ -781,6 +781,13 @@ class ArbitrageStrategy:
         self.price_history_down.append(down_price)
         self.combined_history.append(combined)
 
+        # ── STARTUP QUIET PERIOD: First minute, no trading ──
+        # Allow initial volatility to settle while still collecting data.
+        if self._market_time_elapsed < 60.0:
+            self.current_mode = 'settling'
+            self.mode_reason = f'🕒 Settling: {self._market_time_elapsed:.0f}s < 60s — no trades'
+            return trades
+
         remaining_budget = self.remaining_budget()
         if remaining_budget < self.min_trade_size:
             self.current_mode = 'standby'
