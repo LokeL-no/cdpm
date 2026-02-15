@@ -211,6 +211,14 @@ class ArbitrageStrategy:
         self._endgame_total_spent: float = 0.0
         self._endgame_max_total: float = 30.0  # Max total endgame spend per market
 
+        # Volatility regime / choppy market protection
+        self._volatility_regime: str = 'MEDIUM'  # Updated each tick
+        self._is_choppy: bool = False             # True when market oscillating
+        self._vol_scale: float = 1.0              # Position size multiplier from vol
+        self._consecutive_whipsaw_markets: int = 0  # Track consecutive choppy markets
+        self._market_time_elapsed: float = 0.0    # Time since market open
+        self._market_open_time: Optional[float] = None  # When this market opened
+
         # Telemetry / history for UI compatibility
         self.mgp_history = deque(maxlen=180)
         self.pnl_up_history = deque(maxlen=180)
@@ -558,6 +566,12 @@ class ArbitrageStrategy:
         self.price_history_up.clear()
         self.price_history_down.clear()
         self.combined_history.clear()
+        # Reset volatility tracking for new market
+        self._volatility_regime = 'MEDIUM'
+        self._is_choppy = False
+        self._vol_scale = 1.0
+        self._market_time_elapsed = 0.0
+        self._market_open_time = None
     def _should_take_profit_now(self, locked_profit: float, ratio: float, current_pair: float) -> Tuple[bool, str]:
         """Determine if we should take profit and stop trading now."""
         # NEVER stop if locked profit is negative
@@ -705,12 +719,42 @@ class ArbitrageStrategy:
             return trades
 
         # Per-side trade cooldown: each side (UP/DOWN) has independent cooldown
-        # Normal: 12s per side. Profit seed bypasses cooldown directly.
         now = _time.time()
         up_cd = self.min_trade_interval
         down_cd = self.min_trade_interval
         up_on_cooldown = self._last_trade_time_up > 0 and (now - self._last_trade_time_up) < up_cd
         down_on_cooldown = self._last_trade_time_down > 0 and (now - self._last_trade_time_down) < down_cd
+
+        # ── VOLATILITY REGIME UPDATE ──
+        # Track direction flips, classify volatility, scale position sizes.
+        # This is the core protection against choppy/whipsaw markets.
+        if self._market_open_time is None:
+            self._market_open_time = now
+        self._market_time_elapsed = now - self._market_open_time
+
+        # Update direction tracking in trend predictor
+        self.trend_predictor.update_direction_tracking(up_price, down_price)
+
+        # Update EMA with favored side price
+        favored_price = max(up_price, down_price)
+        self.trend_predictor.update_market_ema(favored_price)
+
+        # Classify volatility regime
+        self._volatility_regime = self.trend_predictor.classify_volatility_regime(self._market_time_elapsed)
+        self._is_choppy = self.trend_predictor.is_choppy_market()
+        self._vol_scale = self.trend_predictor.get_volatility_scale_factor()
+
+        # Apply volatility scale to late_game_scale
+        late_game_scale *= self._vol_scale
+
+        # ── VOLATILE MARKET AWARENESS ──
+        # 5-minute markets are inherently volatile with frequent direction flips.
+        # Instead of capping spend, we rely on:
+        #   - vol_scale reducing position sizes in HIGH/MEDIUM regimes
+        #   - flip penalty reducing trend confidence
+        #   - dynamic thresholds requiring stronger signals
+        # The bot MUST keep trading to follow trends and capture profit.
+
         if up_on_cooldown and down_on_cooldown:
             # Both sides on cooldown — still collect price data
             combined = up_price + down_price
@@ -931,6 +975,7 @@ class ArbitrageStrategy:
         def detect_momentum() -> tuple:
             """
             Detect which side has momentum (trending toward winning).
+            Enhanced with EMA crossover and choppy market filtering.
             Returns: (trending_token, strength, confidence)
               - trending_token: 'UP' or 'DOWN' or None
               - strength: float 0-1 (how strong the trend is)
@@ -939,12 +984,16 @@ class ArbitrageStrategy:
             if len(self.price_history_up) < self.momentum_min_samples:
                 return None, 0, 0
             
+            # ── CHOPPY MARKET AWARENESS ──
+            # In volatile markets with many flips, require stronger signal
+            # instead of blocking momentum detection entirely.
+            # The flip penalty below already reduces confidence proportionally.
+            
             # Current prices as probability signal
-            # UP at $0.60 = 60% chance UP wins
             up_prob = up_price
             down_prob = down_price
             
-            # Check if one side is clearly favored (>56%)
+            # Check if one side is clearly favored (>53%)
             if up_prob <= (0.50 + self.momentum_threshold) and down_prob <= (0.50 + self.momentum_threshold):
                 return None, 0, 0  # Market is ~50/50, no clear momentum
             
@@ -958,35 +1007,60 @@ class ArbitrageStrategy:
                 favored_prob = down_prob
                 history = list(self.price_history_down)
             
-            # Check trend: is price rising over recent samples?
+            # ── EMA-BASED TREND DETECTION (primary) ──
+            # EMA crossover is faster and more reliable than simple averages.
+            ema_trend = self.trend_predictor._ema_trend
+            ema_strength = self.trend_predictor._ema_crossover_strength
+            
+            # Check old-style trend too for confirmation
             recent = history[-min(len(history), 10):]
             if len(recent) < 3:
                 return None, 0, 0
             
             early_avg = sum(recent[:len(recent)//2]) / (len(recent)//2)
             late_avg = sum(recent[len(recent)//2:]) / len(recent[len(recent)//2:])
-            trend = late_avg - early_avg  # positive = price rising = momentum
+            trend = late_avg - early_avg
             
-            # Two ways to detect momentum:
-            # 1. RISING: price is actively going up (trend >= threshold)
-            # 2. SUSTAINED: price has been consistently high for 70%+ of window
+            # Require BOTH EMA and price trend to agree, OR strong EMA signal
+            is_ema_confirmed = (ema_trend == 'RISING' and ema_strength > 0.005)
             is_rising = trend >= self.momentum_trend_strength
             above_count = sum(1 for p in recent if p > (0.50 + self.momentum_threshold))
             is_sustained = above_count >= len(recent) * 0.7 and favored_prob > (0.50 + self.momentum_threshold)
             
-            if not is_rising and not is_sustained:
-                return None, 0, 0  # Neither rising nor sustained
+            # HIGH VOL: require stronger confirmation
+            if self._volatility_regime == 'HIGH':
+                # In high vol, require BOTH EMA + sustained OR very strong EMA
+                if not (is_ema_confirmed and (is_sustained or is_rising)):
+                    if not (ema_strength > 0.015):  # Very strong EMA override
+                        return None, 0, 0
+            else:
+                # Normal: allow EMA-confirmed OR sustained
+                if not is_ema_confirmed and not is_rising and not is_sustained:
+                    return None, 0, 0
             
             # Strength: how far above 0.50 (capped at 1.0)
-            strength = min(1.0, (favored_prob - 0.50) / 0.30)  # 0.50=0, 0.80=1.0
+            strength = min(1.0, (favored_prob - 0.50) / 0.30)
             
-            # Confidence: based on consistency of trend
-            # Count how many of the last 5 samples showed this side leading
+            # Boost strength with EMA confirmation
+            if is_ema_confirmed:
+                strength = min(1.0, strength + 0.15)
+            
+            # Confidence: based on consistency + EMA + direction flip penalty
             last_5_up = list(self.price_history_up)[-5:]
             last_5_down = list(self.price_history_down)[-5:]
             leading_count = sum(1 for u, d in zip(last_5_up, last_5_down) 
                               if (u > d) == (favored == 'UP'))
             confidence = leading_count / max(len(last_5_up), 1)
+            
+            # EMA confirmation boosts confidence
+            if is_ema_confirmed:
+                confidence = min(1.0, confidence + 0.15)
+            
+            # FLIP PENALTY: Reduce confidence after direction flips
+            # Each flip reduces confidence by 10%, making the bot more cautious
+            if self.trend_predictor.direction_flips > 0:
+                flip_penalty = min(0.30, self.trend_predictor.direction_flips * 0.10)
+                confidence = max(0.0, confidence - flip_penalty)
             
             return favored, strength, confidence
 
@@ -1138,7 +1212,10 @@ class ArbitrageStrategy:
         # through trend following in Priority 3/4.
         # NEVER emergency fix in last 30 seconds — prices go extreme, buys are wasteful.
         emergency_time_ok = time_to_close is None or time_to_close > 30
-        if locked_profit < -2.00 and emergency_time_ok:
+        # In volatile markets, still allow emergency fix but vol_scale will reduce size.
+        # Blocking entirely prevented recovery from imbalanced positions.
+        emergency_vol_ok = True
+        if locked_profit < -2.00 and emergency_time_ok and emergency_vol_ok:
             weak_token = 'UP' if pnl_up < pnl_down else 'DOWN'
             strong_pnl = max(pnl_up, pnl_down)
             weak_pnl = min(pnl_up, pnl_down)
@@ -1154,7 +1231,8 @@ class ArbitrageStrategy:
                 return trades
 
             per_share_gain = 1.0 - weak_price * FEE_MULT  # PnL improvement per share
-            if per_share_gain > 0.01:  # Only if price allows profit (< ~$0.97)
+            # Block fix when price is extreme (>0.80) — terrible ROI at near-max price
+            if per_share_gain > 0.05 and weak_price <= 0.80:  # Need 5%+ profit per share AND reasonable price
                 # Dead zone: if gap is tiny (< $0.50), don't bother equalizing
                 if pnl_gap < 0.50:
                     self.current_mode = 'emergency_hold'
@@ -1237,6 +1315,9 @@ class ArbitrageStrategy:
         # ── PRIORITY 3: PROFIT SEED — ensure winning side has min profit ──
         # Buy currently winning side to build profit potential.
         # CAPPED by locked profit guard in buy_with_spend — can never push locked < buffer.
+        # *** CHOPPY MARKET GUARD: Skip profit seed entirely when market is choppy ***
+        # In choppy markets, the "winning side" keeps flipping — seeding both sides
+        # burns cash without building sustained profit on either.
         winning_token = 'UP' if up_price >= down_price else 'DOWN'
         winning_price = up_price if winning_token == 'UP' else down_price
         winning_qty = self.qty_up if winning_token == 'UP' else self.qty_down
@@ -1244,19 +1325,36 @@ class ArbitrageStrategy:
         
         pnl_if_winning_wins = winning_qty - winning_cost
         
-        needs_seed = (winning_price >= self.flip_trigger_price and
-                      pnl_if_winning_wins < self.flip_target_profit and
+        # Dynamic flip trigger: raise threshold in volatile markets
+        # Normal: 0.53, High vol: 0.58 (need stronger conviction before seeding)
+        dynamic_flip_trigger = self.flip_trigger_price
+        if self._volatility_regime == 'HIGH':
+            dynamic_flip_trigger = 0.58
+        elif self._volatility_regime == 'MEDIUM' and self.trend_predictor.direction_flips >= 2:
+            dynamic_flip_trigger = 0.56
+        
+        # Dynamic seed target: reduce in volatile markets (don't waste money chasing)
+        dynamic_seed_target = self.flip_target_profit
+        if self._volatility_regime == 'HIGH':
+            dynamic_seed_target = 1.50  # Only $1.50 target instead of $3
+        elif self.trend_predictor.direction_flips >= 2:
+            dynamic_seed_target = 2.00  # Reduced after multiple flips
+        
+        needs_seed = (winning_price >= dynamic_flip_trigger and
+                      pnl_if_winning_wins < dynamic_seed_target and
                       winning_price < 0.88 and
                       time_to_close is not None and time_to_close > self.awareness_time_end)
         
         if needs_seed:
-            additional_needed = self.flip_target_profit - pnl_if_winning_wins
+            additional_needed = dynamic_seed_target - pnl_if_winning_wins
             if additional_needed > 0.50:
                 profit_per_share = 1.0 - winning_price
                 if profit_per_share > 0.05:
                     shares_needed = additional_needed / profit_per_share
                     seed_spend = shares_needed * winning_price
-                    seed_spend = max(2.0, min(seed_spend, 20.0))  # $20 cap (locked guard will cap further)
+                    seed_spend = max(2.0, min(seed_spend, 20.0))
+                    # Scale down by volatility
+                    seed_spend *= self._vol_scale
                     
                     # Reduced cooldown for seed buys
                     if winning_token == 'UP':
@@ -1280,10 +1378,7 @@ class ArbitrageStrategy:
                                           f'locked ${new_locked:+.2f}')
                     return trades
 
-        # ══════════════════════════════════════════════════════════
-        #  AWARENESS MODE: 150s-60s left — ensure defensive position
-        #  Buy weak side if severely underweight. Protected by buy_with_spend.
-        # ══════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════\n        #  AWARENESS MODE: 150s-60s left — ensure defensive position\n        #  Buy weak side if severely underweight. Protected by buy_with_spend.\n        #  *** CHOPPY GUARD: In choppy markets, only maintain minimum hedge ***\n        # ══════════════════════════════════════════════════════════
         if time_to_close is not None and self.awareness_time_end <= time_to_close <= self.awareness_time_start:
             weak_token = 'DOWN' if self.qty_up > self.qty_down else 'UP'
             strong_token = 'UP' if weak_token == 'DOWN' else 'DOWN'
@@ -1295,17 +1390,18 @@ class ArbitrageStrategy:
             weak_cost = self.cost_down if weak_token == 'DOWN' else self.cost_up
             weak_pnl_if_wins = weak_qty - weak_cost
             
-            if (weak_price >= self.flip_trigger_price and
-                weak_pnl_if_wins < self.flip_target_profit and
+            if (weak_price >= dynamic_flip_trigger and
+                weak_pnl_if_wins < dynamic_seed_target and
                 weak_price <= self.awareness_max_price and weak_price < 0.90):
                 
-                additional_needed = self.flip_target_profit - weak_pnl_if_wins
+                additional_needed = dynamic_seed_target - weak_pnl_if_wins
                 if additional_needed > 0.50:
                     profit_per_share = 1.0 - weak_price
                     if profit_per_share > 0.05:
                         shares_needed = additional_needed / profit_per_share
                         seed_spend = shares_needed * weak_price
-                        seed_spend = max(2.0, min(seed_spend, 20.0))  # $20 cap
+                        seed_spend = max(2.0, min(seed_spend, 20.0))
+                        seed_spend *= self._vol_scale  # Scale down in volatile markets
                         
                         if weak_token == 'UP':
                             self._last_trade_time_up = 0.0
@@ -1385,6 +1481,8 @@ class ArbitrageStrategy:
                     # Sizing based on confidence and urgency
                     sizing_mult = self.trend_predictor.get_position_sizing_multiplier(time_to_close)
                     base_spend = self.momentum_trade_usd * sizing_mult
+                    # Scale down in volatile markets (spot can be wrong more often)
+                    base_spend *= self._vol_scale
                     
                     # Scale spend based on urgency
                     if time_to_close < 30:
@@ -1434,7 +1532,21 @@ class ArbitrageStrategy:
         # This is the main profit driver — follow the market direction.
         # Keep following even in awareness window (down to 60s).
         # BUT: enforce imbalance limits so we don't go 5:1 on one side.
-        if (trending_token and trend_confidence >= 0.6
+        # *** VOLATILITY-AWARE: Higher confidence threshold in volatile markets ***
+        #
+        # Dynamic confidence threshold:
+        #   LOW vol:  0.60 (standard)
+        #   MEDIUM vol: 0.65
+        #   HIGH vol: 0.75 (need much stronger signal to follow trend)
+        trend_conf_threshold = 0.60
+        if self._volatility_regime == 'HIGH':
+            trend_conf_threshold = 0.75
+        elif self._volatility_regime == 'MEDIUM' and self.trend_predictor.direction_flips >= 2:
+            trend_conf_threshold = 0.70
+        
+        # Always allow trend following — the confidence threshold and vol_scale
+        # provide sufficient protection in volatile markets.
+        if (trending_token and trend_confidence >= trend_conf_threshold
             and time_to_close is not None and time_to_close > self.awareness_time_end):
 
             trending_price = up_price if trending_token == 'UP' else down_price
@@ -1444,11 +1556,16 @@ class ArbitrageStrategy:
             other_price_t = down_price if trending_token == 'UP' else up_price
 
             # IMBALANCE GUARD: If we're already tilted > max_tilt_ratio on the
-            # trending side, DON'T buy more trending — buy the weak side instead
-            # (it's cheap and reduces risk).
+            # trending side, DON'T buy more trending — buy the weak side instead.
+            # In volatile markets, use a tighter tilt ratio to prevent overexposure.
+            dynamic_tilt_max = self.max_tilt_ratio
+            if self._volatility_regime == 'HIGH':
+                dynamic_tilt_max = 1.80  # Much tighter in high vol (was 2.50)
+            elif self._volatility_regime == 'MEDIUM':
+                dynamic_tilt_max = 2.00
+            
             current_tilt = (trending_qty / other_qty_t) if other_qty_t > 0 else 999.0
-            if current_tilt > self.max_tilt_ratio and other_price_t <= self.defensive_max_price:
-                # We're over-tilted. Buy weak side to rebalance.
+            if current_tilt > dynamic_tilt_max and other_price_t <= self.defensive_max_price:
                 rebal_spend = self.balance_trade_usd * late_game_scale
                 trade = buy_with_spend(other_token_t, other_price_t, rebal_spend, 'rebalance_weak')
                 if trade:
@@ -1456,40 +1573,38 @@ class ArbitrageStrategy:
                     new_ratio_t = (self.qty_up / self.qty_down) if self.qty_down > 0 else 999.0
                     self.current_mode = 'rebalancing'
                     self.mode_reason = (f'⚖️ Rebalance: buy {other_token_t} @ ${other_price_t:.3f} | '
-                                      f'tilt was {current_tilt:.1f}:1 (max {self.max_tilt_ratio:.1f}) | '
+                                      f'tilt was {current_tilt:.1f}:1 (max {dynamic_tilt_max:.1f}) | '
                                       f'ratio now {new_ratio_t:.2f}')
                 return trades
-            elif current_tilt > self.max_tilt_ratio:
-                # Over-tilted but weak side too expensive — just wait
+            elif current_tilt > dynamic_tilt_max:
                 self.current_mode = 'tilt_wait'
                 self.mode_reason = (f'⚖️ Tilted {current_tilt:.1f}:1 on {trending_token} | '
                                   f'{other_token_t} @ ${other_price_t:.3f} too expensive to rebalance')
                 return trades
 
             if trending_price <= effective_max_price:
-                # Scale spend by trend strength AND time remaining
+                # Scale spend by trend strength AND time remaining AND volatility
                 spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
 
                 # PAIR COST GUARD: Don't buy more trending side if pair cost is
                 # already deep underwater (> 1.05). Each buy just digs the hole deeper.
                 if current_pair > 1.05 and current_tilt > 1.0:
-                    spend = min(spend, 1.5)  # Limit to $1.50 when pair is bad
+                    spend = min(spend, 1.5)
 
                 # HIGH-PRICE GUARD: At 0.80+, limit to $1 on dominant side
-                # But allow full spend if buying the WEAKER side (market reversal rescue)
                 if trending_price >= 0.80:
                     if trending_qty >= other_qty_t:
                         spend = min(spend, 1.0)
-                    # else: buying weaker side (reversal rescue) → keep full spend
 
                 trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
                 if trade:
                     trades.append(trade)
                     new_pnl = self.calculate_pnl_if_up_wins() if trending_token == 'UP' else self.calculate_pnl_if_down_wins()
+                    vol_info = f'vol={self._volatility_regime}'
                     self.current_mode = 'trend_follow'
                     self.mode_reason = (f'📈 Follow {trending_token} @ ${trending_price:.3f} | '
                                       f'conf {trend_confidence:.0%} str {trend_strength:.0%} | '
-                                      f'tilt {current_tilt:.1f}:1 | '
+                                      f'tilt {current_tilt:.1f}:1 | {vol_info} | '
                                       f'pnl_if_{trending_token.lower()}: ${new_pnl:+.2f}')
                 return trades
 
@@ -1497,6 +1612,11 @@ class ArbitrageStrategy:
         # Only when no clear trend. Guards against extreme imbalance.
         if not trending_token or trend_confidence < 0.5:
             for token, price in [('UP', up_price), ('DOWN', down_price)]:
+                # Block arb improve at extreme prices (< 0.15 or > 0.85)
+                # Near-zero shares are almost certainly losers,
+                # near-max shares have terrible ROI.
+                if price < 0.15 or price > 0.85:
+                    continue
                 disc = discount_to_avg(token, price)
                 if disc < 0.05:  # Need 5%+ discount (strict)
                     continue
@@ -1523,8 +1643,10 @@ class ArbitrageStrategy:
 
         # ── C) WATCHING: No discount, no trend ──
         momentum_info = f' | 🧭 {trending_token} {trend_strength:.0%}/{trend_confidence:.0%}' if trending_token else ' | 🧭 no trend'
+        vol_info = f' | vol={self._volatility_regime} flips={self.trend_predictor.direction_flips}'
+        choppy_info = ' | 🌊 CHOPPY' if self._is_choppy else ''
         self.current_mode = 'watching'
-        self.mode_reason = f'👀 pair ${current_pair:.3f} | locked ${locked_profit:+.2f} | combined ${combined_ask:.3f} | ratio {ratio:.2f}{momentum_info}'
+        self.mode_reason = f'👀 pair ${current_pair:.3f} | locked ${locked_profit:+.2f} | combined ${combined_ask:.3f} | ratio {ratio:.2f}{momentum_info}{vol_info}{choppy_info}'
         return trades
 
     def resolve_market(self, outcome: str) -> float:

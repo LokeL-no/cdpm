@@ -57,6 +57,21 @@ class TrendPredictor:
         self.endgame_seconds = 90           # When endgame prediction kicks in
         self.critical_seconds = 30          # When prediction is near-certain
 
+        # === Volatility regime detection ===
+        self.volatility_regime: str = 'MEDIUM'  # LOW, MEDIUM, HIGH
+        self.direction_flips: int = 0           # How many times direction changed
+        self._prev_direction: Optional[str] = None  # Last known direction
+        self._direction_history: deque = deque(maxlen=120)  # Track UP/DOWN over time
+        self._flip_timestamps: list = []        # When each flip occurred
+
+        # === EMA-based market price trend ===
+        self._ema_fast: Optional[float] = None   # 5-tick EMA (fast)
+        self._ema_slow: Optional[float] = None   # 15-tick EMA (slow)
+        self._ema_fast_alpha: float = 2.0 / (5 + 1)   # ~0.333
+        self._ema_slow_alpha: float = 2.0 / (15 + 1)  # ~0.125
+        self._ema_trend: Optional[str] = None    # 'UP', 'DOWN', or None
+        self._ema_crossover_strength: float = 0.0  # |fast - slow| / slow
+
     def reset_for_new_market(self):
         """Reset state for a new market window."""
         self.market_open_price = None
@@ -68,13 +83,24 @@ class TrendPredictor:
         self.current_prediction = None
         self.prediction_confidence = 0.0
         self.prediction_reason = ''
+        # Reset volatility regime tracking
+        self.volatility_regime = 'MEDIUM'
+        self.direction_flips = 0
+        self._prev_direction = None
+        self._direction_history.clear()
+        self._flip_timestamps.clear()
+        # Reset EMA tracking
+        self._ema_fast = None
+        self._ema_slow = None
+        self._ema_trend = None
+        self._ema_crossover_strength = 0.0
 
     def set_market_open_price(self, price: float):
         """Set the BTC spot price at market open."""
         self.market_open_price = price
         self.window_high = price
         self.window_low = price
-        logger.info(f"📊 Market open BTC price: ${price:,.2f}")
+        logger.info(f"📊 Market open BTC price (reference): ${price:,.2f}")
 
     def update_spot_price(self, price: float, timestamp: Optional[float] = None):
         """Update with latest BTC spot price."""
@@ -295,6 +321,148 @@ class TrendPredictor:
         multiplier = 1.0 + conf_factor * 2.0 * time_factor
         return min(3.0, multiplier)
 
+    def update_direction_tracking(self, up_price: float, down_price: float):
+        """
+        Track market direction changes (flips) for whipsaw detection.
+        Call this every tick with current UP/DOWN market prices.
+        """
+        direction = 'UP' if up_price > down_price else 'DOWN' if down_price > up_price else self._prev_direction
+        if direction is None:
+            return
+
+        self._direction_history.append(direction)
+
+        # Detect direction flip
+        if self._prev_direction is not None and direction != self._prev_direction:
+            self.direction_flips += 1
+            self._flip_timestamps.append(time.time())
+            logger.info(f"🔄 Direction FLIP #{self.direction_flips}: {self._prev_direction} → {direction}")
+
+        self._prev_direction = direction
+
+    def update_market_ema(self, favored_price: float):
+        """
+        Update EMA-based trend detection with the favored side's price.
+        Uses fast (5-tick) and slow (15-tick) EMA crossover.
+        """
+        if self._ema_fast is None:
+            self._ema_fast = favored_price
+            self._ema_slow = favored_price
+        else:
+            self._ema_fast = self._ema_fast_alpha * favored_price + (1 - self._ema_fast_alpha) * self._ema_fast
+            self._ema_slow = self._ema_slow_alpha * favored_price + (1 - self._ema_slow_alpha) * self._ema_slow
+
+        if self._ema_slow > 0:
+            self._ema_crossover_strength = abs(self._ema_fast - self._ema_slow) / self._ema_slow
+            if self._ema_fast > self._ema_slow + 0.002:  # Fast above slow = bullish
+                self._ema_trend = 'RISING'
+            elif self._ema_fast < self._ema_slow - 0.002:  # Fast below slow = bearish
+                self._ema_trend = 'FALLING'
+            else:
+                self._ema_trend = 'FLAT'
+
+    def classify_volatility_regime(self, time_elapsed: Optional[float] = None) -> str:
+        """
+        Classify current market volatility regime.
+
+        Uses multiple signals:
+          1. Number of direction flips (most important — 50% weight)
+          2. Direction history alternation pattern (25% weight)
+          3. BTC spot price range in window (15% weight)
+          4. Std dev of price changes (10% weight)
+
+        Returns: 'LOW', 'MEDIUM', or 'HIGH'
+        """
+        score = 0.0  # Higher = more volatile
+
+        # --- Signal 1: Direction flips (weight: 50%) ---
+        # This is the STRONGEST signal. Every directional reversal is dangerous.
+        # Thresholds raised to avoid false positives from noise-induced flips.
+        if self.direction_flips >= 6:
+            score += 0.50
+        elif self.direction_flips >= 4:
+            score += 0.40
+        elif self.direction_flips >= 3:
+            score += 0.30
+        elif self.direction_flips >= 2:
+            score += 0.15
+        elif self.direction_flips >= 1:
+            score += 0.05
+
+        # --- Signal 2: Direction history alternation (weight: 25%) ---
+        # Look at recent direction history for rapid oscillation
+        if len(self._direction_history) >= 6:
+            recent = list(self._direction_history)[-min(len(self._direction_history), 20):]
+            changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+            change_rate = changes / len(recent)
+            if change_rate >= 0.40:      # 40%+ of ticks are direction changes = very choppy
+                score += 0.25
+            elif change_rate >= 0.25:    # 25%+ = moderately choppy
+                score += 0.15
+            elif change_rate >= 0.15:
+                score += 0.05
+
+        # --- Signal 3: BTC spot price range (weight: 15%) ---
+        window_range = self.get_window_range()
+        if window_range > 80:
+            score += 0.15
+        elif window_range > 40:
+            score += 0.10
+        elif window_range > 20:
+            score += 0.05
+
+        # --- Signal 4: Volatility (std dev of price changes, weight: 10%) ---
+        volatility = self.get_volatility()
+        if volatility > 25:
+            score += 0.10
+        elif volatility > 15:
+            score += 0.06
+        elif volatility > 8:
+            score += 0.02
+
+        # Classify — lower thresholds to catch more volatile markets
+        if score >= 0.40:
+            self.volatility_regime = 'HIGH'
+        elif score >= 0.15:
+            self.volatility_regime = 'MEDIUM'
+        else:
+            self.volatility_regime = 'LOW'
+
+        return self.volatility_regime
+
+    def is_choppy_market(self) -> bool:
+        """
+        Detect if the market is choppy (oscillating without sustained trend).
+        
+        5-minute BTC markets are inherently volatile — direction flips are NORMAL.
+        Only flag as choppy when there's truly no trend (EMA flat + extreme alternation).
+        This flag is now advisory; it no longer blocks trading.
+        """
+        if self.direction_flips < 4:
+            return False
+
+        # Only choppy if EMA is flat AND alternation is extreme
+        if self._ema_trend == 'FLAT' and len(self._direction_history) >= 10:
+            recent = list(self._direction_history)[-min(len(self._direction_history), 20):]
+            changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+            change_rate = changes / len(recent)
+            if change_rate >= 0.40:  # 40%+ = truly oscillating with no direction
+                return True
+
+        return False
+
+    def get_volatility_scale_factor(self) -> float:
+        """
+        Get a position-sizing multiplier based on volatility regime.
+        HIGH vol → smaller positions, LOW vol → normal/larger positions.
+        """
+        if self.volatility_regime == 'HIGH':
+            return 0.35  # 35% of normal size in high vol
+        elif self.volatility_regime == 'MEDIUM':
+            return 0.70  # 70% in medium vol
+        else:
+            return 1.0   # Full size in low vol
+
     def get_status(self) -> Dict:
         """Get current predictor status for UI/logging."""
         delta = None
@@ -313,6 +481,12 @@ class TrendPredictor:
             'history_count': len(self.market_history),
             'streak': f"UP×{self.consecutive_up}" if self.consecutive_up > 0 else f"DN×{self.consecutive_down}",
             'fetches': self.spot_fetch_count,
+            'volatility_regime': self.volatility_regime,
+            'direction_flips': self.direction_flips,
+            'choppy': self.is_choppy_market(),
+            'ema_trend': self._ema_trend,
+            'vol_scale': self.get_volatility_scale_factor(),
+            'reference_price': self.market_open_price,
         }
 
 
@@ -374,6 +548,47 @@ async def fetch_btc_spot(session) -> Optional[float]:
     if price:
         return price
 
+    return None
+
+
+async def fetch_btc_price_at_timestamp(session, target_timestamp: float) -> Optional[float]:
+    """
+    Fetch BTC price at a specific Unix timestamp using Binance kline API.
+    
+    This gives us the BTC price at the exact start of a market window,
+    which is the reference price the market resolves against.
+    
+    Uses the 1-minute candle that contains the target timestamp.
+    Returns the candle's open price (closest to the exact second).
+    """
+    try:
+        # Binance kline API uses milliseconds
+        start_ms = int(target_timestamp * 1000)
+        url = (f"https://api.binance.com/api/v3/klines"
+               f"?symbol=BTCUSDT&interval=1m&startTime={start_ms}&limit=1")
+        async with session.get(url, timeout=3.0) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data and len(data) > 0:
+                    # Kline format: [open_time, open, high, low, close, volume, ...]
+                    open_price = float(data[0][1])
+                    logger.info(f"📍 BTC reference price at {target_timestamp:.0f}: ${open_price:,.2f} (Binance kline)")
+                    return open_price
+    except Exception as e:
+        logger.debug(f"Binance kline fetch error: {e}")
+    
+    # Fallback: try Coinbase price (current, not historical — less accurate)
+    try:
+        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        async with session.get(url, timeout=3.0) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                price = float(data['data']['amount'])
+                logger.info(f"📍 BTC fallback price: ${price:,.2f} (Coinbase current)")
+                return price
+    except Exception as e:
+        logger.debug(f"Coinbase fallback error: {e}")
+    
     return None
 
 

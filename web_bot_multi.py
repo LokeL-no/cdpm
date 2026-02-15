@@ -18,7 +18,7 @@ import os
 # Import new arbitrage strategy
 from arbitrage_strategy import ArbitrageStrategy
 from execution_simulator import ExecutionSimulator
-from trend_predictor import fetch_btc_spot
+from trend_predictor import fetch_btc_spot, fetch_btc_price_at_timestamp
 
 # Supported assets
 SUPPORTED_ASSETS = ['btc']
@@ -4447,6 +4447,9 @@ class MarketTracker:
         self.down_orderbook = {'bids': [], 'asks': []}
         self.orderbook_updated_at = 0.0
         self.spot_open_price: Optional[float] = None  # BTC spot at market open
+        self.event_start_time: Optional[datetime] = None  # When 5-min window actually starts (from Polymarket API)
+        self.reference_price: Optional[float] = None  # BTC price at window start (the resolution reference)
+        self.reference_price_source: str = ''  # How we got the reference price
 
 
 class MultiMarketBot:
@@ -4682,11 +4685,29 @@ class MultiMarketBot:
                                 except:
                                     pass
                             
+                            # Parse eventStartTime — the exact start of the 5-min window
+                            # The market resolves based on BTC price at start vs end of this window
+                            event_start_str = ''
+                            for m in markets:
+                                event_start_str = m.get('eventStartTime', '')
+                                if event_start_str:
+                                    break
+                            if not event_start_str:
+                                event_start_str = event.get('startTime', '')
+                            if event_start_str:
+                                try:
+                                    tracker.event_start_time = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
+                                    tracker.window_start = tracker.event_start_time
+                                except:
+                                    pass
+                            
                             tracker.initialized = True
                             tracker.spot_open_price = None  # Reset for new market
+                            tracker.reference_price = None
                             tracker.paper_trader.reset_predictor_for_new_market()
                             self.active_markets[slug] = tracker
-                            print(f"🔍 Auto-discovered: {slug} (budget ${asset_budget:.0f})")
+                            start_info = f" | starts {tracker.event_start_time.strftime('%H:%M:%S')}Z" if tracker.event_start_time else ""
+                            print(f"🔍 Auto-discovered: {slug} (budget ${asset_budget:.0f}{start_info})")
                             break  # Found one for this asset, move to next asset
                 except Exception as e:
                     pass  # Silently skip failed lookups
@@ -4826,7 +4847,9 @@ class MultiMarketBot:
                     spot_delta = ""
                     if pt.trend_predictor.market_open_price and pt.trend_predictor.current_spot_price:
                         d = pt.trend_predictor.current_spot_price - pt.trend_predictor.market_open_price
-                        spot_delta = f" Δ${d:+,.0f}"
+                        ref_src = getattr(tracker, 'reference_price_source', '')
+                        ref_tag = f" [{ref_src}]" if ref_src else ""
+                        spot_delta = f" Δ${d:+,.0f}{ref_tag}"
                     spot_info = f" | 🎯{pt._spot_prediction} {pt._spot_confidence:.0%}{spot_delta}"
                 print(f"🔍 [{tracker.asset}] UP=${tracker.up_price:.3f} DOWN=${tracker.down_price:.3f} | spread=${spread:.3f} | mode={pt.current_mode} | ttc={ttc_str}{extra}{spot_info} | {fetch_latency_ms:.0f}ms")
                 
@@ -5027,12 +5050,39 @@ class MultiMarketBot:
                             self.last_btc_spot = btc_spot
                             self.spot_fetch_errors = 0
                             # Update all active strategies with spot price
+                            now_utc = datetime.now(timezone.utc)
                             for tracker in self.active_markets.values():
                                 if tracker.paper_trader.market_status == 'open':
-                                    # Set open price on first spot fetch for this market
-                                    if tracker.spot_open_price is None:
-                                        tracker.spot_open_price = btc_spot
-                                        tracker.paper_trader.set_market_open_spot(btc_spot)
+                                    # === REFERENCE PRICE LOGIC ===
+                                    # The market resolves based on BTC at window START vs END.
+                                    # We need to set the reference price = BTC at eventStartTime.
+                                    if tracker.reference_price is None:
+                                        # Only set reference price AFTER the market window has started
+                                        window_started = (tracker.event_start_time is None or 
+                                                         now_utc >= tracker.event_start_time)
+                                        if window_started:
+                                            # Try to get exact BTC price at window start via Binance klines
+                                            if tracker.event_start_time:
+                                                target_ts = tracker.event_start_time.timestamp()
+                                                ref_price = await fetch_btc_price_at_timestamp(session, target_ts)
+                                                if ref_price:
+                                                    tracker.reference_price = ref_price
+                                                    tracker.reference_price_source = 'binance_kline'
+                                                    print(f"📍 [{tracker.asset.upper()}] Reference price: ${ref_price:,.2f} (Binance kline at window start)")
+                                                else:
+                                                    # Fallback: use current spot
+                                                    tracker.reference_price = btc_spot
+                                                    tracker.reference_price_source = 'spot_fallback'
+                                                    print(f"📍 [{tracker.asset.upper()}] Reference price: ${btc_spot:,.2f} (current spot fallback)")
+                                            else:
+                                                # No eventStartTime — use first spot as before
+                                                tracker.reference_price = btc_spot
+                                                tracker.reference_price_source = 'first_spot'
+                                            
+                                            # Set both spot_open_price and predictor's market_open_price
+                                            tracker.spot_open_price = tracker.reference_price
+                                            tracker.paper_trader.set_market_open_spot(tracker.reference_price)
+                                    
                                     tracker.paper_trader.update_spot_price(btc_spot)
                         else:
                             self.spot_fetch_errors += 1
