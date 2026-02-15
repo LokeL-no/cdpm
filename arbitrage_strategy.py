@@ -1423,13 +1423,20 @@ class ArbitrageStrategy:
                 continue  # Already bought at this level
             
             # New level — buy trending side!
-            # Small, controlled buys ($2) to tilt ratio toward trending side.
-            # Total capped at $6 per market via _trend_level_budget.
-            TREND_LEVEL_BUDGET = 6.0
+            # When arb possible: small controlled buys ($2, cap $10)
+            # When no arb: aggressive buys to WIN the market ($5-10, cap $30)
+            if combined_ask >= 0.98:
+                TREND_LEVEL_BUDGET = 30.0
+                level_strength = (price_level - 0.55) / 0.30
+                level_strength = max(0.1, min(1.0, level_strength))
+                base_spend = self.entry_trade_usd * (1.0 + level_strength)
+            else:
+                TREND_LEVEL_BUDGET = 10.0
+                base_spend = 2.0
             remaining_trend_budget = TREND_LEVEL_BUDGET - self._trend_level_spent
             if remaining_trend_budget < 1.0:
                 continue  # Trend level budget exhausted
-            spend = min(2.0, remaining_trend_budget)
+            spend = min(base_spend, remaining_trend_budget)
             
             # Spot confidence boost
             if (self._spot_prediction == check_token
@@ -1709,12 +1716,16 @@ class ArbitrageStrategy:
 
             # IMBALANCE GUARD: If we're already tilted > max_tilt_ratio on the
             # trending side, DON'T buy more trending — buy the weak side instead.
+            # When no arb (combined >= 0.98): much looser — focus on winning.
             # In volatile markets, use a tighter tilt ratio to prevent overexposure.
-            dynamic_tilt_max = self.max_tilt_ratio
-            if self._volatility_regime == 'HIGH':
-                dynamic_tilt_max = 1.80  # Much tighter in high vol (was 2.50)
+            if combined_ask >= 0.98:
+                dynamic_tilt_max = 5.0  # No arb — allow heavy tilt toward winner
+            elif self._volatility_regime == 'HIGH':
+                dynamic_tilt_max = 1.80
             elif self._volatility_regime == 'MEDIUM':
                 dynamic_tilt_max = 2.00
+            else:
+                dynamic_tilt_max = self.max_tilt_ratio
             
             current_tilt = (trending_qty / other_qty_t) if other_qty_t > 0 else 999.0
             if current_tilt > dynamic_tilt_max and other_price_t <= self.defensive_max_price:
