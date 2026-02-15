@@ -205,6 +205,8 @@ class ArbitrageStrategy:
         self._bought_levels_up: set = set()    # Price levels bought: {0.60, 0.65, ...}
         self._bought_levels_down: set = set()  # Price levels bought: {0.60, 0.65, ...}
         self._trend_level_spent: float = 0.0   # Total $ spent on trend_level buys this market
+        self._pure_trend_mode: bool = False      # Activated when pair_cost > 1.20 (arb impossible)
+        self._pure_trend_side: Optional[str] = None  # Current trend side in pure mode
 
         # Spot-based trend predictor (BTC spot price from Binance)
         self.trend_predictor = TrendPredictor()
@@ -579,6 +581,9 @@ class ArbitrageStrategy:
         self._bought_levels_up: set = set()    # e.g. {0.60, 0.65, 0.70}
         self._bought_levels_down: set = set()
         self._trend_level_spent: float = 0.0
+        self._pure_trend_mode = False
+        self._pure_trend_side = None
+
     def _should_take_profit_now(self, locked_profit: float, ratio: float, current_pair: float) -> Tuple[bool, str]:
         """Determine if we should take profit and stop trading now."""
         # NEVER stop if locked profit is negative
@@ -810,7 +815,7 @@ class ArbitrageStrategy:
                 and self._spot_confidence >= 0.70
                 and token != self._spot_prediction
                 and reason not in ('emergency_fix', 'endgame_spot', 'profit_lock',
-                                   'pair_market', 'trend_follow_reversal')):
+                                   'pair_market', 'trend_follow_reversal', 'pure_trend')):
                 return None
             
             # ── DIRECTIONAL EXPOSURE CAP ──
@@ -820,7 +825,7 @@ class ArbitrageStrategy:
             if self.qty_up > 0 or self.qty_down > 0:
                 pnl_if_this_wins = (self.calculate_pnl_if_up_wins() if token == 'UP'
                                    else self.calculate_pnl_if_down_wins())
-                if pnl_if_this_wins > max_directional_profit and reason not in ('emergency_fix', 'endgame_spot'):
+                if pnl_if_this_wins > max_directional_profit and reason not in ('emergency_fix', 'endgame_spot', 'pure_trend'):
                     return None  # Already heavily positioned this side
             
             # ── LOCKED PROFIT PROTECTION ──
@@ -831,7 +836,7 @@ class ArbitrageStrategy:
             #  locked >= 0: profitable — cap buys to protect profit
             #  locked > -$2: mildly underwater — allow trend following, cap to prevent worsening
             #  locked < -$2: severely underwater — emergency, only weak-side buys
-            if self.qty_up > 0 and self.qty_down > 0:
+            if self.qty_up > 0 and self.qty_down > 0 and reason != 'pure_trend':
                 pnl_up_now = self.calculate_pnl_if_up_wins()
                 pnl_down_now = self.calculate_pnl_if_down_wins()
                 locked_now = min(pnl_up_now, pnl_down_now)
@@ -1133,14 +1138,17 @@ class ArbitrageStrategy:
             return trades
 
         # ══════════════════════════════════════════════════════════
-        #  PHASE 2: ONE-SIDED — Lock profit, then wait
+        #  PHASE 2: ONE-SIDED — Lock profit, trend, or wait
         #  
         #  Simple logic:
         #   A) PROFIT LOCK: If pair < $0.98 → lock guaranteed profit
-        #   B) WAIT: Hold and wait for lock opportunity
+        #   B) PURE TREND:  If pair >= $1.20 → arb impossible, follow trend
+        #                   Buy owned side at 5c levels above avg.
+        #                   On flip (other side leads & >= $0.55), enter other side.
+        #   C) WAIT: Hold and wait for lock opportunity
         #  
-        #  NO trend building while one-sided — all trend-level buying
-        #  happens in Phase 3 AFTER locking, to prevent unrecoverable
+        #  NO trend building while one-sided in normal mode — all trend-level
+        #  buying happens in Phase 3 AFTER locking, to prevent unrecoverable
         #  one-sided losses.
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
@@ -1176,7 +1184,53 @@ class ArbitrageStrategy:
                     self.mode_reason = f'{lock_label}: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | locked ${locked_after:+.2f}'
                 return trades
 
-            # ── B) WAIT — lock not available yet ──
+            # ── B) PURE TREND — pair too expensive for arb, follow trend ──
+            if potential_pair >= 1.20:
+                self._pure_trend_mode = True
+
+            if self._pure_trend_mode:
+                # Market flipped? If other side leads AND >= $0.55, enter it
+                if other_price > owned_price and other_price >= 0.55:
+                    trade = buy_with_spend(other_token, other_price, self.entry_trade_usd, 'pure_trend')
+                    if trade:
+                        trades.append(trade)
+                        level = round(other_price * 20) / 20
+                        lvls = self._bought_levels_down if other_token == 'DOWN' else self._bought_levels_up
+                        lvls.add(level)
+                        self.current_mode = 'pure_trend_flip'
+                        self.mode_reason = (f'🔄 FLIP: Enter {other_token} @ ${other_price:.3f} | '
+                                           f'pair ${potential_pair:.3f}')
+                    return trades
+
+                # Buy owned side at next 5c level above avg
+                levels = self._bought_levels_up if owned_token == 'UP' else self._bought_levels_down
+                first_level = round((int(owned_avg * 20) + 1) / 20.0, 2)
+                level = first_level
+                while level <= owned_price and level <= 0.92:
+                    if level not in levels:
+                        spend = 5.0
+                        if owned_token == 'UP':
+                            self._last_trade_time_up = 0.0
+                            up_on_cooldown = False
+                        else:
+                            self._last_trade_time_down = 0.0
+                            down_on_cooldown = False
+                        trade = buy_with_spend(owned_token, owned_price, spend, 'pure_trend')
+                        if trade:
+                            trades.append(trade)
+                            levels.add(level)
+                            self.current_mode = 'pure_trend_level'
+                            self.mode_reason = (f'📈 Trend {owned_token} @ ${owned_price:.3f} '
+                                               f'lvl ${level:.2f} | avg ${owned_avg:.3f}')
+                        return trades
+                    level = round(level + 0.05, 2)
+
+                self.current_mode = 'pure_trend_hold'
+                self.mode_reason = (f'📈 Holding {owned_token} ({owned_qty:.1f} @ ${owned_avg:.3f}) | '
+                                   f'pair ${potential_pair:.3f} — waiting for next 5c level')
+                return trades
+
+            # ── C) WAIT — lock not available yet ──
             self.current_mode = 'waiting_lock'
             self.mode_reason = f'⏳ Holding {owned_token} ({owned_qty:.1f} @ ${owned_avg:.3f}) | UP ${up_price:.3f} DOWN ${down_price:.3f} | pair ${potential_pair:.3f} — waiting for lock'
             return trades
@@ -1215,6 +1269,115 @@ class ArbitrageStrategy:
         # Track trend direction for logging
         if trending_token and trend_confidence >= 0.6:
             self._prev_trend_token = trending_token
+
+        # ═══════════════════════════════════════════════════════════
+        #  PURE TREND MODE — pair cost > $1.20, arbitrage impossible
+        #
+        #  When our position's pair cost exceeds $1.20, arb profit is
+        #  impossible (paid $1.20+ for a pair resolving to $1.00).
+        #  Only path to profit: more shares on the winning side.
+        #
+        #  Strategy:
+        #   1) Follow the trending side (higher market price)
+        #   2) Buy at each $0.05 level above our average cost
+        #   3) On flip: switch sides when weak side price >= its avg
+        #   4) No locked profit guard — pure trend following
+        # ═══════════════════════════════════════════════════════════
+        if self.pair_cost > 1.20:
+            self._pure_trend_mode = True
+
+        if self._pure_trend_mode:
+            # Endgame spot positioning (< 90s) — ground truth overrides
+            if (time_to_close is not None and time_to_close <= 90
+                and self._spot_prediction is not None and self._spot_confidence > 0.55):
+                should_act, predicted_side, spot_conf = self.trend_predictor.should_endgame_position(time_to_close)
+                if should_act and predicted_side:
+                    predicted_price = up_price if predicted_side == 'UP' else down_price
+                    if predicted_price < 0.94:
+                        sizing_mult = self.trend_predictor.get_position_sizing_multiplier(time_to_close)
+                        spend = self.momentum_trade_usd * sizing_mult * self._vol_scale
+                        if predicted_side == 'UP':
+                            self._last_trade_time_up = 0.0
+                            up_on_cooldown = False
+                        else:
+                            self._last_trade_time_down = 0.0
+                            down_on_cooldown = False
+                        remaining_endgame = self._endgame_max_total - self._endgame_total_spent
+                        spend = min(spend, remaining_endgame, 16.0)
+                        if spend >= 1.0:
+                            trade = buy_with_spend(predicted_side, predicted_price, spend, 'pure_trend')
+                            if trade:
+                                self._endgame_total_spent += spend
+                                trades.append(trade)
+                                new_pnl = (self.calculate_pnl_if_up_wins() if predicted_side == 'UP'
+                                          else self.calculate_pnl_if_down_wins())
+                                self.current_mode = 'pure_trend_endgame'
+                                self.mode_reason = (f'🎯 Trend endgame {predicted_side} @ ${predicted_price:.3f} | '
+                                                   f'spot {spot_conf:.0%} | pnl ${new_pnl:+.2f}')
+                            return trades
+
+            # Determine trending side: higher market price
+            trend_side = 'UP' if up_price > down_price else 'DOWN'
+
+            # Initialize if not set
+            if self._pure_trend_side is None:
+                self._pure_trend_side = trend_side
+
+            # Flip detection: market direction changed AND weak side price >= its avg
+            # → confirmed flip, immediately switch sides
+            if trend_side != self._pure_trend_side:
+                new_avg = self.avg_up if trend_side == 'UP' else self.avg_down
+                new_price = up_price if trend_side == 'UP' else down_price
+                if new_price >= new_avg:
+                    self._pure_trend_side = trend_side
+
+            # Buy trending side at next 5c level above average
+            active_side = self._pure_trend_side
+            active_price = up_price if active_side == 'UP' else down_price
+            active_avg = self.avg_up if active_side == 'UP' else self.avg_down
+            levels = self._bought_levels_up if active_side == 'UP' else self._bought_levels_down
+
+            # Find first 5c level above average
+            if active_avg > 0:
+                first_level = round((int(active_avg * 20) + 1) / 20.0, 2)
+            else:
+                first_level = 0.55
+
+            level = first_level
+            while level <= active_price and level <= 0.92:
+                if level not in levels:
+                    spend = 5.0
+                    # Bypass cooldown for level buys
+                    if active_side == 'UP':
+                        self._last_trade_time_up = 0.0
+                        up_on_cooldown = False
+                    else:
+                        self._last_trade_time_down = 0.0
+                        down_on_cooldown = False
+                    trade = buy_with_spend(active_side, active_price, spend, 'pure_trend')
+                    if trade:
+                        trades.append(trade)
+                        levels.add(level)
+                        new_pnl = (self.calculate_pnl_if_up_wins() if active_side == 'UP'
+                                  else self.calculate_pnl_if_down_wins())
+                        self.current_mode = 'pure_trend'
+                        self.mode_reason = (f'📈 TREND {active_side} @ ${active_price:.3f} '
+                                           f'lvl ${level:.2f} | avg ${active_avg:.3f} | '
+                                           f'pnl_if_{active_side.lower()}: ${new_pnl:+.2f}')
+                    return trades
+                level = round(level + 0.05, 2)
+
+            # No new level to buy — holding position
+            other_side = 'DOWN' if active_side == 'UP' else 'UP'
+            other_price_t = down_price if active_side == 'UP' else up_price
+            other_avg = self.avg_down if active_side == 'UP' else self.avg_up
+            pnl_active = (self.calculate_pnl_if_up_wins() if active_side == 'UP'
+                         else self.calculate_pnl_if_down_wins())
+            self.current_mode = 'pure_trend_hold'
+            self.mode_reason = (f'📈 Pure trend {active_side} | avg ${active_avg:.3f} | '
+                               f'price ${active_price:.3f} | pnl ${pnl_active:+.2f} | '
+                               f'{other_side} avg ${other_avg:.3f} price ${other_price_t:.3f}')
+            return trades
 
         # ── PRIORITY 1: EMERGENCY FIX — locked profit SEVERELY negative ──
         # ONLY when arb is possible (combined < 0.98). When no arb, skip entirely
