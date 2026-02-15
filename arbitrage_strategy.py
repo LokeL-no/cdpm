@@ -838,10 +838,13 @@ class ArbitrageStrategy:
                 other_pnl = pnl_down_now if token == 'UP' else pnl_up_now
                 
                 if reason == 'trend_level':
-                    # Price-level trend buys: skip locked profit guard entirely.
-                    # Spending is capped by _trend_level_budget in Phase 3.
-                    # Emergency fix adjusts for trend_level spending too.
-                    pass  # No locked profit restriction
+                    # Price-level trend buys: relaxed guard (floor -$2).
+                    # Small tilts toward trend, not big positions.
+                    trend_floor = -2.0
+                    max_spend_safe = max(0, (other_pnl - trend_floor) / FEE_MULT)
+                    if max_spend_safe < 1.0:
+                        return None
+                    spend = min(spend, max_spend_safe)
                 elif locked_now >= 0:
                     # Position is profitable — protect it universally
                     max_spend_safe = max(0, (other_pnl - self.min_locked_buffer) / FEE_MULT)
@@ -1179,9 +1182,20 @@ class ArbitrageStrategy:
             # Once ANY side crosses $0.60, the trend is established.
             # Buy at each new $0.05 price level (0.60, 0.65, 0.70, 0.75, 0.80).
             # Only triggers if profit lock is NOT available (pair ≥ $0.98).
+            # EXPOSURE CAP: Skip if one-sided cost > $10 — force lock first.
             TREND_CONFIRM_PRICE = 0.60  # Trend is "real" at this price
             LEVEL_STEP = 0.05           # Buy at each $0.05 increment
             MAX_TREND_PRICE = 0.85      # Don't chase above this
+            MAX_ONE_SIDED_COST = self.entry_trade_usd * 2.0  # Max $10 before lock
+            
+            owned_cost = self.cost_up if owned_token == 'UP' else self.cost_down
+            if owned_cost > MAX_ONE_SIDED_COST:
+                # Too much one-sided exposure — wait for lock opportunity
+                up_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_up)) or 'none'
+                dn_levels_str = ','.join(f'{l:.2f}' for l in sorted(self._bought_levels_down)) or 'none'
+                self.current_mode = 'waiting_lock'
+                self.mode_reason = f'⏳ Exposure cap ${owned_cost:.1f} > ${MAX_ONE_SIDED_COST:.0f} — waiting for lock | pair ${potential_pair:.3f} | UP=[{up_levels_str}] DN=[{dn_levels_str}]'
+                return trades
             
             # Check both sides for price-level triggers
             for check_token, check_price in [('UP', up_price), ('DOWN', down_price)]:
@@ -1281,19 +1295,12 @@ class ArbitrageStrategy:
             self._prev_trend_token = trending_token
 
         # ── PRIORITY 1: EMERGENCY FIX — locked profit SEVERELY negative ──
-        # Only trigger for significant imbalances (> $2 deficit), NOT for normal
-        # pair cost overhead from market spread (~$0.50 at combined 1.02).
-        # Small negative locked is expected in real markets and is recovered
-        # through trend following in Priority 3/4.
-        # NEVER emergency fix in last 30 seconds — prices go extreme, buys are wasteful.
+        # ONLY when arb is possible (combined < 0.98). When no arb, skip entirely
+        # and focus on winning the market instead of trying to balance.
         emergency_time_ok = time_to_close is None or time_to_close > 30
-        # In volatile markets, still allow emergency fix but vol_scale will reduce size.
-        # Blocking entirely prevented recovery from imbalanced positions.
         emergency_vol_ok = True
-        # Adjust locked for intentional trend_level spending
-        # trend_level buys are calculated risk, not a deficit to fix
         adjusted_locked = locked_profit + self._trend_level_spent
-        if adjusted_locked < -2.00 and emergency_time_ok and emergency_vol_ok:
+        if adjusted_locked < -2.00 and emergency_time_ok and emergency_vol_ok and combined_ask < 0.98:
             weak_token = 'UP' if pnl_up < pnl_down else 'DOWN'
             strong_pnl = max(pnl_up, pnl_down)
             weak_pnl = min(pnl_up, pnl_down)
@@ -1417,8 +1424,8 @@ class ArbitrageStrategy:
             
             # New level — buy trending side!
             # Small, controlled buys ($2) to tilt ratio toward trending side.
-            # Total capped at $10 per market via _trend_level_budget.
-            TREND_LEVEL_BUDGET = 10.0
+            # Total capped at $6 per market via _trend_level_budget.
+            TREND_LEVEL_BUDGET = 6.0
             remaining_trend_budget = TREND_LEVEL_BUDGET - self._trend_level_spent
             if remaining_trend_budget < 1.0:
                 continue  # Trend level budget exhausted
@@ -1731,14 +1738,12 @@ class ArbitrageStrategy:
                 # Scale spend by trend strength AND time remaining AND volatility
                 spend = self.momentum_trade_usd * (0.5 + 0.5 * trend_strength) * late_game_scale
 
-                # PAIR COST GUARD: Don't buy more trending side if pair cost is
-                # already deep underwater (> 1.05). Each buy just digs the hole deeper.
-                if current_pair > 1.05 and current_tilt > 1.0:
-                    spend = min(spend, 1.5)
-
-                # HIGH-PRICE GUARD: At 0.80+, limit to $1 on dominant side
-                if trending_price >= 0.80:
-                    if trending_qty >= other_qty_t:
+                # PAIR COST GUARD: Only applies when arb is possible.
+                # When no arb, focus on winning — don't limit spend.
+                if combined_ask < 0.98:
+                    if current_pair > 1.05 and current_tilt > 1.0:
+                        spend = min(spend, 1.5)
+                    if trending_price >= 0.80 and trending_qty >= other_qty_t:
                         spend = min(spend, 1.0)
 
                 trade = buy_with_spend(trending_token, trending_price, spend, 'trend_follow')
