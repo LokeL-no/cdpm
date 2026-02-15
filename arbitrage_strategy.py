@@ -797,11 +797,13 @@ class ArbitrageStrategy:
             
             # ── SPOT GUARD: Block wrong-side buys when spot is confident ──
             # BTC spot price is the settlement source — if spot says DOWN at 70%+,
-            # don't accumulate more UP shares (except emergency fix and endgame).
+            # don't accumulate more UP shares (except emergency fix, endgame,
+            # and PROFIT LOCK — locking guaranteed profit should never be blocked).
             if (self._spot_prediction is not None 
                 and self._spot_confidence >= 0.70
                 and token != self._spot_prediction
-                and reason not in ('emergency_fix', 'endgame_spot')):
+                and reason not in ('emergency_fix', 'endgame_spot', 'profit_lock',
+                                   'pair_market', 'reversal_hedge', 'time_hedge')):
                 return None
             
             # ── DIRECTIONAL EXPOSURE CAP ──
