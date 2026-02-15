@@ -1065,10 +1065,11 @@ class ArbitrageStrategy:
             return favored, strength, confidence
 
         # ══════════════════════════════════════════════════════════
-        #  PHASE 1: ENTRY - Buy the CHEAPER side first
-        #  Enter when: combined ask < threshold AND enough time left.
-        #  Buy the cheaper side to get best cost basis, then Phase 2
-        #  will complete the pair on the next tick.
+        #  PHASE 1: ENTRY - Buy the side most likely to win
+        #  Uses spot predictor (BTC price vs reference) to pick the side
+        #  that will probably pay $1.00 at resolution. If no signal,
+        #  falls back to buying the cheaper side.
+        #  Does NOT immediately pair — waits for other side to drop.
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 and self.qty_down == 0:
             # Don't start new positions with < 2 min left
@@ -1079,33 +1080,46 @@ class ArbitrageStrategy:
 
             combined_ask_entry = up_price + down_price
             entry_spread = abs(up_price - down_price)
-            cheap_token = 'UP' if up_price <= down_price else 'DOWN'
-            cheap_price = min(up_price, down_price)
-
-            # SPREAD GUARD: Don't enter decided markets.
-            # If spread > 0.40 (e.g., UP=$0.72 DOWN=$0.30), the market is
-            # already heavily tilted — buying the cheap side is buying the loser.
-            if entry_spread > self.max_entry_spread:
-                self.current_mode = 'scouting'
-                self.mode_reason = f'🔍 Spread ${entry_spread:.3f} > ${self.max_entry_spread:.3f} — market too decided | UP ${up_price:.3f} DOWN ${down_price:.3f}'
-                return trades
             
-            # PRICE FLOOR GUARD: Don't enter if either side is near-zero
-            if cheap_price < self.min_entry_price:
+            # Pick entry side: use spot predictor if confident, else cheapest
+            if self._spot_prediction is not None and self._spot_confidence >= 0.60:
+                # Spot says which side will win — buy THAT side
+                entry_token = self._spot_prediction
+                entry_price = up_price if entry_token == 'UP' else down_price
+            else:
+                # No spot signal — buy cheaper side (lower cost basis)
+                entry_token = 'UP' if up_price <= down_price else 'DOWN'
+                entry_price = min(up_price, down_price)
+
+            # SPREAD GUARD: Don't enter decided markets (unless spot agrees).
+            # If spread > 0.40 (e.g., UP=$0.72 DOWN=$0.30), the market is
+            # already heavily tilted. Allow entry only if spot predictor
+            # confirms we're buying the winning side.
+            if entry_spread > self.max_entry_spread:
+                if self._spot_prediction is None or self._spot_confidence < 0.65 or entry_token != self._spot_prediction:
+                    self.current_mode = 'scouting'
+                    self.mode_reason = f'🔍 Spread ${entry_spread:.3f} > ${self.max_entry_spread:.3f} — market too decided | UP ${up_price:.3f} DOWN ${down_price:.3f}'
+                    return trades
+            
+            # PRICE FLOOR GUARD: Don't buy if our chosen side is near-zero
+            if entry_price < self.min_entry_price:
                 self.current_mode = 'scouting'
-                self.mode_reason = f'🔍 Cheap side ${cheap_price:.3f} < ${self.min_entry_price:.3f} — side near-zero | UP ${up_price:.3f} DOWN ${down_price:.3f}'
+                self.mode_reason = f'🔍 Entry side ${entry_price:.3f} < ${self.min_entry_price:.3f} — side near-zero | UP ${up_price:.3f} DOWN ${down_price:.3f}'
                 return trades
 
-            if combined_ask_entry <= self.combined_entry_threshold:
+            if combined_ask_entry <= self.combined_entry_threshold or (self._spot_confidence >= 0.65 and entry_price <= 0.85):
                 spend = self.entry_trade_usd
-                # Bigger entry for better arb opportunities
+                # Bigger entry for better arb opportunities or high-confidence spot
                 if combined_ask_entry < 0.98:
                     spend = self.entry_trade_usd * 2.0
-                trade = buy_with_spend(cheap_token, cheap_price, spend, 'base_entry')
+                elif self._spot_confidence >= 0.75:
+                    spend = self.entry_trade_usd * 1.5  # Stronger spot = bigger entry
+                trade = buy_with_spend(entry_token, entry_price, spend, 'base_entry')
                 if trade:
                     trades.append(trade)
+                    spot_info = f' | spot={self._spot_prediction} {self._spot_confidence:.0%}' if self._spot_prediction else ''
                     self.current_mode = 'entry'
-                    self.mode_reason = f'🎯 Entry {cheap_token} @ ${cheap_price:.3f} | combined ${combined_ask_entry:.3f} | spread ${entry_spread:.3f}'
+                    self.mode_reason = f'🎯 Entry {entry_token} @ ${entry_price:.3f} | combined ${combined_ask_entry:.3f}{spot_info}'
                 return trades
 
             self.current_mode = 'scouting'
@@ -1113,10 +1127,17 @@ class ArbitrageStrategy:
             return trades
 
         # ══════════════════════════════════════════════════════════
-        #  PHASE 2: COMPLETE PAIR - One side owned.
-        #  PRIORITY #1: Buy the other side to form a pair.
-        #  A complete pair reduces risk — even if pair cost > 1.0, trend
-        #  following in Phase 3 can recover the difference.
+        #  PHASE 2: ONE-SIDED — Build position, pair only when profitable
+        #  
+        #  KEY INSIGHT: Don't rush to complete pairs at any price.
+        #  If we own UP at $0.50 and DOWN is $0.50 → pair costs $1.00 (breakeven).
+        #  But if we WAIT and DOWN drops to $0.30 → pair costs $0.80 = $0.20 profit!
+        #  
+        #  Strategy:
+        #   A) PROFIT LOCK: If opposite side is cheap enough → pair for guaranteed profit
+        #   B) TREND BUILD: If our side is trending → keep building position  
+        #   C) DEFENSIVE PAIR: If trend reverses → pair to limit losses
+        #   D) WAIT: If no clear signal → wait for opportunity
         # ══════════════════════════════════════════════════════════
         if self.qty_up == 0 or self.qty_down == 0:
             owned_token = 'UP' if self.qty_up > 0 else 'DOWN'
@@ -1127,47 +1148,161 @@ class ArbitrageStrategy:
             owned_avg = self.avg_up if owned_token == 'UP' else self.avg_down
             potential_pair = owned_avg + other_price
 
-            # ── A) COMPLETE THE PAIR (PRIORITY #1) ──
-            # Always pair-complete when one-sided. Holding one side with no hedge
-            # is the MAXIMUM risk scenario. Even an expensive pair (cost > 1.03)
-            # is safer than a naked one-sided position that can lose $5+.
-            # Only skip if pair would be absurdly expensive (> 1.10).
-            if potential_pair < 1.10:
-                # Scale spend by pair quality
-                if potential_pair < 0.985:  # True arb
-                    spend = self.balance_trade_usd * 2.0
-                elif potential_pair < 1.00:  # Near breakeven
-                    spend = self.balance_trade_usd
-                else:  # Slightly above breakeven — small hedge
-                    spend = self.balance_trade_usd * 0.5
+            # ── A) PROFIT LOCK: Pair up when opposite side is cheap enough ──
+            # If pairing now would cost < $0.98 combined → guaranteed profit after fees!
+            # This is the core arbitrage: buy winning side, wait, pair when cheap.
+            PROFIT_LOCK_THRESHOLD = 0.98  # Combined must be < this for profit lock
+            GOOD_LOCK_THRESHOLD = 0.95    # Even better lock opportunity
+            
+            if potential_pair < PROFIT_LOCK_THRESHOLD:
+                # Scale spend by how good the opportunity is
+                if potential_pair < GOOD_LOCK_THRESHOLD:
+                    # Excellent lock — go big
+                    spend = min(owned_qty * other_price * FEE_MULT, self.balance_trade_usd * 3.0)
+                    lock_label = '🔒 PROFIT LOCK (excellent)'
+                else:
+                    # Good lock
+                    spend = min(owned_qty * other_price * FEE_MULT, self.balance_trade_usd * 2.0)
+                    lock_label = '🔒 PROFIT LOCK'
                 
-                # Cap to balanced amount
+                # Cap to what we'd need to match our owned quantity
                 balanced_spend = owned_qty * other_price * FEE_MULT
                 spend = min(spend, balanced_spend * 1.1 + 1.0)
                 
-                trade = buy_with_spend(other_token, other_price, spend, 'pair_complete')
+                trade = buy_with_spend(other_token, other_price, spend, 'profit_lock')
                 if trade:
                     trades.append(trade)
                     new_pair = self.pair_cost
-                    self.current_mode = 'pair_complete'
-                    self.mode_reason = f'🔗 Completing pair: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f}'
+                    locked_after = self.calculate_locked_profit()
+                    self.current_mode = 'profit_lock'
+                    self.mode_reason = f'{lock_label}: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | locked ${locked_after:+.2f}'
                 return trades
 
-            # ── B) PAIR TOO EXPENSIVE — build owned side if trending ──
+            # ── A2) MARKET-BASED PAIR: Fallback when no spot data ──
+            # When spot predictor is unavailable, we can't know which side is
+            # truly winning. In that case, pair at reasonable levels to avoid
+            # staying naked on one side indefinitely.
+            # With spot data (real trading), we skip this and use trend-first.
+            has_spot_data = (self._spot_prediction is not None and self._spot_confidence > 0)
+            if not has_spot_data:
+                # Time-based decay: become more willing to pair as time passes
+                if time_to_close is not None:
+                    market_fraction = time_to_close / 900.0  # 0.0 = end, 1.0 = start
+                    # Early (>70% left): only pair at < 1.02 (near-breakeven)
+                    # Mid (30-70% left): pair at < 1.05
+                    # Late (<30% left): pair at < 1.08
+                    if market_fraction > 0.70:
+                        pair_threshold = 1.02
+                    elif market_fraction > 0.30:
+                        pair_threshold = 1.05
+                    else:
+                        pair_threshold = 1.08
+                    
+                    if potential_pair < pair_threshold:
+                        if potential_pair < 1.00:
+                            spend = self.balance_trade_usd * 1.5
+                        elif potential_pair < 1.03:
+                            spend = self.balance_trade_usd
+                        else:
+                            spend = self.balance_trade_usd * 0.5
+                        balanced_spend = owned_qty * other_price * FEE_MULT
+                        spend = min(spend, balanced_spend * 1.1 + 1.0)
+                        
+                        trade = buy_with_spend(other_token, other_price, spend, 'pair_market')
+                        if trade:
+                            trades.append(trade)
+                            new_pair = self.pair_cost
+                            self.current_mode = 'pair_market'
+                            self.mode_reason = f'🔗 Market pair: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f} | threshold ${pair_threshold:.2f}'
+                        return trades
+
+            # ── B) TREND BUILD: Keep building our side if it's trending ──
             trending_token, trend_strength, trend_confidence = detect_momentum()
-            if (trending_token == owned_token and trend_confidence >= 0.6
-                and owned_price <= effective_max_price
-                and time_to_close is not None and time_to_close > 120):
-                spend = self.entry_trade_usd * (0.5 + 0.5 * trend_strength)
-                trade = buy_with_spend(owned_token, owned_price, spend, 'trend_buildup_solo')
+            
+            # Also check spot predictor
+            spot_agrees_with_owned = (self._spot_prediction == owned_token and self._spot_confidence >= 0.60)
+            
+            if ((trending_token == owned_token and trend_confidence >= 0.6) or spot_agrees_with_owned):
+                if owned_price <= effective_max_price and time_to_close is not None and time_to_close > 60:
+                    conf = max(trend_confidence or 0, self._spot_confidence or 0)
+                    # Scale spend by confidence — high confidence = bigger buys
+                    base_mult = 0.5 + 0.5 * (trend_strength or 0.5)
+                    if conf >= 0.80:
+                        base_mult *= 1.5  # High confidence boost
+                    spend = self.entry_trade_usd * base_mult
+                    
+                    # Late game (< 120s): only build if spot confidence is strong
+                    if time_to_close <= 120 and self._spot_confidence < 0.65:
+                        pass  # Don't build in late game without strong spot signal
+                    else:
+                        trade = buy_with_spend(owned_token, owned_price, spend, 'trend_buildup_solo')
+                        if trade:
+                            trades.append(trade)
+                            self.current_mode = 'trend_buildup'
+                            self.mode_reason = f'📈 Building {owned_token} @ ${owned_price:.3f} | conf {conf:.0%} | waiting for {other_token} to drop (${other_price:.3f})'
+                        return trades
+
+            # ── B2) ENDGAME ONE-SIDED: < 90s left, spot is strong, keep building ──
+            # If we're still one-sided near the end, aggressively build our side
+            # if spot confirms. Don't waste money pairing at bad prices.
+            if (time_to_close is not None and time_to_close <= 90
+                and self._spot_prediction == owned_token 
+                and self._spot_confidence >= 0.65
+                and owned_price <= 0.92):
+                endgame_spend = self.momentum_trade_usd * (0.5 + self._spot_confidence)
+                endgame_spend *= self._vol_scale
+                if time_to_close < 30:
+                    # Bypass cooldown in final 30s
+                    if owned_token == 'UP':
+                        self._last_trade_time_up = 0.0
+                        up_on_cooldown = False
+                    else:
+                        self._last_trade_time_down = 0.0
+                        down_on_cooldown = False
+                    endgame_spend *= 1.5
+                
+                trade = buy_with_spend(owned_token, owned_price, endgame_spend, 'endgame_solo')
                 if trade:
                     trades.append(trade)
-                    self.current_mode = 'trend_buildup'
-                    self.mode_reason = f'📈 Building {owned_token} @ ${owned_price:.3f} (pair too expensive: ${potential_pair:.3f})'
+                    self.current_mode = 'endgame_solo'
+                    self.mode_reason = f'🎯 Endgame SOLO {owned_token} @ ${owned_price:.3f} | spot {self._spot_confidence:.0%} | {time_to_close:.0f}s left'
                 return trades
 
-            self.current_mode = 'waiting_pair'
-            self.mode_reason = f'⏳ Waiting: {other_token} @ ${other_price:.3f} too expensive (pair ${potential_pair:.3f})'
+            # ── C) DEFENSIVE PAIR: Trend reversed — pair to limit losses ──
+            # If the spot predictor now favors the OTHER side, pair up to hedge.
+            # Also pair if running low on time with no pair.
+            # Fallback: if no spot data, use market momentum for reversal detection
+            spot_against = (self._spot_prediction == other_token and self._spot_confidence >= 0.65)
+            if not has_spot_data and trending_token == other_token and (trend_confidence or 0) >= 0.65:
+                spot_against = True  # Market momentum reversal
+            time_pressure = (time_to_close is not None and time_to_close < 180)  # < 3 min left
+            
+            if spot_against or (time_pressure and potential_pair < 1.08):
+                if potential_pair < 1.10:
+                    # Pair up defensively — limit is pair < 1.10
+                    if potential_pair < 1.00:
+                        spend = self.balance_trade_usd * 1.5
+                    elif potential_pair < 1.05:
+                        spend = self.balance_trade_usd
+                    else:
+                        spend = self.balance_trade_usd * 0.5
+                    
+                    balanced_spend = owned_qty * other_price * FEE_MULT
+                    spend = min(spend, balanced_spend * 1.1 + 1.0)
+                    
+                    reason_tag = 'reversal_hedge' if spot_against else 'time_hedge'
+                    trade = buy_with_spend(other_token, other_price, spend, reason_tag)
+                    if trade:
+                        trades.append(trade)
+                        new_pair = self.pair_cost
+                        reason = f'🛡️ Defensive pair' if spot_against else f'⏰ Time hedge'
+                        self.current_mode = 'defensive_pair'
+                        self.mode_reason = f'{reason}: {other_token} @ ${other_price:.3f} | pair ${new_pair:.3f}'
+                    return trades
+
+            # ── D) WAIT — no clear signal, hold position ──
+            self.current_mode = 'waiting_lock'
+            self.mode_reason = f'⏳ Holding {owned_token} ({owned_qty:.1f} @ ${owned_avg:.3f}) | {other_token} @ ${other_price:.3f} | pair ${potential_pair:.3f} — waiting for drop'
             return trades
 
         # ══════════════════════════════════════════════════════════
